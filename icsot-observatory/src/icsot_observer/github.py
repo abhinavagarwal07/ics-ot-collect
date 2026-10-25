@@ -22,6 +22,10 @@ HEADERS_TO_KEEP = (
     "content-length", "x-github-request-id", "cache-control"
 )
 _NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+_REPOSITORY_PATH_RE = re.compile(
+    r"(?P<repository>/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|/repositories/(?P<id>[1-9][0-9]*))"
+    r"(?P<endpoint>(?:/[^/?#]+)*)"
+)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -43,19 +47,24 @@ class GitHubAPI:
         self.token = os.getenv(config.token_env, "").strip()
         self.opener = urllib.request.build_opener(NoRedirect)
         self.requests = 0
+        self._repository_ids: dict[str, str] = {}
 
     @staticmethod
     def validate_url(url: str) -> None:
         x = urllib.parse.urlsplit(url)
         if (x.scheme != "https" or x.netloc != "api.github.com" or
-                not x.path.startswith("/repos/") or x.username or x.password or x.fragment):
+                not _REPOSITORY_PATH_RE.fullmatch(x.path) or x.username or x.password or x.fragment or
+                any(ord(c) <= 32 or ord(c) == 127 for c in url) or "\\" in x.path or
+                any(part in (".", "..") for part in x.path.split("/"))):
             raise ValueError(f"Disallowed API endpoint: {url}")
 
     @staticmethod
     def url(path: str, params: dict[str, Any] | None = None) -> str:
-        if not path.startswith("/repos/") or "?" in path or "#" in path:
+        if not _REPOSITORY_PATH_RE.fullmatch(path) or "?" in path or "#" in path:
             raise ValueError(f"Disallowed API path: {path}")
-        return "https://api.github.com" + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        url = "https://api.github.com" + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        GitHubAPI.validate_url(url)
+        return url
 
     def get(self, url: str, purpose: str) -> Response:
         self.validate_url(url)
@@ -140,6 +149,9 @@ class GitHubAPI:
         obj = json.loads(r.body)
         if not isinstance(obj, dict):
             raise ValueError(f"Expected JSON object for {purpose}")
+        route = _REPOSITORY_PATH_RE.fullmatch(path)
+        if route and not route["endpoint"] and type(obj.get("id")) is int and obj["id"] > 0:
+            self._repository_ids[route["repository"].lower()] = str(obj["id"])
         return obj
 
     def list_pages(self, path: str, purpose: str, *, params: dict | None = None,
@@ -150,6 +162,9 @@ class GitHubAPI:
         """
         url = self.url(path, {**(params or {}), "per_page": 100})
         first_page = url
+        first_route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url).path)
+        assert first_route is not None  # self.url validated the initial endpoint.
+        canonical_repository_id = first_route["id"] or self._repository_ids.get(first_route["repository"].lower())
         first_digest = None
         all_items: list[dict] = []
         seen_urls: set[str] = set()
@@ -186,8 +201,19 @@ class GitHubAPI:
                 break
             url = match.group(1)
             self.validate_url(url)
-            if urllib.parse.urlsplit(url).path != urllib.parse.urlsplit(first_page).path:
+            route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url).path)
+            assert route is not None  # validate_url checked the opaque Link URL.
+            if route["endpoint"] != first_route["endpoint"]:
                 raise RuntimeError(f"Unexpected endpoint changed across pagination for {purpose}")
+            if route["id"] is not None:
+                # GitHub legitimately canonicalizes slug routes to stable numeric
+                # routes in Link. Bind that ID to known metadata, or to the first
+                # authenticated-origin Link if list_pages was used standalone.
+                if canonical_repository_id is not None and route["id"] != canonical_repository_id:
+                    raise RuntimeError(f"Unexpected repository changed across pagination for {purpose}")
+                canonical_repository_id = route["id"]
+            elif route["repository"].lower() != first_route["repository"].lower():
+                raise RuntimeError(f"Unexpected repository changed across pagination for {purpose}")
         else:
             raise RuntimeError(f"Max pages exceeded for {purpose} (NOT complete)")
 
