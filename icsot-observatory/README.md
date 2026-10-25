@@ -8,6 +8,8 @@ Prospective, **public-only** GitHub observation with raw byte preservation, cont
 
 The first selected target is `libfuse/libfuse`, configured in `config.libfuse.toml`. The workspace-root manual Actions workflow runs a shallow full capture, a delta capture, full-bundle restoration, byte verification and CSV/diff generation. It requests OpenTimestamps receipts but does not equate pending receipts with verified Bitcoin attestations. Artifact downloads are temporary transfer copies, not the indefinite archive.
 
+See [the first live libfuse validation](docs/LIBFUSE_VALIDATION.md) for measured results, preserved failures, evidence digests and remaining implementation limits.
+
 ## Quickstart
 
 Requirements: Linux/macOS, Python >=3.11, Git, OpenTimestamps CLI (`ots`) from [official client](https://github.com/opentimestamps/opentimestamps-client). For local development tests `ots` can be omitted using `--no-stamp`. Prefer a narrowly scoped **read-only** GitHub App/token restricted to public repositories; `GITHUB_TOKEN` is read from your environment, never stored in run manifests.

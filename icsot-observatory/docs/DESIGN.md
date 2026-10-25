@@ -96,6 +96,16 @@ Support arbitrary observation-pair and interval queries. Report `not_observed_in
 
 ## SQLite and scheduling policy
 
+### GitHub Actions execution
+
+The workspace includes push/PR validation and a manually triggered libfuse smoke workflow. This tests hosted execution of the current prototype, not a recurring deployment of this design. The smoke uploads temporary seven-day artifacts for transfer to local indefinite storage; no cron schedule is enabled.
+
+Scheduled Actions can supply periodic compute, but hosted jobs start on fresh machines and have a six-hour execution limit. Persist the authoritative archive and a consistent state/database snapshot outside the runner, then restore the needed state for each bounded batch. Actions artifacts/caches have retention or eviction policies and are not the indefinite evidence store. [Hosted runners](https://docs.github.com/en/actions/concepts/runners/github-hosted-runners), [Actions limits](https://docs.github.com/en/actions/reference/limits), [Artifact retention](https://docs.github.com/en/organizations/managing-organization-settings/configuring-the-retention-period-for-github-actions-artifacts-and-logs-in-your-organization)
+
+Scheduled runs may be delayed or dropped, so 1–6 hours remains a measured target rather than a guaranteed observation gap. Offset scheduling from the start of the hour, serialize state-changing runs without cancelling active capture, and archive gaps derived from the declared schedule. The manually triggered smoke uses only a read-only workflow token; validate credential/API capacity before expanding beyond the initial target. [Scheduled events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+
+### Local database and rate handling
+
 Use one local SQLite database initially, with clearly separated `idx_*` evidence/index tables and `op_*` operational tables. Keep original payloads outside SQLite. Enable and verify foreign keys on every connection; use short writes, bounded busy retries and explicit queue leases. WAL supports concurrent readers but still only one writer and requires clients on the same host. [SQLite foreign keys](https://www.sqlite.org/foreignkeys.html#fk_enable), [WAL](https://www.sqlite.org/wal.html)
 
 Start with WAL and `synchronous=FULL` for acknowledged operational writes, subject to working filesystem synchronization. Check that the deployed SQLite runtime contains the documented WAL-reset fix (3.51.3+, or the relevant 3.44.6/3.50.7 backport). These are deployment checks, not settings silently applied by the schema. Use SQLite's backup API for live backups rather than copying only an active `.db` file. [Synchronization](https://www.sqlite.org/pragma.html#pragma_synchronous), [WAL-reset fix](https://www.sqlite.org/wal.html#the_wal_reset_bug), [Backup API](https://www.sqlite.org/backup.html)

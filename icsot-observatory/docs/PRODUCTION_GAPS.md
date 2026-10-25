@@ -8,6 +8,7 @@ A research paper must not misrepresent this starter as a complete, unattended re
 - [x] GitHub pinned REST API version, HTTPS-only allowlist, explicit no-redirect behavior for bearer tokens.
 - [x] Raw HTTP bodies in SHA-256 CAS; response metadata includes request start/end, safe headers and status.
 - [x] Link-header pagination, duplicate-ID detection and first-page recheck on multi-page feeds.
+- [x] GitHub's numeric-repository pagination links are accepted while preserving repository and endpoint continuity checks.
 - [x] Updated-item delta with configurable 48h overlap and last successful completed run cursor.
 - [x] Public Git refs observed and pinned to permanent local `refs/archive/` namespace, with ref-set stability test.
 - [x] Annotated tags retain their tag-object and peeled-target IDs without creating invalid peeled pseudo-refs.
