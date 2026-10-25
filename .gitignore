@@ -1,0 +1,21 @@
+# Collected evidence and machine-local state are retained outside source control.
+evidence/
+analysis/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+.env
+.env.*
+.DS_Store
+icsot-observatory/config.toml
+
+# Original supplied archive; extracted source is versioned below.
+/icsot-observatory-research-starter.zip

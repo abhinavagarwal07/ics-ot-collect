@@ -1,0 +1,176 @@
+name: Libfuse collector smoke
+
+# Manual prototype validation only. Durable off-site storage is not connected.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libfuse-collector-smoke
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install project and pinned tools
+        run: |
+          mkdir -p analysis/libfuse-smoke
+          set +e
+          python -m pip install --disable-pip-version-check -e . pytest==9.1.1 opentimestamps-client==0.7.2 2>&1 | tee analysis/libfuse-smoke/install.log
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf 'install\t%s\ninstall_log\t%s\n' "${statuses[0]}" "${statuses[1]}" | tee analysis/libfuse-smoke/exit-status.tsv
+          if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+          exit "${statuses[1]}"
+      - name: Record code and tool versions
+        run: |
+          python - <<'PY'
+          import importlib.metadata
+          import json
+          import platform
+          import subprocess
+          import sys
+          from pathlib import Path
+          report = {
+              "collector_code_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "python": sys.version,
+              "platform": platform.platform(),
+              "git": subprocess.check_output(["git", "--version"], text=True).strip(),
+              "packages": {name: importlib.metadata.version(name) for name in ("icsot-observatory", "pytest", "opentimestamps-client")},
+              "target": "libfuse/libfuse",
+              "timestamp_status": "OTS submission requested; Bitcoin verification is not performed by this smoke run",
+          }
+          raw = json.dumps(report, indent=2) + "\n"
+          Path("analysis/libfuse-smoke/environment.json").write_text(raw)
+          print(raw)
+          PY
+          python -m pip freeze > analysis/libfuse-smoke/pip-freeze.txt
+      - name: Run complete test suite
+        run: |
+          set +e
+          python -m pytest -q -x --junitxml=analysis/libfuse-smoke/pytest.xml 2>&1 | tee analysis/libfuse-smoke/pytest.log
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf 'pytest\t%s\npytest_log\t%s\n' "${statuses[0]}" "${statuses[1]}" | tee -a analysis/libfuse-smoke/exit-status.tsv
+          if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+          exit "${statuses[1]}"
+      - name: Collect full and delta evidence, verify, derive, and diff
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          failed=0
+          run_logged() {
+            local label="$1"
+            shift
+            local rc=0
+            "$@" > "analysis/libfuse-smoke/${label}.json" 2> "analysis/libfuse-smoke/${label}.stderr.log" || rc=$?
+            cat "analysis/libfuse-smoke/${label}.json"
+            cat "analysis/libfuse-smoke/${label}.stderr.log" >&2
+            printf '%s\t%s\n' "$label" "$rc" | tee -a analysis/libfuse-smoke/exit-status.tsv
+            if (( rc != 0 )); then failed=1; fi
+          }
+          run_logged full icsot-observe collect --config config.libfuse.toml --mode full --bundle-full
+          run_logged delta icsot-observe collect --config config.libfuse.toml --mode delta --bundle-full
+          run_logged verify icsot-observe verify --root evidence/libfuse
+          run_logged derive icsot-observe derive --root evidence/libfuse --out analysis/libfuse-smoke/observations.csv
+          run_logged diff python - <<'PY'
+          import json
+          from pathlib import Path
+          from icsot_observer.cli import main
+          registry = json.loads(Path("evidence/libfuse/registry/libfuse__libfuse.json").read_bytes())
+          raise SystemExit(main(["diff", "--root", "evidence/libfuse", "--repository-id", str(registry["repository_id"])]))
+          PY
+          run_logged acceptance python - <<'PY'
+          import json
+          from pathlib import Path
+          home = Path("analysis/libfuse-smoke")
+          results = {mode: json.loads((home / f"{mode}.json").read_bytes()) for mode in ("full", "delta")}
+          for mode, rows in results.items():
+              assert len(rows) == 1, f"Expected one target in {mode}"
+              row = rows[0]
+              assert row["repo"] == "libfuse/libfuse", "Unexpected target"
+              assert row["status"] == "complete", f"Partial {mode} collection"
+              assert row["attestation"] == "pending_bitcoin_completion", f"OTS submission failed for {mode}"
+              manifest = json.loads(Path(row["manifest"]).read_bytes())
+              assert manifest["mode"] == mode, "Delta was not based on a complete full baseline"
+              assert manifest["git"]["portable_full_bundle"], "Missing portable Git bundle"
+              assert Path(row["proof"]).is_file(), "Missing working OTS receipt"
+              assert Path(row["immutable_initial_proof"]).is_file(), "Missing immutable OTS receipt"
+          verification = json.loads((home / "verify.json").read_bytes())
+          assert verification["ok"], "Evidence verification failed"
+          assert verification["manifests"] == 2, "Expected two manifests"
+          assert verification["portable_git_bundles_verified"] == 2, "Expected two independent bundle restores"
+          assert verification["git_repositories_verified"] == 1, "Expected one verified Git mirror"
+          assert verification["git_refs_verified"] > 0, "No verified Git refs"
+          assert verification["raw_observations"] > 0, "No verified response bytes"
+          assert verification["partial_runs"] == 0, "Unexpected partial run"
+          assert verification["unstamped_runs"] == 0, "Unexpected missing OTS receipt"
+          assert (home / "observations.csv").is_file(), "Missing derived CSV"
+          print(json.dumps({"ok": True, "collection_runs": 2, "bitcoin_verification": "NOT_PERFORMED_PENDING"}, indent=2))
+          PY
+          exit "$failed"
+      - name: Write bounded smoke summary
+        if: always()
+        env:
+          SMOKE_JOB_STATUS: ${{ job.status }}
+        run: |
+          mkdir -p analysis/libfuse-smoke
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          home = Path("analysis/libfuse-smoke")
+          lines = ["## Libfuse collector smoke", "", f"Job result before artifact upload: {os.environ['SMOKE_JOB_STATUS']}", ""]
+          status_file = home / "exit-status.tsv"
+          if status_file.exists():
+              lines += ["Command exit statuses:", "", "```text", status_file.read_text().strip(), "```", ""]
+          verify = home / "verify.json"
+          if verify.exists():
+              try:
+                  result = json.loads(verify.read_bytes())
+                  counts = {key: value for key, value in result.items() if isinstance(value, (int, bool))}
+                  lines += ["Evidence verification counters:", "", "```json", json.dumps(counts, indent=2), "```", ""]
+              except (ValueError, OSError):
+                  lines += ["Verification did not produce a valid JSON report.", ""]
+          lines += [
+              "Scope: one public target, libfuse/libfuse; shallow full metadata scan, overlapping delta, advertised Git ref capture, and full portable bundles restored independently during verification.",
+              "", "OTS submissions are requested. Pending Bitcoin proofs are allowed and are NOT reported as verified third-party timestamps.",
+              "", "Exclusions: initial per-item timeline/review backfill, Discussions, native XZ storage, SQLite queue, monthly byte-budget enforcement, and durable off-site archival are not implemented by this workflow.",
+              "", "Artifacts expire after seven days. They are temporary transfer copies; download and verify them into indefinite storage. No scheduled collection is enabled.",
+          ]
+          text = "\n".join(lines) + "\n"
+          (home / "summary.md").write_text(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(text)
+          print(text)
+          PY
+      - name: Preserve temporary evidence and reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: libfuse-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            icsot-observatory/evidence/libfuse/
+            icsot-observatory/analysis/libfuse-smoke/
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error

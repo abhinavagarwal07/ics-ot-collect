@@ -1,0 +1,13 @@
+# First explicitly selected public target. No credentials belong in this file.
+[collector]
+root = "./evidence/libfuse"
+api_version = "2026-03-10"
+user_agent = "ICSOT-Observatory/0.1 (public research collector)"
+token_env = "GITHUB_TOKEN"
+http_timeout_seconds = 35
+max_response_mib = 32
+overlap_hours = 48
+max_pages = 10000
+
+[cohort]
+repositories = ["libfuse/libfuse"]

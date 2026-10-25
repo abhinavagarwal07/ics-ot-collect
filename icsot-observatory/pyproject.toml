@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icsot-observatory"
+version = "0.1.0"
+description = "Prospective, timestamped public GitHub evidence collector (research starter)"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name="ICS/OT observatory research"}]
+dependencies = []
+
+[project.scripts]
+icsot-observe = "icsot_observer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

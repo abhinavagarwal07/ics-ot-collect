@@ -1,0 +1,15 @@
+# Fixed, preregistered cohort. Add projects by protocol-defined amendment.
+[collector]
+root = "./evidence"                 # use absolute path in production
+api_version = "2026-03-10"         # record changes to this pin
+user_agent = "ICSOT-Observatory/0.1 (public research collector)"
+token_env = "GITHUB_TOKEN"         # read-only token; never stored
+http_timeout_seconds = 35
+max_response_mib = 32
+overlap_hours = 48                 # query modified objects with this overlap
+max_pages = 10000                  # exceeded => FAIL, never silently truncate
+
+[cohort]
+repositories = [
+  "libfuse/libfuse",
+]

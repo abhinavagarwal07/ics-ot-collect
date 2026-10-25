@@ -1,0 +1,51 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install project and test dependency
+        run: python -m pip install --disable-pip-version-check -e . pytest==9.1.1
+      - name: Run complete test suite
+        run: |
+          mkdir -p analysis/ci
+          set +e
+          python -m pytest -q -x --junitxml=analysis/ci/pytest.xml 2>&1 | tee analysis/ci/pytest.log
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf 'pytest exit status: %s; tee exit status: %s\n' "${statuses[0]}" "${statuses[1]}" | tee analysis/ci/exit-status.txt
+          if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+          exit "${statuses[1]}"
+      - name: Preserve temporary test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: icsot-observatory/analysis/ci/
+          if-no-files-found: warn
+          retention-days: 7
