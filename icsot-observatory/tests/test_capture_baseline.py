@@ -210,6 +210,7 @@ def make_portable_capture(config, slug, mode, **kwargs):
     response = {"body_sha256": store.put(body), "body_bytes": len(body), "purpose": "repository_identity"}
     manifest = {
         "run_id": "synthetic", "repository_id": 17, "repository_input_slug": slug,
+        "started_at": "2026-10-20T00:00:00.123456Z", "finished_at": "2026-10-20T00:00:01.654321Z",
         "previous_manifest_sha256": None, "mode": "full", "status": "complete",
         "responses": [response], "public_config_sha256": "f" * 64,
         "git": {
@@ -222,12 +223,22 @@ def make_portable_capture(config, slug, mode, **kwargs):
     path.parent.mkdir(parents=True)
     path.write_bytes(canonical_json(manifest))
     proof = Path(str(path) + ".ots")
-    proof.write_bytes(b"synthetic pending receipt; no Bitcoin verification in this test")
+    pytest.importorskip("opentimestamps.core.timestamp")
+    from opentimestamps.core.notary import PendingAttestation
+    from opentimestamps.core.op import OpSHA256
+    from opentimestamps.core.serialize import StreamSerializationContext
+    from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
+    stamp = Timestamp(bytes.fromhex(hashlib.sha256(path.read_bytes()).hexdigest()))
+    stamp.attestations.add(PendingAttestation("https://calendar.example.invalid"))
+    serialized = io.BytesIO()
+    DetachedTimestampFile(OpSHA256(), stamp).serialize(StreamSerializationContext(serialized))
+    proof.write_bytes(serialized.getvalue())
     initial = config.root / "proofs/initial/initial.ots"
     initial.parent.mkdir(parents=True)
     initial.write_bytes(proof.read_bytes())
     return {"repo": slug, "status": "complete", "attestation": "pending_bitcoin_completion",
-            "manifest": str(path), "proof": str(proof), "immutable_initial_proof": str(initial)}
+            "manifest": str(path), "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "repository_id": 17, "run_id": "synthetic", "proof": str(proof), "immutable_initial_proof": str(initial)}
 
 
 def test_complete_capture_omits_verified_mirror_and_restores_offline(tmp_path, monkeypatch):
@@ -635,3 +646,296 @@ def test_finalizer_combines_parent_and_current_capture_with_original_shas(tmp_pa
     inherited = summary["repositories"][0]
     assert inherited["collector_code_sha"] == "a" * 40 and inherited["source_release_tag"] == args.parent_release_tag
     assert inherited["index_sha256"] == hashlib.sha256(data[12]).hexdigest()
+
+
+def multi_parent_fixture(tmp_path, monkeypatch):
+    _, _, config, identities = sources(tmp_path, ("example/one", "example/two", "example/three"))
+    tags = ["corpus-baseline-101-1", "corpus-baseline-99-1"]
+    releases = {tag: {"id": 100 + n, "draft": True, "tag_name": tag, "target_commitish": code,
+                      "body": f"Parent release: {tags[1-n]}"}
+                for n, (tag, code) in enumerate(zip(tags, ("b" * 40, "a" * 40)))}
+    data, assets, indices, calls = {}, {tag: [] for tag in tags}, {}, []
+    sequence = [1000]
+
+    def add_json(tag, name, value):
+        sequence[0] += 1
+        raw = canonical_json(value)
+        data[sequence[0]] = raw
+        asset = {"id": sequence[0], "name": name, "size": len(raw), "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                 "state": "uploaded"}
+        assets[tag].append(asset)
+        return asset
+
+    def add_capture(tag, slug, *, complete=True, repo_id=17, run_id=None):
+        request = argparse.Namespace(slug=slug, release_tag=tag, code_sha=releases[tag]["target_commitish"])
+        index = accepted_index(identities, request)
+        name = baseline.repository_key(slug)
+        manifest = index["manifests"][0]
+        manifest.update(repository_id=repo_id, run_id=run_id or (name + tag))
+        manifest["sha256"] = hashlib.sha256((tag + slug + manifest["run_id"]).encode()).hexdigest()
+        index["collector_result"].update(repository_id=repo_id, run_id=manifest["run_id"], manifest_sha256=manifest["sha256"])
+        part = index["archive"]["parts"][0]
+        part.update(name=name + "." + tag + ".enc", sha256=hashlib.sha256((tag + slug).encode()).hexdigest())
+        if not complete:
+            index.update(complete=False, capture_accepted=False, status="incomplete", errors=["synthetic partial"])
+            index["collector_result"]["status"] = "partial"
+        index_asset = add_json(tag, name + ".index.json", index)
+        sequence[0] += 1
+        assets[tag].append({"id": sequence[0], "name": part["name"], "size": part["bytes"],
+                            "digest": "sha256:" + part["sha256"], "state": "uploaded"})
+        indices[tag, slug] = index, index_asset
+        return index, index_asset
+
+    add_capture(tags[0], "example/one", complete=False)
+    add_capture(tags[0], "example/two", repo_id=18)
+    old_index, _ = add_capture(tags[1], "example/one")
+    original = old_index["archive"]["parts"][0]
+    plain_asset = assets[tags[1]].pop()
+    cipher = {"name": original["name"] + ".migrated.enc", "sha256": "c" * 64, "bytes": 101}
+    assets[tags[1]].append({**plain_asset, "name": cipher["name"], "digest": "sha256:" + cipher["sha256"], "size": 101})
+    migration = {"schema_version": 1, "parts": {original["name"]: {
+        "plaintext": {key: original[key] for key in ("name", "sha256", "bytes")}, "ciphertext": cipher}}}
+    add_json(tags[1], "encryption-migration-index.json", migration)
+
+    def gh(*arguments, **kwargs):
+        calls.append(arguments)
+        route = arguments[1]
+        if "/releases/assets/" in route:
+            return data[int(route.rsplit("/", 1)[1])]
+        return canonical_json(releases[route.rsplit("/", 1)[1]])
+
+    monkeypatch.setattr(baseline, "gh", gh)
+    monkeypatch.setattr(baseline, "release_assets", lambda repo, rid: assets[next(tag for tag, release in releases.items() if release["id"] == rid)])
+    monkeypatch.setattr(baseline, "downloaded_asset_identity", lambda *a: pytest.fail("Planner downloaded an archive payload"))
+    monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config, identities))
+    args = argparse.Namespace(config=tmp_path / "config.toml", csv=tmp_path / "cohort.csv", release_repository="owner/private",
+                              parent_release_tag=tags[0], additional_parent_release_tag=[tags[1]], github_output=None,
+                              plan_output=tmp_path / "resume-plan.json")
+    return args, config, identities, tags, releases, assets, indices, data, calls, add_capture
+
+
+def test_explicit_parent_chain_keeps_older_complete_over_nearer_partial_and_ignores_note_cycles(tmp_path, monkeypatch):
+    args, config, identities, tags, _, _, indices, _, calls, _ = multi_parent_fixture(tmp_path, monkeypatch)
+    assert baseline.plan(args) == 0
+    plan = json.loads(args.plan_output.read_bytes())
+    assert plan["parent_release_tags"] == tags
+    assert plan["reused_repository_count"] == 2 and plan["remaining_repositories"] == ["example/three"]
+    older = plan["reused_captures"][0]
+    assert older["source_release_tag"] == tags[1] and older["repository_id"] == 17
+    assert older["collector_code_sha"] == "a" * 40
+    assert older["source_index_asset_id"] == indices[tags[1], "example/one"][1]["id"]
+    assert older["archive_transport_aliases"] and older["transport_index_sha256"]
+    assert older["verified_archive_assets"][0]["name"].endswith(".migrated.enc")
+    assert len(older["accepted_parent_references"]) == 1
+    assert [call[1].rsplit("/", 1)[1] for call in calls if "/releases/tags/" in call[1]] == tags
+
+
+@pytest.mark.parametrize("conflict", ["repository_id", "manifest", "bundle", "code"])
+def test_every_parent_is_checked_and_conflicting_accepted_identity_is_rejected(tmp_path, monkeypatch, conflict):
+    args, config, identities, tags, releases, _, indices, data, _, add_capture = multi_parent_fixture(tmp_path, monkeypatch)
+    # The nearest parent covers every target; older evidence must still be checked.
+    current, asset = indices[tags[0], "example/one"]
+    current.update(complete=True, capture_accepted=True, status="complete_for_declared_shallow_baseline", errors=[])
+    current["collector_result"]["status"] = "complete"
+    add_capture(tags[0], "example/three", repo_id=19)
+    older = indices[tags[1], "example/one"][0]
+    if conflict == "repository_id":
+        current["manifests"][0]["repository_id"] = current["collector_result"]["repository_id"] = 99
+    else:
+        current["manifests"][0]["run_id"] = current["collector_result"]["run_id"] = older["manifests"][0]["run_id"]
+        if conflict != "manifest":
+            current["manifests"][0]["sha256"] = current["collector_result"]["manifest_sha256"] = older["manifests"][0]["sha256"]
+        if conflict != "code":
+            releases[tags[0]]["target_commitish"] = current["collector_code_sha"] = "a" * 40
+            for slug in ("example/two", "example/three"):
+                other, remote = indices[tags[0], slug]
+                other["collector_code_sha"] = "a" * 40
+                raw = canonical_json(other)
+                data[remote["id"]] = raw
+                remote.update(size=len(raw), digest="sha256:" + hashlib.sha256(raw).hexdigest())
+        if conflict == "bundle":
+            current["manifests"][0]["portable_full_bundle"]["sha256"] = "0" * 64
+    raw = canonical_json(current)
+    data[asset["id"]] = raw
+    asset.update(size=len(raw), digest="sha256:" + hashlib.sha256(raw).hexdigest())
+    with pytest.raises(ValueError, match="Conflicting"):
+        baseline.parent_capture_outcomes_many(config, identities, args.release_repository, tags)
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "self", "cap"])
+def test_explicit_parent_cycles_duplicates_and_bounds_fail_before_reads(tmp_path, monkeypatch, invalid):
+    args, _, _, tags, _, _, _, _, calls, _ = multi_parent_fixture(tmp_path, monkeypatch)
+    if invalid == "duplicate":
+        args.additional_parent_release_tag = [tags[0]]
+    elif invalid == "self":
+        args.release_tag = tags[0]
+    else:
+        args.additional_parent_release_tag = [f"corpus-baseline-{n}-1" for n in range(16)]
+    with pytest.raises(ValueError):
+        baseline.plan(args)
+    assert not calls
+
+
+def test_duplicate_asset_names_in_any_requested_parent_are_rejected(tmp_path, monkeypatch):
+    args, config, identities, tags, _, assets, _, _, _, _ = multi_parent_fixture(tmp_path, monkeypatch)
+    assets[tags[1]].append(dict(assets[tags[1]][0]))
+    with pytest.raises(ValueError, match="Duplicate"):
+        baseline.parent_capture_outcomes_many(config, identities, args.release_repository, tags)
+
+
+def test_same_repo_different_observation_times_keep_all_accepted_references_in_priority_order(tmp_path, monkeypatch):
+    args, config, identities, tags, _, _, indices, data, _, _ = multi_parent_fixture(tmp_path, monkeypatch)
+    index, asset = indices[tags[0], "example/one"]
+    index.update(complete=True, capture_accepted=True, status="complete_for_declared_shallow_baseline", errors=[])
+    index["collector_result"]["status"] = "complete"
+    raw = canonical_json(index)
+    data[asset["id"]] = raw
+    asset.update(size=len(raw), digest="sha256:" + hashlib.sha256(raw).hexdigest())
+    outcomes = baseline.parent_capture_outcomes_many(config, identities, args.release_repository, tags)
+    assert outcomes["example/one"]["source_release_tag"] == tags[0]
+    assert [row["source_release_tag"] for row in outcomes["example/one"]["accepted_parent_references"]] == tags
+
+
+def test_finalizer_checks_current_capture_against_every_accepted_parent_reference(tmp_path, monkeypatch):
+    args, _, _, tags, releases, assets, indices, data, _, add_capture = multi_parent_fixture(tmp_path, monkeypatch)
+    nearest, nearest_asset = indices[tags[0], "example/one"]
+    nearest.update(complete=True, capture_accepted=True, status="complete_for_declared_shallow_baseline", errors=[])
+    nearest["collector_result"]["status"] = "complete"
+    raw = canonical_json(nearest)
+    data[nearest_asset["id"]] = raw
+    nearest_asset.update(size=len(raw), digest="sha256:" + hashlib.sha256(raw).hexdigest())
+    current_tag = "corpus-baseline-200-1"
+    releases[current_tag] = {"id": 777, "draft": True, "target_commitish": "d" * 40}
+    assets[current_tag] = []
+    older_run = indices[tags[1], "example/one"][0]["manifests"][0]["run_id"]
+    add_capture(current_tag, "example/one", run_id=older_run)
+    args.release_tag, args.code_sha, args.work_root = current_tag, "d" * 40, tmp_path / "finalize"
+    monkeypatch.setattr(baseline, "upload_asset", lambda *a: pytest.fail("Conflicting current capture reached publication"))
+    with pytest.raises(ValueError, match="Current capture conflicts"):
+        baseline.finalize(args)
+
+
+def test_multi_parent_finalizer_retains_order_and_original_capture_transport_references(tmp_path, monkeypatch):
+    args, _, _, tags, releases, assets, _, _, _, add_capture = multi_parent_fixture(tmp_path, monkeypatch)
+    current_tag = "corpus-baseline-300-1"
+    releases[current_tag] = {"id": 888, "draft": True, "target_commitish": "d" * 40}
+    assets[current_tag] = []
+    add_capture(current_tag, "example/three", repo_id=19)
+    args.release_tag, args.code_sha, args.work_root = current_tag, "d" * 40, tmp_path / "finalize"
+    original_gh, inventories = baseline.gh, []
+
+    def gh(*arguments, **kwargs):
+        return b"" if arguments[:2] == ("release", "edit") else original_gh(*arguments, **kwargs)
+
+    monkeypatch.setattr(baseline, "gh", gh)
+    monkeypatch.setattr(baseline, "upload_asset", lambda tag, path, repository: inventories.append(json.loads(path.read_bytes())))
+    assert baseline.finalize(args) == 0
+    summary = inventories[0]
+    assert summary["parent_release_tags"] == tags and summary["complete_repositories"] == 3
+    older, nearest, own = summary["repositories"]
+    assert older["source_release_tag"] == tags[1] and older["collector_code_sha"] == "a" * 40
+    assert older["transport_index_sha256"] and older["verified_archive_assets"]
+    assert older["timestamp_sidecar_status"].startswith("not_recorded")
+    assert nearest["source_release_tag"] == tags[0] and nearest["collector_code_sha"] == "b" * 40
+    assert own["repository"] == "example/three" and "source_release_tag" not in own
+
+
+def test_multi_parent_tampered_index_is_not_accepted_and_never_downloads_payload(tmp_path, monkeypatch):
+    args, _, _, tags, _, _, indices, _, _, _ = multi_parent_fixture(tmp_path, monkeypatch)
+    indices[tags[0], "example/two"][1]["digest"] = "sha256:" + "0" * 64
+    assert baseline.plan(args) == 0
+    plan = json.loads(args.plan_output.read_bytes())
+    assert plan["reused_repository_count"] == 1
+    assert plan["remaining_repositories"] == ["example/two", "example/three"]
+    assert plan["reused_captures"][0]["source_release_tag"] == tags[1]
+
+
+def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and_idempotent(tmp_path, monkeypatch):
+    from icsot_observer.attestations import inspect_ots_receipt
+    from icsot_observer.proof_maintenance import empty_state
+    _, _, config, identities = sources(tmp_path, ("example/one",))
+    args = args_for(tmp_path, tmp_path / "config.toml", tmp_path / "cohort.csv")
+    monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config, identities))
+    monkeypatch.setattr(baseline, "collect_one", make_portable_capture)
+    assets, contents, uploads, events = [], {}, [], []
+    release = {"id": 101, "draft": True, "target_commitish": args.code_sha}
+
+    def upload(tag, path, repository):
+        assert all(asset["name"] != path.name for asset in assets)
+        raw = path.read_bytes()
+        asset = {"id": 1000 + len(assets), "name": path.name, "size": len(raw), "state": "uploaded",
+                 "digest": "sha256:" + hashlib.sha256(raw).hexdigest()}
+        assets.append(asset)
+        contents[path.name] = raw
+        uploads.append(path.name)
+        events.append("upload:" + path.name)
+
+    def gh(*arguments, **kwargs):
+        if arguments[:2] == ("release", "edit"):
+            release["draft"] = False
+            events.append("publish")
+            return b""
+        if "/releases/assets/" in arguments[1]:
+            identifier = int(arguments[1].rsplit("/", 1)[1])
+            return contents[next(asset["name"] for asset in assets if asset["id"] == identifier)]
+        return canonical_json(release)
+
+    class Registry:
+        def __init__(self):
+            self.head, self.state, self.records, self.saves = None, empty_state(), {}, 0
+            self.defer_once = True
+
+        def load(self):
+            return self.head, json.loads(json.dumps(self.state))
+
+        def record(self, head, path):
+            return self.records.get(path)
+
+        def fetch(self, ref):
+            raw = contents[ref["name"]]
+            assert ref["release_tag"] == args.release_tag
+            assert hashlib.sha256(raw).hexdigest() == ref["sha256"] and len(raw) == ref["bytes"]
+            return raw
+
+        def save(self, parent, state, records=None):
+            assert parent == self.head
+            if self.defer_once:
+                from icsot_observer.github_state import StateDeferredError
+                self.defer_once = False
+                raise StateDeferredError("baseline registration deferred", retry_not_before=2000000000)
+            self.saves += 1
+            self.head, self.state = str(self.saves), state
+            self.records.update(records or {})
+            events.append("register")
+            return self.head
+
+    registry = Registry()
+    monkeypatch.setattr(baseline, "upload_asset", upload)
+    monkeypatch.setattr(baseline, "gh", gh)
+    monkeypatch.setattr(baseline, "release_assets", lambda *a: list(assets))
+    monkeypatch.setattr("icsot_observer.github_state.GhCliStateTransport", lambda repository: registry)
+    assert baseline.capture(args) == 0
+    index_name = baseline.repository_key(args.slug) + ".index.json"
+    index = json.loads(contents[index_name])
+    evidence = index["timestamp_evidence"]["opentimestamps"]
+    assert index["manifest_sha256"] == index["collector_result"]["manifest_sha256"] == evidence["metadata"]["subject_sha256"]
+    for sidecar in index["public_sidecars"]:
+        assert uploads.index(sidecar["name"]) < uploads.index(index_name)
+        assert hashlib.sha256(contents[sidecar["name"]]).hexdigest() == sidecar["sha256"]
+    assert inspect_ots_receipt(contents[evidence["proof_asset"]["name"]], index["manifest_sha256"])["status"] == "pending_bitcoin_completion"
+    assert evidence["metadata"]["verification"]["bitcoin_verified"] is False
+    from icsot_observer.github_state import StateDeferredError
+    with pytest.raises(StateDeferredError, match="baseline registration deferred"):
+        baseline.finalize(args)
+    assert release["draft"] is True and registry.head is None
+    assert uploads[-2:] == ["baseline-inventory.json", "metadata-catalog.json"]
+    upload_count = len(uploads)
+    assert baseline.finalize(args) == 0
+    assert len(uploads) == upload_count
+    assert events[-2:] == ["register", "publish"]
+    marker = json.loads(contents["metadata-catalog.json"])
+    assert marker["observations"][0]["manifest_sha256"] == index["manifest_sha256"]
+    assert marker["observations"][0]["index"]["sha256"] == hashlib.sha256(contents[index_name]).hexdigest()
+    assert len(registry.state["pending"]) == 1
+    assert baseline.finalize(args) == 0
+    assert len(uploads) == upload_count and registry.saves == 1

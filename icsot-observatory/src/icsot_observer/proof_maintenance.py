@@ -37,7 +37,8 @@ MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_INCOMPLETE_RELEASES = 4096
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\Z")
-OBSERVATION = re.compile(r"collector-observations-r[1-9][0-9]*-g[0-9a-f]{32}\Z")
+OBSERVATION = re.compile(
+    r"(?:collector-observations-r[1-9][0-9]*-g[0-9a-f]{32}|corpus-baseline-[0-9]+-[0-9]+)\Z")
 
 
 def _json(raw: bytes) -> dict:

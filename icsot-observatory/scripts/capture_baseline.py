@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from icsot_observer.checks import verify_all
-from icsot_observer.core import Config, ObjectStore, REPO_RE, canonical_json, sha256, utc_iso
+from icsot_observer.core import Config, ObjectStore, REPO_RE, canonical_json, sha256, utc_iso, write_once
 from icsot_observer.gitstore import run_git
 from icsot_observer.encryption import encrypt_file, public_key_fingerprint
 from icsot_observer.pipeline import collect_one, restore_mirrors as restore_evidence_mirrors
@@ -37,6 +37,7 @@ EXPECTED_REPOSITORIES = 185
 CAPTURE_TIMEOUT_SECONDS = 120 * 60
 VERIFICATION_TIMEOUT_SECONDS = 20 * 60
 RESULTS_PUBLIC_KEY = Path(__file__).resolve().parents[1] / "keys/results-rsa-public.pem"
+MAX_PARENT_RELEASES = 16
 SCOPE = (
     "One initial public GitHub observation: shallow full REST listings, advertised "
     "branch/tag/pull-head Git refs and reachable Git objects. Per-item historical "
@@ -418,6 +419,27 @@ def release_capture_outcome(slug: str, repository: str, tag: str, assets: dict,
             raise ValueError("Index source identity mismatch")
         row.update({"index_sha256": sha256(raw), "capture_status": index["status"],
                     "capture_accepted": index["capture_accepted"], "manifests": index["manifests"]})
+        if "timestamp_evidence" in index:
+            if not isinstance(index["timestamp_evidence"], dict) or not isinstance(index.get("public_sidecars"), list):
+                raise ValueError("Invalid public timestamp evidence")
+            sidecars = index["public_sidecars"]
+            if len({item["name"] for item in sidecars}) != len(sidecars):
+                raise ValueError("Duplicate public timestamp sidecar")
+            for item in sidecars:
+                if (not isinstance(item.get("name"), str) or type(item.get("bytes")) is not int or item["bytes"] <= 0 or
+                        not isinstance(item.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
+                    raise ValueError("Invalid public timestamp sidecar identity")
+                remote = assets[item["name"]]
+                if parent and not remote.get("digest"):
+                    raise ValueError("Parent timestamp sidecar has no remote SHA-256 digest")
+                verify_remote_asset(repository, remote, item)
+            ots = index["timestamp_evidence"].get("opentimestamps", {})
+            if "metadata" in ots and any(ots[key] not in sidecars for key in ("proof_asset", "metadata_asset")):
+                raise ValueError("Timestamp evidence references an unpublished sidecar")
+            row.update(timestamp_evidence=index["timestamp_evidence"], public_sidecars=sidecars,
+                       timestamp_sidecar_status="published" if "metadata" in ots else ots.get("status", "not_collected"))
+        else:
+            row["timestamp_sidecar_status"] = "not_recorded_in_original_index; encrypted_receipt_backfill_not_attempted"
         if parent:
             row.update({"source_release_tag": tag, "source_release_repository": repository,
                         "source_index_asset_id": asset["id"], "collector_code_sha": capture_sha})
@@ -456,6 +478,10 @@ def release_capture_outcome(slug: str, repository: str, tag: str, assets: dict,
             if parent and not remote.get("digest"):
                 raise ValueError("Parent archive part has no remote SHA-256 digest")
             verify_remote_asset(repository, remote, identity)
+            if parent:
+                row.setdefault("verified_archive_assets", []).append({
+                    "id": remote["id"], "name": remote["name"], "sha256": identity["sha256"], "bytes": identity["bytes"],
+                })
         row["complete"] = bool(index_capture_accepted(index) and index["archive"].get("complete") is True and parts)
         if index.get("complete") and not row["complete"]:
             row["errors"].append("Index claims completion but acceptance evidence is inconsistent")
@@ -471,7 +497,7 @@ def parent_capture_outcomes(config: Config, sources: dict, repository: str, tag:
     target = release.get("target_commitish", "")
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target):
         raise ValueError("Parent release must identify a full capture code SHA")
-    assets = {asset["name"]: asset for asset in release_assets(repository, release["id"])}
+    assets = unique_release_assets(release_assets(repository, release["id"]))
     migration_asset = assets.get("encryption-migration-index.json")
     aliases, migration_raw = {}, None
     if migration_asset:
@@ -484,25 +510,114 @@ def parent_capture_outcomes(config: Config, sources: dict, repository: str, tag:
     outcomes = {slug: release_capture_outcome(slug, repository, tag, assets, sources, target, parent=True,
                                              transport_aliases=aliases) for slug in config.repositories}
     for row in outcomes.values():
+        if row.get("complete"):
+            row.update({"source_release_id": release["id"], "source_release_target_commitish": target,
+                        "repository_id": row["manifests"][0]["repository_id"]})
         if row.get("archive_transport_aliases"):
             row.update({"transport_index_asset": migration_asset["name"],
+                        "transport_index_asset_id": migration_asset["id"],
                         "transport_index_sha256": sha256(migration_raw)})
     return outcomes
 
 
+def unique_release_assets(items: list[dict]) -> dict[str, dict]:
+    assets = {}
+    for asset in items:
+        name = asset["name"]
+        if not isinstance(name, str) or name in assets:
+            raise ValueError("Duplicate or invalid release asset name")
+        assets[name] = asset
+    return assets
+
+
+def requested_parent_tags(args) -> list[str]:
+    primary = getattr(args, "parent_release_tag", None)
+    tags = ([primary] if primary else []) + list(getattr(args, "additional_parent_release_tag", None) or [])
+    tags = [tag.strip() for tag in tags]
+    if len(tags) > MAX_PARENT_RELEASES:
+        raise ValueError(f"At most {MAX_PARENT_RELEASES} explicit parent releases are supported")
+    if any(not re.fullmatch(r"corpus-baseline-[0-9]+-[0-9]+", tag) for tag in tags):
+        raise ValueError("Invalid parent release tag")
+    if len(set(tags)) != len(tags):
+        raise ValueError("Duplicate parent releases are not allowed")
+    if getattr(args, "release_tag", None) in tags:
+        raise ValueError("Parent and current release must differ")
+    return tags
+
+
+def _capture_identity(row: dict) -> tuple[int, str, tuple]:
+    manifest = row["manifests"][0]
+    bundle = manifest["portable_full_bundle"]
+    return manifest["repository_id"], manifest["run_id"], (
+        manifest["sha256"], bundle["sha256"], bundle["bytes"], row["collector_code_sha"])
+
+
+def _capture_reference(row: dict) -> dict:
+    return {key: value for key, value in row.items() if key != "accepted_parent_references"}
+
+
+def parent_capture_outcomes_many(config: Config, sources: dict, repository: str, tags: list[str]) -> dict[str, dict]:
+    """Union explicit parents; never infer lineage from mutable release notes."""
+    if len(tags) > MAX_PARENT_RELEASES or len(set(tags)) != len(tags):
+        raise ValueError("Parent list exceeds its bound or contains a duplicate/cycle")
+    selected: dict[str, dict] = {}
+    references: dict[str, list[dict]] = {}
+    seen_capture: dict[tuple[int, str], tuple] = {}
+    seen_index_asset: dict[tuple[str, int], str] = {}
+    repository_ids: dict[str, int] = {}
+    # Validate every requested release, even if an earlier parent covers all.
+    for tag in tags:
+        outcomes = parent_capture_outcomes(config, sources, repository, tag)
+        for slug, row in outcomes.items():
+            if slug not in selected:
+                selected[slug] = row
+            if not row.get("complete"):
+                continue
+            repo_id, capture_id, fingerprint = _capture_identity(row)
+            if slug in repository_ids and repository_ids[slug] != repo_id:
+                raise ValueError(f"Conflicting stable repository IDs across accepted parents: {slug}")
+            repository_ids[slug] = repo_id
+            identity = (repo_id, capture_id)
+            if identity in seen_capture and seen_capture[identity] != fingerprint:
+                raise ValueError(f"Conflicting accepted capture identity across parents: {slug}")
+            seen_capture[identity] = fingerprint
+            asset_key = (row["source_release_repository"], row["source_index_asset_id"])
+            if asset_key in seen_index_asset and seen_index_asset[asset_key] != row["index_sha256"]:
+                raise ValueError("One source index asset ID has conflicting SHA-256 identities")
+            seen_index_asset[asset_key] = row["index_sha256"]
+            references.setdefault(slug, []).append(_capture_reference(row))
+            if not selected[slug].get("complete"):
+                selected[slug] = row
+    if len(tags) > 1:
+        for slug, refs in references.items():
+            selected[slug] = {**selected[slug], "accepted_parent_references": refs}
+    return selected
+
+
 def plan(args) -> int:
     config, sources = load_sources(args.config, args.csv)
-    parent_tag = getattr(args, "parent_release_tag", None)
-    inherited = parent_capture_outcomes(config, sources, args.release_repository, parent_tag) if parent_tag else {}
+    parent_tags = requested_parent_tags(args)
+    inherited = parent_capture_outcomes_many(config, sources, args.release_repository, parent_tags) if parent_tags else {}
     remaining = [slug for slug in config.repositories if not inherited.get(slug, {}).get("complete")]
     outputs = {"matrix": json.dumps({"include": [{"slug": slug, "key": repository_key(slug)} for slug in remaining]},
                                     separators=(",", ":")),
                "remaining_count": len(remaining), "inherited_complete_count": len(config.repositories) - len(remaining),
+               "parent_release_tags": json.dumps(parent_tags, separators=(",", ":")),
                **sources}
     if args.github_output:
         with args.github_output.open("a") as output:
             for key, value in outputs.items():
                 output.write(f"{key}={value}\n")
+    if getattr(args, "plan_output", None):
+        write_once(args.plan_output, canonical_json({
+            "schema_version": 1, "planned_at": utc_iso(), "release_repository": getattr(args, "release_repository", None),
+            "parent_release_tags": parent_tags, **sources,
+            "reused_repository_count": outputs["inherited_complete_count"],
+            "remaining_count": len(remaining), "remaining_repositories": remaining,
+            "reused_captures": [inherited[slug] for slug in config.repositories if inherited.get(slug, {}).get("complete")],
+            "remaining_parent_outcomes": [inherited[slug] for slug in remaining if slug in inherited],
+            "claim": "Metadata-only accepted-capture reuse; no archive payload download or new observation. Live outcomes may change after planned_at.",
+        }))
     print(json.dumps(outputs, indent=2))
     return 0
 
@@ -609,6 +724,27 @@ def capture(args) -> int:
             except Exception as error:
                 part["uploaded"] = False
                 index["errors"].append(f"Upload {part['name']}: {type(error).__name__}: {error}")
+        index["public_sidecars"] = []
+        index["timestamp_evidence"] = {"opentimestamps": {"status": "not_collected"}}
+        if len(manifests) == 1 and result.get("immutable_initial_proof"):
+            try:
+                from icsot_observer.attestations import publish_ots_attestation
+                manifest = manifests[0]
+                timing = result.get("timestamp_provenance", {})
+                evidence = publish_ots_attestation(
+                    assets, manifest_sha256=manifest["sha256"], proof_path=Path(result["immutable_initial_proof"]),
+                    observation_started_at=manifest["started_at"], observation_finished_at=manifest["finished_at"],
+                    requested_at=timing.get("requested_at"), received_at=timing.get("received_at"),
+                    collected_at=timing.get("receipt_collected_at"))
+                for sidecar in (evidence["proof_asset"], evidence["metadata_asset"]):
+                    upload_asset(args.release_tag, assets / sidecar["name"], args.release_repository)
+                index.update(observation_started_at=manifest["started_at"], observation_finished_at=manifest["finished_at"],
+                             manifest_sha256=manifest["sha256"], repository_id=manifest["repository_id"],
+                             clock_source="runner_system_clock", public_sidecars=[evidence["proof_asset"], evidence["metadata_asset"]],
+                             timestamp_evidence={"opentimestamps": evidence})
+            except Exception as error:
+                index["timestamp_evidence"] = {"opentimestamps": {"status": "publication_failed"}}
+                index["errors"].append(f"Timestamp sidecars: {type(error).__name__}: {error}")
         index["finished_at"] = utc_iso()
         index["complete"] = bool(index["capture_accepted"] and archive["complete"] and archive["parts"] and
                                  all(part["uploaded"] for part in archive["parts"]) and not index["errors"])
@@ -623,6 +759,53 @@ def capture(args) -> int:
     return 0 if index["complete"] else 2
 
 
+def publish_baseline_timestamp_catalog(args, summary: dict, current_rows: list[dict], assets: dict, *, draft: bool) -> None:
+    """One finalizer barrier; capture jobs never race on the shared filename."""
+    existing = assets.get("metadata-catalog.json")
+    if existing is None and not any("timestamp_evidence" in row for row in current_rows):
+        return  # Frozen older indexes remain valid; no receipt backfill/decryption.
+    indexes, observations, gaps = [], [], []
+    for row in current_rows:
+        if not row.get("index_sha256"):
+            continue
+        ref = {"release_tag": args.release_tag, "name": row["index_asset"],
+               "sha256": row["index_sha256"], "bytes": assets[row["index_asset"]]["size"]}
+        indexes.append(ref)
+        ots = row.get("timestamp_evidence", {}).get("opentimestamps", {})
+        if "metadata" not in ots:
+            gaps.append({"repository": row["repository"], "index": ref,
+                         "status": row.get("timestamp_sidecar_status", "public_proof_unavailable")})
+            continue
+        observations.append({"repository": row["repository"], "manifest_sha256": ots["metadata"]["subject_sha256"],
+                             "index": ref, "timestamp_evidence": row["timestamp_evidence"],
+                             "public_sidecars": [{"release_tag": args.release_tag, **item} for item in row["public_sidecars"]]})
+    value = {"schema_version": 1, "kind": "icsot_evidence_metadata_catalog", "generation_release": args.release_tag,
+             "publication_recorded_at": summary["finalized_at"], "clock_source": "runner_system_clock",
+             "parent_release_tags": requested_parent_tags(args), "indexes": indexes, "observations": observations,
+             "indexes_without_public_proof": gaps,
+             "inherited_public_proof_backfill_gaps": [
+                 {"repository": row["repository"], "source_release_tag": row.get("source_release_tag"),
+                  "index_sha256": row.get("index_sha256"), "status": row["timestamp_sidecar_status"]}
+                 for row in summary["repositories"] if row.get("source_release_tag") and
+                 row.get("timestamp_sidecar_status", "").startswith("not_recorded")],
+             "inventory_sha256": sha256((args.work_root / "baseline-inventory.json").read_bytes())}
+    destination = args.work_root / "metadata-catalog.json"
+    if existing is not None:
+        recorded, raw = read_json_asset(args.release_repository, existing)
+        if recorded != value:
+            raise ValueError("Existing timestamp catalog differs from verified outcomes; refusing overwrite")
+        destination.write_bytes(raw)
+    else:
+        if not draft:
+            return  # Do not add metadata to a frozen historical published release.
+        write_json(destination, value)
+        upload_asset(args.release_tag, destination, args.release_repository)
+    from icsot_observer.github_state import GhCliStateTransport
+    from icsot_observer.proof_maintenance import register_catalog
+    register_catalog(GhCliStateTransport(args.release_repository), {
+        "release_tag": args.release_tag, "name": destination.name, **{key: file_identity(destination)[key] for key in ("sha256", "bytes")}})
+
+
 def finalize(args) -> int:
     config, sources = load_sources(args.config, args.csv)
     release = release_by_tag(args.release_repository, args.release_tag)
@@ -630,11 +813,10 @@ def finalize(args) -> int:
     if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", target) and target.lower() != args.code_sha.lower():
         raise ValueError("Release target commit differs from expected capture code SHA")
     observed_assets = release_assets(args.release_repository, release["id"])
-    assets = {asset["name"]: asset for asset in observed_assets}
-    parent_tag = getattr(args, "parent_release_tag", None)
-    if parent_tag == args.release_tag:
-        raise ValueError("Parent and current release must differ")
-    inherited = parent_capture_outcomes(config, sources, args.release_repository, parent_tag) if parent_tag else {}
+    assets = unique_release_assets(observed_assets)
+    parent_tags = requested_parent_tags(args)
+    parent_tag = parent_tags[0] if parent_tags else None
+    inherited = parent_capture_outcomes_many(config, sources, args.release_repository, parent_tags) if parent_tags else {}
     summary = {
         "schema_version": 1, "release_tag": args.release_tag, "collector_code_sha": args.code_sha,
         "finalizer_code_sha": getattr(args, "finalizer_code_sha", args.code_sha),
@@ -649,8 +831,19 @@ def finalize(args) -> int:
     }
     if parent_tag:
         summary["parent_release_tag"] = parent_tag
+        summary["parent_release_tags"] = parent_tags
+    current_rows = []
     for slug in config.repositories:
         row = release_capture_outcome(slug, args.release_repository, args.release_tag, assets, sources, args.code_sha)
+        current_rows.append(row)
+        prior = inherited.get(slug, {})
+        if row["complete"] and prior.get("complete"):
+            current_id, current_run, current_fingerprint = _capture_identity({**row, "collector_code_sha": args.code_sha})
+            for reference in prior.get("accepted_parent_references", [_capture_reference(prior)]):
+                prior_id, prior_run, prior_fingerprint = _capture_identity(reference)
+                if current_id != prior_id or (current_run == prior_run and current_fingerprint != prior_fingerprint):
+                    raise ValueError(f"Current capture conflicts with an accepted parent identity: {slug}")
+            row["accepted_parent_references"] = prior.get("accepted_parent_references", [_capture_reference(prior)])
         if not row["complete"] and inherited.get(slug, {}).get("complete"):
             row = inherited[slug]
         summary["repositories"].append(row)
@@ -667,6 +860,8 @@ def finalize(args) -> int:
                        "repositories", "complete_repositories", "incomplete_repositories", "complete", "status")
         if parent_tag:
             stable_keys += ("parent_release_tag",)
+            if len(parent_tags) > 1 or "parent_release_tags" in recorded:
+                stable_keys += ("parent_release_tags",)
         if any(recorded.get(key) != summary[key] for key in stable_keys):
             raise ValueError("Existing inventory differs from verified current capture outcomes; refusing overwrite")
         inventory.write_bytes(recorded_raw)
@@ -676,6 +871,7 @@ def finalize(args) -> int:
             raise RuntimeError("Published baseline release has no verifiable inventory")
         write_json(inventory, summary)
         upload_asset(args.release_tag, inventory, args.release_repository)
+    publish_baseline_timestamp_catalog(args, summary, current_rows, assets, draft=release["draft"])
     if not release["draft"]:
         print(json.dumps({**{key: summary[key] for key in ("status", "complete_repositories", "incomplete_repositories")},
                           "already_published": True, "finalizer_code_sha": getattr(args, "finalizer_code_sha", args.code_sha)}, indent=2))
@@ -688,7 +884,7 @@ def finalize(args) -> int:
         "A missing index represents missing/failed transfer, not successful coverage.\n\n"
         f"Collector commit: `{args.code_sha}`. Config SHA-256: `{sources['config_source_sha256']}`. CSV SHA-256: `{sources['csv_sha256']}`.\n\n"
         f"Finalizer commit: `{getattr(args, 'finalizer_code_sha', args.code_sha)}`.\n\n"
-        + (f"Accepted captures referenced from parent release: `{parent_tag}`. Parent assets remain in that release; "
+        + (f"Accepted captures referenced from ordered parent releases: `{', '.join(parent_tags)}`. Parent assets remain in those releases; "
            "each inherited inventory row records its source release, original collector commit, and index SHA-256.\n\n" if parent_tag else "") +
         f"{SCOPE}\n\n"
         "All matrix jobs have reached a terminal state. This release is published once after collection; no cron, later state restore, "
@@ -719,6 +915,7 @@ def main(argv=None) -> int:
         if command == "plan":
             child.add_argument("--github-output", type=Path)
             child.add_argument("--release-repository")
+            child.add_argument("--plan-output", type=Path, help="Create-only local audit of all reused references and remaining targets")
         else:
             child.add_argument("--release-tag", required=True)
             child.add_argument("--release-repository", required=True)
@@ -729,13 +926,15 @@ def main(argv=None) -> int:
                 child.add_argument("--public-key", type=Path, default=RESULTS_PUBLIC_KEY)
         if command in ("plan", "finalize"):
             child.add_argument("--parent-release-tag")
+            child.add_argument("--additional-parent-release-tag", action="append", default=[],
+                               help="Additional explicit fallback parent, in priority order; at most 16 total")
     args = parser.parse_args(argv)
     if args.command == "restore":
         verification = restore_mirrors(args.root)
         print(json.dumps(verification, indent=2))
         return 0 if verification["ok"] else 3
     if args.command == "plan":
-        if args.parent_release_tag and not args.release_repository:
+        if requested_parent_tags(args) and not args.release_repository:
             parser.error("--release-repository is required with --parent-release-tag")
         return plan(args)
     if not REPO_RE.fullmatch(args.release_repository) or not re.fullmatch(r"corpus-baseline-[0-9]+-[0-9]+", args.release_tag):

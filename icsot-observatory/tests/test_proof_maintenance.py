@@ -242,6 +242,57 @@ def test_missing_completion_marker_is_durable_and_later_discovered(tmp_path):
     assert second["proofs_changed"] == 1
 
 
+def test_baseline_marker_fallback_recovers_quota_refused_registration(tmp_path, monkeypatch):
+    github = FakeGitHub()
+    tag = "corpus-baseline-40246318334-2"
+    ref, evidence = observation(tmp_path, github, tag=tag)
+    # The baseline index binds its one frozen manifest both at top level and
+    # within the original capture result; discovery needs the public top-level
+    # subject and never reads an encrypted archive or inherited capture payload.
+    index = json.loads(github.assets[tag, "capture.index.json"])
+    index.update(schema_version=1, repository="libfuse/libfuse", mode="full",
+                 repository_id=123, manifests=[{"sha256": SUBJECT}],
+                 collector_result={"manifest_sha256": SUBJECT, "repository_id": 123},
+                 public_sidecars=[evidence["proof_asset"], evidence["metadata_asset"]],
+                 observation_started_at=START, observation_finished_at=FINISH)
+    encoded_index = canonical_json(index)
+    github.assets[tag, "capture.index.json"] = encoded_index
+    marker = json.loads(github.markers[tag])
+    marker["observations"][0].update(repository="libfuse/libfuse", timestamp_evidence=index["timestamp_evidence"])
+    marker["observations"][0]["index"].update(sha256=sha256(encoded_index), bytes=len(encoded_index))
+    encoded_marker = canonical_json(marker)
+    github.markers[tag] = github.assets[tag, "metadata-catalog.json"] = encoded_marker
+    ref.update(sha256=sha256(encoded_marker), bytes=len(encoded_marker))
+    original_save = github.save
+    def refuse(*args, **kwargs):
+        raise StateDeferredError("controlled registration quota refusal", retry_not_before=2000000000)
+    monkeypatch.setattr(github, "save", refuse)
+    with pytest.raises(StateDeferredError, match="quota refusal"):
+        register_catalog(github, ref)
+    assert github.head is None and github.state["pending"] == {} and github.files == {}
+    monkeypatch.setattr(github, "save", original_save)
+    github.pages[1] = [{"id": 123, "tag_name": tag}]
+    report = refresh(github, client=ControlledClient(), clock=lambda: 10000)
+    assert report["markers_processed"] == 1 and report["proofs_attempted"] == 1
+    assert report["proofs_changed"] == 1 and report["proofs_verified"] == 0
+    assert f"catalogs/{ref['sha256']}.json" in github.files
+    history = json.loads(github.files[f"proofs/{evidence['metadata_asset']['sha256']}.json"])
+    assert history["subject_sha256"] == index["manifest_sha256"] == index["collector_result"]["manifest_sha256"]
+    assert history["maintenance_status"] == "awaiting_trusted_rpc"
+
+
+def test_legacy_unmarked_baseline_release_stays_explicit_backfill_gap():
+    github = FakeGitHub()
+    tag = "corpus-baseline-40246318334-1"
+    github.pages[1] = [{"id": 123, "tag_name": tag}]
+    report = refresh(github, client=ControlledClient(), clock=lambda: 10000)
+    assert report["status"] == "backlog" and report["incomplete_releases"] == 1
+    assert report["markers_processed"] == report["proofs_attempted"] == 0
+    assert github.state["discovery"]["incomplete_releases"] == [{"id": 123, "tag": tag}]
+    assert github.state["discovery"]["recent_release_ids"] == []
+    assert github.files == {} and github.published == []
+
+
 def test_rolling_cursor_discovers_new_release_outside_recent_page(tmp_path):
     github = FakeGitHub()
     ref, _ = observation(tmp_path, github)
