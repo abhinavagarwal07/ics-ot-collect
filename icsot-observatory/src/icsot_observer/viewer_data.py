@@ -670,6 +670,15 @@ class ViewerData:
                     if cap["manifest"] is None:
                         cap["status"] = summary.get("status") or ("complete" if index.get("capture_accepted") is True else "coverage_unknown")
                         cap["mode"] = summary.get("mode")
+                for seed in index.get("legacy_prerequisites") or []:
+                    from .legacy_seed_catalog import validate_legacy_seed
+                    validate_legacy_seed(seed, repository_id=repo["repository_id"], slug=repo["slug"])
+                    original = seed["source_manifest"]
+                    source_ref = seed["source_index"]
+                    self._add_capture(repo, {**original, "repository_id": repo["repository_id"]},
+                        remote={"release_tag": source_ref["release_tag"], "name": source_ref["name"],
+                                "expected_sha256": source_ref["sha256"], "legacy_seed": seed},
+                        source={"legacy_seed": seed})
                 self._record_attempt(repo, {"release_tag": identity[0], "status": index.get("status", "index_present"),
                     "complete": index.get("complete"), "errors": index.get("errors") or [], "index_asset": identity[1]})
             except (OSError, ValueError, TypeError) as error:
@@ -714,6 +723,21 @@ class ViewerData:
             initial["current_maintenance_gap"] = str(error)
 
     def _fetch_index(self, repo: dict, descriptor: dict) -> dict:
+        if descriptor.get("legacy_seed"):
+            from .legacy_seed_catalog import validate_legacy_seed
+            seed = descriptor["legacy_seed"]
+            validate_legacy_seed(seed, repository_id=repo["repository_id"], slug=repo["slug"])
+            reference = seed["source_index"]
+            if reference["release_repository"] != self.release_repository:
+                raise MetadataError("Legacy source repository differs from configured archive source")
+            index = self.remote.asset({"id": reference["asset_id"], "size": reference["bytes"],
+                                       "digest": "sha256:" + reference["sha256"]}, reference["sha256"])
+            migration_ref = seed["transport"].get("migration_index")
+            migration = self.remote.asset({"id": migration_ref["asset_id"], "size": migration_ref["bytes"],
+                "digest": "sha256:" + migration_ref["sha256"]}, migration_ref["sha256"]) if migration_ref else None
+            validate_legacy_seed(seed, source_index=index, migration_index=migration)
+            descriptor["index"] = index
+            return index
         release = self._releases.get(descriptor.get("release_tag"))
         if release is None:
             raise MetadataError("Referenced parent release has not been inventoried")
@@ -779,6 +803,10 @@ class ViewerData:
             "api": {"started_at": min(starts) if starts else None, "completed_at": max(finishes) if finishes else None},
             "git_refs": {"started_at": _utc(git.get("ls_remote_started_at")), "completed_at": _utc(git.get("ls_remote_completed_at"))}}
         result["git_file_diff"] = self._git_capability(capture)
+        result["legacy_prerequisites"] = [{"kind": seed.get("kind"), "seed_sha256": seed.get("seed_sha256"),
+            "source_index": seed.get("source_index"), "source_manifest": seed.get("source_manifest"),
+            "membership_scope": seed.get("membership_scope"), "import_receipt": seed.get("import_receipt")}
+            for seed in source.get("legacy_prerequisites") or []]
         return result
 
     def _public_repo(self, repo: dict) -> dict:
@@ -1382,7 +1410,13 @@ class ViewerData:
         descriptor = capture.get("remote")
         if not descriptor:
             raise ValueError("No remote archive reference exists for this capture")
+        if descriptor.get("legacy_seed"):
+            return self._legacy_reader(repo, capture, descriptor["legacy_seed"])
         index = descriptor.get("index") or self._fetch_index(repo, descriptor)
+        if index.get("legacy_prerequisites"):
+            from .legacy_seed_catalog import validate_legacy_seed
+            for seed in index["legacy_prerequisites"]:
+                validate_legacy_seed(seed, repository_id=repo["repository_id"], slug=repo["slug"])
         release = self._releases[descriptor["release_tag"]]
         expected_members = None
         archive = index.get("archive") or {}
@@ -1431,6 +1465,38 @@ class ViewerData:
                                        allowed_prefixes=("evidence", "reports"))
         return reader, index
 
+    def _legacy_reader(self, repo: dict, capture: dict, seed: dict):
+        from .archive_reader import ArchivePart, VerifiedArchiveReader
+        from .legacy_seed_catalog import validate_legacy_seed
+        validate_legacy_seed(seed, repository_id=repo["repository_id"], slug=repo["slug"])
+        if seed["source_index"]["release_repository"] != self.release_repository:
+            raise ValueError("Legacy source repository differs from configured read-only archive source")
+        def metadata(ref):
+            asset = {"id": ref["asset_id"], "size": ref["bytes"], "digest": "sha256:" + ref["sha256"]}
+            return self.remote.asset(asset, ref["sha256"])
+        source = metadata(seed["source_index"])
+        migration_ref = seed["transport"].get("migration_index")
+        migration = metadata(migration_ref) if migration_ref else None
+        validate_legacy_seed(seed, repository_id=repo["repository_id"], slug=repo["slug"],
+                             source_index=source, migration_index=migration)
+        contexts = []
+        for row in seed["transport"]["parts"]:
+            cipher, plain = row["ciphertext"], row["plaintext"]
+            if cipher["release_repository"] != self.release_repository:
+                raise ValueError("Legacy source repository differs from configured read-only archive source")
+            asset = {"id": cipher["asset_id"], "size": cipher["bytes"], "digest": "sha256:" + cipher["sha256"]}
+            description = {"name": cipher["name"], "ciphertext_sha256": cipher["sha256"], "ciphertext_bytes": cipher["bytes"],
+                           "plaintext_sha256": plain["sha256"], "plaintext_bytes": plain["bytes"]}
+            contexts.append(self._download_part(asset, description, capture, ArchivePart))
+        return VerifiedArchiveReader(contexts, self.private_key_path, allowed_prefixes=("evidence", "reports")), source
+
+    @staticmethod
+    def _check_legacy_membership(seed: dict, scan):
+        expected = {m["path"]: (m["sha256"], m["bytes"]) for m in seed["members"]}
+        observed = {m.path: (m.sha256, m.bytes) for m in scan.members if m.path in expected}
+        if observed != expected:
+            raise ValueError("Authenticated legacy package does not contain its declared delivered subset")
+
     def _load_remote(self, repo: dict, capture: dict):
         reader, index = self._remote_reader(repo, capture)
         staged: dict[str, bytes] = {}
@@ -1466,16 +1532,55 @@ class ViewerData:
                 staged_manifest_hashes.add(digest)
             total += len(raw)
             capture["progress"].update(phase="authenticating_archive", json_bytes=total)
-        reader.scan(member)
+        scan = reader.scan(member)
+        own_seed = (capture.get("remote") or {}).get("legacy_seed")
+        if own_seed:
+            self._check_legacy_membership(own_seed, scan)
         manifest_raw = staged.get(expected_manifest) or self._manifests.get(expected_manifest)
         if manifest_raw is None:
             raise ValueError("Selected manifest is a prerequisite from an earlier export; load the earlier capture containing it before retrying")
+        if own_seed:
+            from .legacy_seed_catalog import validate_legacy_manifest
+            validate_legacy_manifest(own_seed, manifest_raw)
         manifest = json.loads(manifest_raw)
         if manifest.get("repository_id") != repo["repository_id"] or str(manifest.get("repository_input_slug", "")).lower() != repo["slug"].lower():
             raise ValueError("Decrypted manifest does not belong to selected repository")
         if manifest.get("run_id") != capture["run_id"] or (manifest.get("lane") or "combined") != capture["lane"]:
             raise ValueError("Decrypted manifest run/lane differs from registered capture")
         wanted = {r.get("body_sha256") for r in manifest.get("responses") or []}
+        missing = {digest for digest in wanted if digest and digest not in staged and digest not in self._objects
+                   and not any(_safe_path(root, f"objects/sha256/{digest[:2]}/{digest}").is_file() for root in self.roots)}
+        dependencies_loaded = []
+        for seed in index.get("legacy_prerequisites") or []:
+            supplied = {m["sha256"] for m in seed["members"] if m["path"].startswith("evidence/objects/sha256/")}
+            needed = missing & supplied
+            if not needed:
+                continue
+            dependency_reader, _ = self._legacy_reader(repo, capture, seed)
+            def dependency(record, stream):
+                nonlocal total
+                digest = Path(record.path).name
+                is_manifest = record.path == "evidence/" + seed["source_manifest"]["path"]
+                if digest not in needed and not is_manifest:
+                    return
+                if record.bytes > JSON_LIMIT or total + record.bytes > CAPTURE_MEMORY_LIMIT:
+                    projection_gaps.append({"reason": "legacy_dependency_not_loaded_memory_bound", "member": record.path, "bytes": record.bytes})
+                    return
+                raw = stream.read(record.bytes)
+                actual = sha256(raw)
+                if is_manifest and actual != seed["source_manifest"]["sha256"] or not is_manifest and actual != digest:
+                    raise ValueError("Legacy dependency bytes differ from the frozen source identity")
+                if is_manifest:
+                    from .legacy_seed_catalog import validate_legacy_manifest
+                    validate_legacy_manifest(seed, raw)
+                staged[actual] = raw
+                total += len(raw)
+                if is_manifest:
+                    staged_manifest_hashes.add(actual)
+            dependency_scan = dependency_reader.scan(dependency)
+            self._check_legacy_membership(seed, dependency_scan)
+            dependencies_loaded.append(seed["seed_sha256"])
+            missing -= set(staged)
         selected = {digest: raw for digest, raw in staged.items() if digest in wanted and digest not in self._objects}
         selected_manifests = {digest: staged[digest] for digest in staged_manifest_hashes if digest not in self._manifests}
         additional = sum(map(len, selected.values())) + sum(map(len, selected_manifests.values()))
@@ -1485,7 +1590,8 @@ class ViewerData:
         self._manifests.update(selected_manifests)
         self._memory_bytes += additional
         capture.update(manifest=manifest, coverage=manifest.get("api") or {}, status=manifest.get("status", "coverage_unknown"),
-                       mode=manifest.get("mode"), source=index, projection_gaps=projection_gaps)
+                       mode=manifest.get("mode"), source=index, projection_gaps=projection_gaps,
+                       legacy_dependencies_loaded=dependencies_loaded)
         if index.get("timestamp_evidence"):
             capture["proof"] = _proof(index)
         metadata_key = capture["proof"]["opentimestamps"].get("metadata_sha256")

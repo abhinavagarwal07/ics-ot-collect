@@ -112,6 +112,33 @@ def test_header_reader_never_consumes_payload(original):
     assert capsules.envelope_aad_size(original[1][:13]) == len(original[2])
 
 
+def test_header_inspection_returns_only_public_identity_descriptors(original):
+    _, raw, aad, _, _, metadata = original
+    assert capsules.inspect_envelope_aad(aad) == {
+        "plaintext_sha256": metadata["plaintext_sha256"],
+        "plaintext_bytes": metadata["plaintext_bytes"],
+        "ciphertext_bytes": len(raw),
+        "original_header_sha256": hashlib.sha256(aad[13:]).hexdigest(),
+        "original_aad_sha256": hashlib.sha256(aad).hexdigest(),
+        "owner_key_fingerprint_sha256": metadata["public_key_fingerprint_sha256"],
+    }
+
+
+@pytest.mark.parametrize("mode", ["empty", "truncated", "trailing", "oversized"])
+def test_header_inspection_requires_exact_bounded_aad(original, mode):
+    aad = original[2]
+    if mode == "empty":
+        aad = b""
+    elif mode == "truncated":
+        aad = aad[:-1]
+    elif mode == "trailing":
+        aad += b"x"
+    else:
+        aad = b"x" * (capsules.MAX_AAD_BYTES + 1)
+    with pytest.raises(capsules.CapsuleError):
+        capsules.inspect_envelope_aad(aad)
+
+
 @pytest.mark.parametrize("header_size", [0, 65537, 2 ** 32 - 1])
 def test_header_reader_rejects_unbounded_header_without_reading_body(header_size):
     source = io.BytesIO(struct.pack(">8sBI", b"ICSOTENC", 1, header_size) + b"never read")

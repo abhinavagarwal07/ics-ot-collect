@@ -118,6 +118,24 @@ def read_envelope_aad(source: BinaryIO) -> bytes:
     return aad
 
 
+def inspect_envelope_aad(aad: bytes) -> dict[str, Any]:
+    """Return public identity descriptors from a bounded, validated header.
+
+    No key file is read. The descriptors describe an unauthenticated header;
+    callers must compare them with independently selected index metadata.
+    Original payload authentication still requires full restoration.
+    """
+    header, _, _ = _parse_aad(aad)
+    return {
+        "plaintext_sha256": header["plaintext_sha256"],
+        "plaintext_bytes": header["plaintext_bytes"],
+        "ciphertext_bytes": len(aad) + header["plaintext_bytes"] + _envelope._TAG_BYTES,
+        "original_header_sha256": hashlib.sha256(aad[_envelope._PREFIX.size:]).hexdigest(),
+        "original_aad_sha256": hashlib.sha256(aad).hexdigest(),
+        "owner_key_fingerprint_sha256": header["public_key_fingerprint_sha256"],
+    }
+
+
 def _validate_binding(binding: Any) -> dict[str, Any]:
     if not isinstance(binding, dict) or binding.keys() != _BINDING_FIELDS:
         raise CapsuleError("Unexpected capsule binding fields")

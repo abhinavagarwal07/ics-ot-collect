@@ -423,7 +423,8 @@ class CaptureExporter:
     """
 
     def __init__(self, root: Path, directory: Path, public_key: Path, *, part_bytes: int = 1024 ** 3,
-                 verified_prior_indexes: list[dict[str, Any]] | None = None):
+                 verified_prior_indexes: list[dict[str, Any]] | None = None,
+                 verified_legacy_seeds: list[dict[str, Any]] | None = None):
         from .encryption import public_key_fingerprint
         self.root, self.directory, self.public_key = root.resolve(), directory.resolve(), public_key
         self.recipient = public_key_fingerprint(public_key)
@@ -435,10 +436,21 @@ class CaptureExporter:
         self.delivered: set[str] = set()
         self.delivered_objects: set[str] = set()
         self.known_exports: dict[str, dict] = {}
+        self.legacy_seeds: list[dict] = []
         # Only an adapter's authenticated, remotely reconciled catalog may use
         # this path. Local-only operation still checks its retained ciphertext.
         for index in verified_prior_indexes or []:
             self._register_index(index, verify_assets=False)
+        for seed in verified_legacy_seeds or []:
+            from .legacy_seed_catalog import registerable_members, validate_legacy_seed
+            validate_legacy_seed(seed, root=self.root)
+            if seed["owner_recipient_spki_sha256"] != self.recipient:
+                raise ValueError("Legacy seed owner recipient differs from native evidence recipient")
+            members = registerable_members(seed)
+            self.delivered.update(member["sha256"] for member in members)
+            self.delivered_objects.update(member["sha256"] for member in members
+                                          if member["path"].startswith("objects/sha256/"))
+            self.legacy_seeds.append(seed)
         for path in self.directory.glob("*.index.json"):
             index = json.loads(path.read_bytes())
             self._register_index(index, verify_assets=True)
@@ -521,6 +533,19 @@ class CaptureExporter:
                 if rfc_home.exists():
                     files.update(item for item in rfc_home.rglob("*") if item.is_file())
             files.update(store.location(digest) for digest in objects if digest not in self.delivered_objects)
+            for seed in self.legacy_seeds:
+                receipt_ref = seed["import_receipt"]
+                receipt_path = self.root / receipt_ref["path"]
+                receipt = json.loads(receipt_path.read_bytes())
+                for reference in [receipt_ref, *receipt.get("derived_artifacts", [])]:
+                    relative = Path(reference["path"])
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError("Unsafe derived migration artifact path")
+                    artifact = self.root / relative
+                    if (_file_sha256(artifact) != reference["sha256"] or artifact.stat().st_size != reference["bytes"]):
+                        raise RuntimeError("Derived migration artifact differs from its verified receipt")
+                    if reference["sha256"] not in self.delivered:
+                        files.add(artifact)
             registry = _registry_path(self.root, manifest["repository_input_slug"])
             if registry.exists():
                 files.add(registry)
@@ -547,6 +572,7 @@ class CaptureExporter:
                 "assets": sink.parts, "maximum_plaintext_part_bytes": self.part_bytes,
                 "encoding": "one tar/XZ stream, split in order before independent encryption",
                 "members": members, "requires_cas_sha256": sorted(objects & self.delivered_objects),
+                "legacy_prerequisites": self.legacy_seeds,
                 "previous_manifest_sha256": manifest["previous_manifest_sha256"],
                 "restore": "Verify each encrypted asset hash, decrypt every part, concatenate plaintext parts in listed order, extract into the same evidence root as all prerequisites, then verify and restore Git offline.",
             }
@@ -771,6 +797,7 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                    stamp: bool = True, export_directory: Path | None = None,
                    public_key: Path | None = None,
                    verified_prior_indexes: list[dict[str, Any]] | None = None,
+                   verified_legacy_seeds: list[dict[str, Any]] | None = None,
                    expected_repository_ids: dict[str, int] | None = None,
                    observation_key: str | None = None, controller_locked: bool = False,
                    working_state_origin: str | None = None,
@@ -800,7 +827,8 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
     with nullcontext() if controller_locked else ControllerLock(config.root):
         queue = PersistentQueue(config.root)
         exporter = CaptureExporter(config.root, export_directory, public_key,
-                                   verified_prior_indexes=verified_prior_indexes) if export_directory else None
+                                   verified_prior_indexes=verified_prior_indexes,
+                                   verified_legacy_seeds=verified_legacy_seeds) if export_directory else None
         return _persistent_loop(config, queue, exporter=exporter, once=once, api_workers=api_workers,
                                 git_workers=git_workers, api_interval_seconds=api_interval_seconds,
                                 git_interval_seconds=git_interval_seconds,
@@ -1117,6 +1145,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
         collection = run_persistent(config, once=True, deep_full=deep_full, stamp=stamp,
                                     export_directory=exports, public_key=evidence_public_key,
                                     verified_prior_indexes=[entry["index"] for entry in catalog["exports"]],
+                                    verified_legacy_seeds=catalog.get("legacy_seed_packages", []),
                                     expected_repository_ids={slug: repository_id},
                                     observation_key=observation_key or run_id(), controller_locked=True,
                                     working_state_origin=working_state_origin,
