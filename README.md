@@ -9,12 +9,14 @@ Incremental preservation of public repository observations, with independently v
 - [Storage and launch decision](icsot-observatory/docs/STORAGE.md)
 - [Actions limits, errors and recovery](icsot-observatory/docs/ACTIONS_OPERATIONS.md)
 - [Durable split-lane collection and incremental transfers](icsot-observatory/docs/PERSISTENT.md)
+- [Local capture and diff viewer](icsot-observatory/docs/VIEWER.md)
+- [Bounded recovery audit](icsot-observatory/docs/RECOVERY_AUDIT.md) and [shared 2-GB local disk limit](icsot-observatory/docs/LOCAL_DATA.md)
 
 The selected cohort is all **185 repositories** in [public_patch_corpus_185.csv](public_patch_corpus_185.csv), configured in [config.corpus.toml](icsot-observatory/config.corpus.toml): 42 healthcare, 51 ICS/OT/IIoT and 92 cross-sector projects. CSV order and all selections are preserved, regardless of pilot or priority labels. The CSV retains repository roles, source links and measurement caveats.
 
 Main evidence payloads are encrypted before upload using AES-256-GCM with RSA-OAEP-SHA256 key wrapping. Metadata and the recipient public key are public; the private RSA key stays on the owner's machine. See [encryption and restoration](icsot-observatory/docs/ENCRYPTION.md).
 
-The [replacement encrypted baseline](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40275429320) retains **109 verified complete captures**—94 from the [preceding resumed run](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40253057671) and 15 from the [original run](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40249527444)—and schedules only the **76 unresolved repositories**. Accepted evidence remains in its original releases. The original 16 archive parts and nine historical Actions artifacts were migrated into verified encrypted replacements before this repository became public.
+The [eight-worker resumed baseline](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40294818409) reuses **142 accepted captures** from three explicitly verified parent releases and schedules only **43 unresolved repositories**. Accepted evidence remains in its original releases with original observation times. The original 16 archive parts and nine historical Actions artifacts were migrated into verified encrypted replacements before this repository became public.
 
 [`libfuse/libfuse`](https://github.com/libfuse/libfuse) remains the single-repository smoke target in [config.libfuse.toml](icsot-observatory/config.libfuse.toml).
 

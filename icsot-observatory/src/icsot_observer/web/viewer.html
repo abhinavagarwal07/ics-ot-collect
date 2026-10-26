@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Capture Observatory · Repository changes</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <script src="/viewer.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">◈</span><div>Capture Observatory<span class="brand-sub">ICS / OT PUBLIC REPOSITORIES</span></div></div>
+    <div class="header-right"><span class="local-indicator"><i></i> LOCAL VIEWER</span><span id="budget-label" class="budget-label">Checking local budget…</span><button id="refresh" class="icon-button" title="Refresh local metadata" aria-label="Refresh local metadata">↻</button></div>
+  </header>
+  <div class="app-shell">
+    <aside class="repository-sidebar" aria-label="Repositories">
+      <div class="sidebar-heading"><h2>Repositories <span id="repo-count">—</span></h2><span class="small-label">COHORT</span></div>
+      <label class="search-box"><span aria-hidden="true">⌕</span><input id="repo-search" type="search" placeholder="Find a repository…" autocomplete="off" aria-label="Search repositories"></label>
+      <div class="sidebar-filters"><select id="role-filter" aria-label="Filter repository role"><option value="">All roles</option></select><select id="status-filter" aria-label="Filter capture availability"><option value="">All statuses</option><option value="local">Locally available</option><option value="metadata">Metadata only</option><option value="none">No captures</option></select></div>
+      <div id="repo-list" class="repo-list" aria-live="polite"></div>
+      <div class="sidebar-footer"><span class="footer-symbol">◎</span><div>Evidence stays on this machine<span>Selected captures load on request.</span></div></div>
+    </aside>
+    <main id="main" class="main-panel">
+      <div id="metadata-status" class="metadata-notice" role="status" aria-live="polite" hidden></div>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section class="repository-header">
+        <div class="eyebrow">PRESERVED EVIDENCE <span>/</span> COMPARE CAPTURES</div>
+        <div class="repository-title-row"><div><h1 id="repository-name">Repository changes</h1><p id="repository-description">Choose a repository to explore its capture history.</p></div><span id="repo-status" class="badge neutral">READ ONLY</span></div>
+        <div class="summary-row"><div><span class="summary-number" id="capture-count">—</span><span class="summary-label" id="capture-count-label">captures</span></div><div><span class="summary-number" id="lane-count">—</span><span class="summary-label">capture lanes</span></div><div><span class="summary-number" id="proof-count">—</span><span class="summary-label">locally available</span></div><div class="summary-hint">Capture times are shown in <strong>UTC</strong>.<br>Capture time and timestamp verification are distinct.</div></div>
+      </section>
+      <section class="capture-section" aria-label="Capture selection">
+        <div class="section-line"><h2>Capture timeline</h2><span id="timeline-caption">Metadata first · no automatic evidence downloads</span></div>
+        <div id="timeline" class="timeline"><p class="empty-inline">Capture history will appear here.</p></div>
+        <div class="compare-controls"><label><span>EARLIER CAPTURE</span><select id="left-capture" aria-label="Earlier capture" disabled></select></label><button id="swap-captures" class="swap-button" aria-label="Swap earlier and later captures" title="Swap captures" disabled>⇄</button><label><span>LATER CAPTURE</span><select id="right-capture" aria-label="Later capture" disabled></select></label><button id="load-captures" class="primary-button" disabled>Load selected evidence</button></div>
+        <div id="selection-note" class="selection-note">Choose two captures to inspect observed changes.</div>
+      </section>
+      <nav id="category-tabs" class="category-tabs" aria-label="Evidence categories">
+        <button data-category="issues" class="active">Issues <span></span></button><button data-category="pulls">Pull requests <span></span></button><button data-category="comments">Comments <span></span></button><button data-category="releases">Releases <span></span></button><button data-category="tags">Tags <span></span></button><button data-category="events">Events <span></span></button><button data-category="git">Git refs &amp; files <span></span></button><button data-category="coverage">Coverage &amp; proofs <span></span></button>
+      </nav>
+      <div id="qualification" class="qualification"><span>◌</span><p>Select a repository to begin. Missing observations are never labeled as deletions.</p></div>
+      <section id="comparison" class="comparison" aria-label="Capture comparison">
+        <aside class="change-pane" aria-label="Observed changes"><div class="changes-heading"><h2 id="changes-title">Changes</h2><span id="changes-count">—</span></div><label class="change-filter"><input id="change-search" type="search" placeholder="Filter changes…" aria-label="Filter changes"></label><div id="change-list" class="change-list"><div class="empty-state compact"><span class="empty-symbol">⌁</span><h3>A history to explore</h3><p>Choose captures above to see what was observed.</p></div></div><div id="pagination" class="pagination" hidden><button id="previous-page">← Previous</button><span id="page-label"></span><button id="next-page">Next →</button></div></aside>
+        <article id="detail" class="detail-pane"><div class="empty-state"><span class="empty-symbol">◇</span><h3>Changes, with their evidence</h3><p>Inspect fields, read bodies side by side, and trace an observation to its preserved response.</p><div class="empty-tags"><span>FIELD COMPARISON</span><span>ORIGINAL RECORDS</span><span>CAPTURE COVERAGE</span></div></div></article>
+      </section>
+    </main>
+  </div>
+  <div id="loading" class="loading-pill" role="status" hidden><span></span><span id="loading-text">Reading metadata…</span></div>
+</body>
+</html>

@@ -20,6 +20,8 @@ The manual `Corpus baseline (one time)` workflow preserves full bundles, raw evi
 
 Future baseline dispatches accept integer `max_parallel` from 1 through 16, defaulting to 8; only the validated plan output controls the matrix. Existing runs keep their pinned limit. Workers share API/upload quotas. The initial baseline's one-time 100-GB allowance and future recurring 50-GB UTC-month policy are separate, and runtime budget admission is not implemented. See [storage policy](docs/STORAGE.md) and [Actions operations](docs/ACTIONS_OPERATIONS.md).
 
+The [local capture viewer](docs/VIEWER.md) provides UTC timelines, entity/ref/file comparisons, raw-response provenance, coverage and proof status. Selected encrypted evidence loads explicitly within one shared **2,000,000,000-byte local limit**, including this workspace and temporary files. The [recovery auditor](docs/RECOVERY_AUDIT.md) waits for the complete stable baseline, checks retained payloads and performs bounded Git restoration spot checks. See [local storage controls](docs/LOCAL_DATA.md); no Docker is required.
+
 ## Quickstart
 
 Requirements: Linux/macOS, Python >=3.11, Git, OpenTimestamps CLI (`ots`) from [official client](https://github.com/opentimestamps/opentimestamps-client). For local development tests `ots` can be omitted using `--no-stamp`. Prefer a narrowly scoped **read-only** GitHub App/token restricted to public repositories; `GITHUB_TOKEN` is read from your environment, never stored in run manifests.

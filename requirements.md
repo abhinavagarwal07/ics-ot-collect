@@ -19,6 +19,7 @@ Create local, incremental, independently verifiable records of public GitHub obs
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.
 - The source repository is **public**. The one-time baseline uses standard hosted runners and encrypted XZ Release assets; metadata and the RSA public key may remain public. Incremental collection is implemented, but recurring execution still requires durable working state and operational budget enforcement. Six hours is the initial configurable cadence, not a measured guarantee.
 - Respect Actions runtime/disk/API limits; preserve explicit partial or missing outcomes and repair only affected targets/scopes. Avoid overwriting prior evidence or repeating the entire cohort to repair one failure.
+- **Local disk hard limit: 2,000,000,000 bytes at once**, counting this workspace, caches, temporary downloads, decrypted/expanded data and visualization/spot-check files together. Use one shared admission ledger and stream one archive part at a time; defer any check that cannot fit. Do not use Docker locally.
 
 ## Functional requirements
 
@@ -31,6 +32,8 @@ Create local, incremental, independently verifiable records of public GitHub obs
 6. Regenerate measurements and the analysis index from preserved evidence without trusting the working database.
 7. Resume safely after interruption; respect primary/secondary limits and pagination/caps without silent truncation or false success.
 8. Encrypt every uploaded evidence payload with AES-256-GCM and RSA-OAEP-SHA256 key wrapping for this machine's RSA key. Keep the private key local. Preserve original and encrypted hashes; reject tampering, wrong keys and truncated files. Migrate and verify existing payloads before exposing the repository publicly.
+9. Provide a local, read-only capture browser with UTC timelines, qualified entity/ref/file differences, raw-response provenance, coverage and proof status. Load selected encrypted evidence only on explicit request within the shared local limit.
+10. After the complete initial cohort is published and stable, audit retained payload integrity/recoverability and perform bounded offline Git restoration spot checks; record gaps and deferred checks explicitly, followed by independent GPT-6.1-sol xhigh inspection.
 
 GitHub-backed resumption uses a separately generated operational RSA recipient and an explicitly authorized Actions state-key secret. It encrypts the working API/Git corpus for runner recovery; the retained-evidence recipient and its local private key remain separate. State snapshot bytes must be reported separately from evidence-transfer bytes.
 
