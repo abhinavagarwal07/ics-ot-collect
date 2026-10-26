@@ -117,7 +117,9 @@ jobs:
         run: python -m pip install --disable-pip-version-check -e . opentimestamps-client==0.7.2
       - name: Capture, verify, split archive, and transfer even partial outcomes
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          # API reads use the optional public read credential. Release writes
+          # remain on this workflow's separate, repository-scoped GH_TOKEN.
+          GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
           GH_TOKEN: ${{ github.token }}
           CAPTURE_SLUG: ${{ matrix.slug }}
           RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}

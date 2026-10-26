@@ -10,11 +10,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from .core import Config, ObjectStore, parse_github_time, sha256, utc_iso
+from .core import Config, ObjectStore, canonical_json, parse_github_time, sha256, utc_iso
+from .checkpoints import CheckpointError, CheckpointStore
 
 HEADERS_TO_KEEP = (
     "date", "etag", "last-modified", "link", "x-github-api-version-selected",
@@ -27,6 +29,8 @@ _REPOSITORY_PATH_RE = re.compile(
     r"(?P<repository>/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|/repositories/(?P<id>[1-9][0-9]*))"
     r"(?P<endpoint>(?:/[^/?#]+)*)"
 )
+BASE_SCOPES = ("repository_metadata", "issues", "pulls", "issue_comments", "review_comments",
+               "releases", "tags", "events")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -40,11 +44,58 @@ class Response:
     record: dict[str, Any]
 
 
+class APIRequestDeferred(RuntimeError):
+    """A persisted rate refusal which a scheduler can retry without sleeping."""
+
+    def __init__(self, retry_not_before: float, reason: str, *, scope: str | None = None,
+                 capture_id: str | None = None):
+        super().__init__(reason)
+        self.retry_not_before = retry_not_before
+        self.reason, self.scope, self.capture_id = reason, scope, capture_id
+        self.lane_wide = True
+
+
+class _ScopeCapped(RuntimeError):
+    pass
+
+
 class GitHubAPI:
     """Captures original HTTP body and a redacted provenance envelope."""
 
-    def __init__(self, config: Config, store: ObjectStore, records: list[dict]):
+    def __init__(self, config: Config, store: ObjectStore, records: list[dict],
+                 checkpoint_store: CheckpointStore | None = None, *, defer_on_rate: bool = False):
         self.config, self.store, self.records = config, store, records
+        self.checkpoint_store = checkpoint_store
+        self.defer_on_rate = defer_on_rate or checkpoint_store is not None
+        self._checkpoint_context: dict | None = None
+        self._deferred: APIRequestDeferred | None = None
+        self._checkpoint_integrity_errors: dict[str, list[str]] = {}
+        if checkpoint_store is not None:
+            if (config.root.resolve() != checkpoint_store.root or
+                    store.root.resolve() != checkpoint_store.root):
+                raise CheckpointError("API object store and checkpoint root differ")
+            # Identity may have been fetched before the stable numeric binding was
+            # known. Persist those envelopes before any subsequent network call.
+            old_records = checkpoint_store.responses()
+            for record in old_records:
+                try:
+                    self._validate_record_body(record)
+                except CheckpointError as exc:
+                    scope = record.get("checkpoint_provenance", {}).get("scope") or "repository_metadata"
+                    self._checkpoint_integrity_errors.setdefault(scope, []).append(str(exc))
+            known = {record["checkpoint_provenance"]["event_sequence"] for record in old_records}
+            for record in records:
+                provenance = record.get("checkpoint_provenance", {})
+                if (provenance.get("capture_id") == checkpoint_store.capture_id and
+                        provenance.get("event_sequence") in known):
+                    continue
+                self._validate_record_body(record)
+                checkpoint_store.record_response(record)
+            present = {record.get("checkpoint_provenance", {}).get("event_sequence") for record in records}
+            for record in old_records:
+                if record["checkpoint_provenance"]["event_sequence"] not in present:
+                    record["checkpoint_provenance"]["reused_from_checkpoint"] = True
+                    records.append(record)
         self.token = os.getenv(config.token_env, "").strip()
         self.opener = urllib.request.build_opener(NoRedirect)
         self.requests = 0
@@ -52,6 +103,57 @@ class GitHubAPI:
         self.secondary_rate_waited_seconds = 0.0
         self._last_rate_record: dict | None = None
         self._repository_ids: dict[str, str] = {}
+
+    def _validate_record_body(self, record: dict) -> bytes | None:
+        if "body_sha256" not in record:
+            if record.get("status") is not None:
+                raise CheckpointError("HTTP response checkpoint lacks body reference")
+            return None
+        try:
+            body = self.store.get(record["body_sha256"])
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise CheckpointError(f"Checkpoint CAS missing or corrupt: {record['body_sha256']}") from exc
+        if record.get("body_bytes") != len(body):
+            raise CheckpointError("Checkpoint response body length changed")
+        return body
+
+    def _append_record(self, record: dict) -> None:
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.record_response(record, self._checkpoint_context)
+        self.records.append(record)
+
+    @staticmethod
+    def _retry_time(headers: dict, default: float = 60.0, *, include_reset: bool = False) -> float:
+        now = time.time()
+        deadlines = [now + default]
+        try:
+            if include_reset or headers.get("x-ratelimit-remaining") == "0":
+                deadlines.append(float(headers["x-ratelimit-reset"]) + 1)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+        retry = headers.get("retry-after")
+        if retry:
+            try:
+                seconds = float(retry)
+                if math.isfinite(seconds):
+                    deadlines.append(now + max(1, seconds))
+            except (TypeError, ValueError, OverflowError):
+                try:
+                    deadlines.append(email.utils.parsedate_to_datetime(retry).timestamp())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        return max(value for value in deadlines if math.isfinite(value))
+
+    def _defer_request(self, headers: dict, reason: str, *, include_reset: bool = False) -> None:
+        context = self._checkpoint_context or {}
+        retry_not_before = self._retry_time(headers, include_reset=include_reset)
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.append("rate_deferral", {
+                **context, "retry_not_before": retry_not_before, "reason": reason, "lane_wide": True,
+            })
+        raise APIRequestDeferred(retry_not_before, reason,
+                                 scope=context.get("scope"),
+                                 capture_id=self.checkpoint_store.capture_id if self.checkpoint_store else None)
 
     @staticmethod
     def validate_url(url: str) -> None:
@@ -81,6 +183,14 @@ class GitHubAPI:
             return
         if remaining > self.config.primary_rate_reserve:
             return
+        if self.defer_on_rate:
+            try:
+                if time.time() >= float(headers["x-ratelimit-reset"]) + 1:
+                    self._last_rate_record = None
+                    return
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+            self._defer_request(headers, f"Primary rate-limit reserve reached for {purpose}", include_reset=True)
         try:
             duration = max(1.0, int(headers["x-ratelimit-reset"]) - time.time() + 1.0)
         except (KeyError, TypeError, ValueError, OverflowError):
@@ -121,7 +231,7 @@ class GitHubAPI:
                 failure = f"HTTP_{status}"
             except errors as e:
                 completed = utc_iso()
-                self.records.append({
+                self._append_record({
                     "purpose": purpose, "url": url, "request_started_at": started,
                     "request_completed_at": completed, "status": None,
                     "error": type(e).__name__, "attempt": attempt + 1,
@@ -144,11 +254,19 @@ class GitHubAPI:
                 "status": status, "headers": hdrs, "body_sha256": digest, "body_bytes": len(body),
                 "error": failure, "attempt": attempt + 1, "auth": "token_present" if self.token else "anonymous"
             }
-            self.records.append(rec)
+            self._append_record(rec)
             self._last_rate_record = rec
             self.requests += 1
             if failure is None and status == 200:
                 return Response(body=body, record=rec)
+
+            throttled = status == 429 or (status == 403 and (
+                hdrs.get("x-ratelimit-remaining") == "0" or "retry-after" in hdrs or
+                b"rate limit" in body[:4096].lower() or b"abuse" in body[:4096].lower()))
+            if self.defer_on_rate and throttled:
+                self._defer_request(hdrs, f"Rate-limit deferral for {purpose}: HTTP {status}")
+            if self.checkpoint_store is not None and failure == "RESPONSE_EXCEEDS_CAP":
+                raise _ScopeCapped(f"Response exceeds byte cap for {purpose} (NOT complete)")
 
             # Rate-limit and server issues: bounded retry, no invented successful response.
             if status in (403, 429) and hdrs.get("x-ratelimit-remaining") == "0":
@@ -300,6 +418,435 @@ class GitHubAPI:
             if check.record["body_sha256"] != first_digest:
                 raise RuntimeError(f"Pagination non-atomic: first page changed for {purpose}; retry later")
         return all_items
+
+    def _checkpoint_get(self, url: str, purpose: str) -> Response:
+        response = self.get(url, purpose)
+        assert self.checkpoint_store is not None
+        provenance = response.record.get("checkpoint_provenance", {})
+        if not provenance:
+            # Also supports instrumented transports which implement get().
+            if self._validate_record_body(response.record) != response.body:
+                raise CheckpointError("Transport body does not match checkpoint CAS reference")
+            self.checkpoint_store.record_response(response.record, self._checkpoint_context)
+            if not any(record is response.record for record in self.records):
+                self.records.append(response.record)
+        else:
+            durable = self.checkpoint_store.response(provenance["event_sequence"])
+            if durable != response.record:
+                raise CheckpointError("Transport envelope differs from durable checkpoint")
+        return response
+
+    def _page_next(self, query: dict, response: Response, items: list[dict]) -> str | None:
+        boundary = query["updated_before"]
+        if boundary is not None and items and all(
+                isinstance(item.get("updated_at"), str) and
+                parse_github_time(item["updated_at"]) < parse_github_time(boundary) for item in items):
+            return None
+        match = _NEXT_RE.search(response.record.get("headers", {}).get("link", ""))
+        if not match:
+            return None
+        url = match.group(1)
+        self._validate_page_url(query["initial_url"], url)
+        return url
+
+    def _validate_page_url(self, initial_url: str, url: str) -> None:
+        self.validate_url(url)
+        first = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(initial_url).path)
+        route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url).path)
+        assert first and route and self.checkpoint_store
+        if route["endpoint"] != first["endpoint"]:
+            raise CheckpointError("Unexpected endpoint changed across checkpoint pagination")
+        if route["id"] is not None:
+            if route["id"] != str(self.checkpoint_store.repository_id):
+                raise CheckpointError("Unexpected repository changed across checkpoint pagination")
+        elif route["repository"].lower() != first["repository"].lower():
+            raise CheckpointError("Unexpected repository changed across checkpoint pagination")
+        # Link cursors are opaque. Retain them verbatim but reject changed query
+        # filters or page sizes before sending a request (including on resume).
+        original = urllib.parse.parse_qs(urllib.parse.urlsplit(initial_url).query, keep_blank_values=True)
+        current = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query, keep_blank_values=True)
+        for name, values in original.items():
+            if current.get(name) != values:
+                raise CheckpointError(f"Checkpoint pagination query changed: {name}")
+        if set(current) - set(original) - {"page", "after", "before", "cursor"}:
+            raise CheckpointError("Unexpected checkpoint pagination query parameter")
+
+    @staticmethod
+    def _decode_scope_body(body: bytes, kind: str, scope: str) -> Any:
+        value = json.loads(body)
+        if kind == "object":
+            if not isinstance(value, dict):
+                raise ValueError(f"Expected JSON object for {scope}")
+        elif not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            raise ValueError(f"Unexpected page JSON for {scope}")
+        return value
+
+    def _load_scope_pages(self, state: dict, query: dict) -> tuple[Any, list[Response]]:
+        assert self.checkpoint_store is not None
+        pages: list[Response] = []
+        values: Any = {} if query["kind"] == "object" else []
+        next_url = query["initial_url"]
+        seen_ids: set[str] = set()
+        seen_urls: set[str] = set()
+        for expected, page in enumerate(state["pages"], 1):
+            if (page["page_no"] != expected or expected > self.config.max_pages or
+                    page["url"] != next_url or next_url in seen_urls):
+                raise CheckpointError("Checkpoint page order/cap/URL lineage changed")
+            self._validate_page_url(query["initial_url"], page["url"])
+            record = self.checkpoint_store.response(page["response_sequence"])
+            provenance = record.get("checkpoint_provenance", {})
+            if (record.get("url") != page["url"] or record.get("api_version") != self.config.api_version or
+                    record.get("status") != 200 or record.get("error") is not None or
+                    provenance.get("scope") != state["scope"] or
+                    provenance.get("attempt_id") != state["attempt_id"]):
+                raise CheckpointError("Checkpoint response request/attempt lineage changed")
+            body = self._validate_record_body(record)
+            assert body is not None
+            response = Response(body, record)
+            value = self._decode_scope_body(body, query["kind"], state["scope"])
+            if query["kind"] == "object":
+                if expected != 1 or page["next_url"] is not None:
+                    raise CheckpointError("Unexpected object checkpoint pagination")
+                values, next_url = value, None
+            else:
+                for item in value:
+                    if item.get("id") is not None:
+                        entity_id = str(item["id"])
+                        if entity_id in seen_ids:
+                            raise CheckpointError("Repeated entity ID in checkpoint pages")
+                        seen_ids.add(entity_id)
+                values.extend(value)
+                next_url = self._page_next(query, response, value)
+                if page["next_url"] != next_url:
+                    raise CheckpointError("Checkpoint next-page URL differs from original response")
+            pages.append(response)
+            seen_urls.add(page["url"])
+        return values, pages
+
+    def _begin_scope(self, scope: str, query: dict, *, query_started_at: str | None = None) -> dict:
+        assert self.checkpoint_store is not None
+        self.checkpoint_store.append("scope_started", {
+            "scope": scope, "attempt_id": uuid.uuid4().hex,
+            "fingerprint": sha256(canonical_json(query)), "query": query,
+            "query_started_at": query_started_at or utc_iso(),
+        })
+        state = self.checkpoint_store.scope_state(scope)
+        assert state is not None
+        return state
+
+    def _abandon_scope(self, state: dict, reason: str) -> None:
+        assert self.checkpoint_store is not None
+        if state["restarts"] >= 1:
+            raise RuntimeError(f"Pagination drift restart budget exhausted for {state['scope']}: {reason}")
+        self.checkpoint_store.append("scope_abandoned", {
+            "scope": state["scope"], "attempt_id": state["attempt_id"], "reason": reason,
+            "status": "partial_drift", "abandoned_at": utc_iso(),
+        })
+
+    def _run_checkpoint_scope(self, scope: str, query: dict, *, validate=None) -> tuple[Any, dict]:
+        """Resume one exact query. A drifted attempt is retained, never stitched."""
+        assert self.checkpoint_store is not None
+        if scope in self._checkpoint_integrity_errors:
+            raise CheckpointError("; ".join(self._checkpoint_integrity_errors[scope]))
+        state = self.checkpoint_store.scope_state(scope)
+        if state is not None and (state["fingerprint"] != sha256(canonical_json(query)) or state["query"] != query):
+            raise CheckpointError(f"Scope query/options changed for {scope}; use a new capture_id")
+        if state is not None and state.get("abandoned"):
+            # A process may stop after recording drift but before starting its
+            # replacement attempt. Do not reuse the abandoned pages in that gap.
+            state = self._begin_scope(scope, query)
+        if state is not None:
+            values, pages = self._load_scope_pages(state, query)
+            if state["outcome"] and state["outcome"]["status"] == "complete_for_query":
+                if not pages or state["pages"][-1]["next_url"] is not None:
+                    raise CheckpointError("Complete checkpoint scope has unfinished pagination")
+                if validate is not None:
+                    validate(values)
+                return values, {**state["outcome"], "reused_from_checkpoint": True}
+            outcome = state["outcome"] or {}
+            if outcome.get("status") == "deferred" and outcome["retry_not_before"] > time.time():
+                raise APIRequestDeferred(outcome["retry_not_before"], outcome.get("reason", outcome["error"]), scope=scope,
+                                         capture_id=self.checkpoint_store.capture_id)
+        if self._deferred is not None:
+            raise self._deferred
+        resumed = state is not None and bool(state["pages"])
+        if state is None:
+            state = self._begin_scope(scope, query)
+        while True:
+            self._checkpoint_context = {"scope": scope, "attempt_id": state["attempt_id"]}
+            values, pages = self._load_scope_pages(state, query)
+            if resumed:
+                fresh = self._checkpoint_get(query["initial_url"], scope + "_resume_first_page_validation")
+                matches = (fresh.record["body_sha256"] == pages[0].record["body_sha256"] and
+                           fresh.record.get("headers", {}).get("link") == pages[0].record.get("headers", {}).get("link"))
+                self.checkpoint_store.append("scope_validation", {
+                    **self._checkpoint_context, "response_sequence": fresh.record["checkpoint_provenance"]["event_sequence"],
+                    "matches_first_page": matches,
+                })
+                resumed = False
+                if not matches:
+                    self._abandon_scope(state, "First page changed before continuation")
+                    state = self._begin_scope(scope, query, query_started_at=fresh.record["request_started_at"])
+                    # The fresh validation envelope belongs to the old attempt.
+                    # Start with a new request instead of relabeling its lineage.
+                    continue
+            next_url = state["pages"][-1]["next_url"] if pages else query["initial_url"]
+            seen_urls = {page["url"] for page in state["pages"]}
+            seen_ids = {str(item["id"]) for item in values if isinstance(item, dict) and item.get("id") is not None} if query["kind"] == "list" else set()
+            while next_url is not None:
+                if next_url in seen_urls:
+                    raise RuntimeError(f"Pagination loop in {scope}")
+                if len(pages) >= self.config.max_pages:
+                    raise _ScopeCapped(f"Max pages exceeded for {scope} (NOT complete)")
+                response = self._checkpoint_get(next_url, scope)
+                value = self._decode_scope_body(response.body, query["kind"], scope)
+                if query["kind"] == "object":
+                    values, following = value, None
+                else:
+                    for item in value:
+                        if item.get("id") is not None:
+                            entity_id = str(item["id"])
+                            if entity_id in seen_ids:
+                                raise RuntimeError(f"Pagination drift: repeated ID {entity_id} in {scope}")
+                            seen_ids.add(entity_id)
+                    values.extend(value)
+                    following = self._page_next(query, response, value)
+                self.checkpoint_store.append("scope_page", {
+                    **self._checkpoint_context, "page_no": len(pages) + 1,
+                    "url": next_url, "next_url": following,
+                    "response_sequence": response.record["checkpoint_provenance"]["event_sequence"],
+                })
+                pages.append(response)
+                seen_urls.add(next_url)
+                next_url = following
+            if query["kind"] == "list" and len(pages) > 1:
+                fresh = self._checkpoint_get(query["initial_url"], scope + "_first_page_recheck")
+                if (fresh.record["body_sha256"] != pages[0].record["body_sha256"] or
+                        fresh.record.get("headers", {}).get("link") != pages[0].record.get("headers", {}).get("link")):
+                    self._abandon_scope(state, "First page changed after pagination")
+                    state = self._begin_scope(scope, query, query_started_at=fresh.record["request_started_at"])
+                    continue
+            if validate is not None:
+                validate(values)
+            outcome = {**self._checkpoint_context, "status": "complete_for_query",
+                       "count": 1 if query["kind"] == "object" else len(values), "pages": len(pages),
+                       "query_started_at": state["query_started_at"], "completed_at": utc_iso()}
+            self.checkpoint_store.append("scope_finished", outcome)
+            return values, outcome
+
+    def collect_resumable(self, slug: str, mode: str, since: str | None = None,
+                          deep_full: bool = False, *, scope_since: dict[str, str | None] | None = None) -> dict:
+        """Collect independent scopes with durable retry state and cursor candidates.
+
+        Candidates are query START times and are never committed here. A caller
+        must finalize an immutable manifest before making them scheduling state.
+        Rate deferrals are returned after retaining completed scopes; schedulers
+        can retry this same capture without repeating successful queries or Git.
+        Missing parent cursors select shallow full repairs; deep requests come
+        from bounded delta items or explicit deep_full. A requested incomplete
+        child withholds its selecting parent's cursor until that work is repaired.
+        """
+        if self.checkpoint_store is None:
+            raise ValueError("collect_resumable requires a bound CheckpointStore")
+        if mode not in ("full", "delta", "events"):
+            raise ValueError("Unknown collection mode")
+        self._deferred = None
+        for event in reversed(self.checkpoint_store.events):
+            if event["kind"] == "rate_deferral":
+                data = event["data"]
+                if data["retry_not_before"] > time.time():
+                    self._deferred = APIRequestDeferred(data["retry_not_before"], data["reason"],
+                        scope=data.get("scope"), capture_id=self.checkpoint_store.capture_id)
+                break
+        scope_since = dict(scope_since or {})
+        for boundary in [since, *scope_since.values()]:
+            if boundary is not None:
+                parse_github_time(boundary)
+        self.checkpoint_store.bind_options({
+            "slug": slug, "mode": mode, "since": since, "scope_since": scope_since,
+            "deep_full": deep_full, "api_version": self.config.api_version,
+            "max_pages": self.config.max_pages, "max_response_bytes": self.config.max_response_bytes,
+            "auth": "token_present" if self.token else "anonymous",
+        })
+        result: dict[str, Any] = {"mode": mode, "since": since, "scopes": {}, "warnings": [],
+                                  "scope_statuses": {}, "failures": [], "watermark_candidates": {},
+                                  "repository_id": self.checkpoint_store.repository_id,
+                                  "capture_id": self.checkpoint_store.capture_id}
+        prefix = f"/repos/{slug}"
+
+        def run(scope, route, params=None, *, kind="list", boundary=None, validate=None):
+            query = {"api_version": self.config.api_version, "initial_url": self.url(prefix + route,
+                         {**(params or {}), "per_page": 100} if kind == "list" else None),
+                     "kind": kind, "updated_before": boundary, "since": scope_since.get(scope, since),
+                     "max_pages": self.config.max_pages, "max_response_bytes": self.config.max_response_bytes,
+                     "mode": mode, "deep_full": deep_full}
+            previous_context = self._checkpoint_context
+            record_start = len(self.records)
+            try:
+                value, outcome = self._run_checkpoint_scope(scope, query, validate=validate)
+                result["watermark_candidates"][scope] = outcome["query_started_at"]
+            except Exception as exc:
+                state = self.checkpoint_store.scope_state(scope)
+                context = {"scope": scope, "attempt_id": state["attempt_id"] if state else None,
+                           "query_started_at": state["query_started_at"] if state else None}
+                status = "failed"
+                if isinstance(exc, APIRequestDeferred):
+                    self._deferred = exc
+                    status = "deferred"
+                elif isinstance(exc, _ScopeCapped):
+                    status = "capped"
+                elif isinstance(exc, (CheckpointError, FileNotFoundError)):
+                    status = "checkpoint_invalid"
+                elif len(self.records) > record_start and self.records[-1].get("status") in (404, 410):
+                    status = "unavailable"
+                outcome = {**context, "status": status, "error": f"{type(exc).__name__}: {exc}"}
+                if isinstance(exc, APIRequestDeferred):
+                    outcome.update(retry_not_before=exc.retry_not_before, lane_wide=exc.lane_wide, reason=exc.reason)
+                    result["deferred"] = {"retry_not_before": exc.retry_not_before,
+                                          "reason": exc.reason, "lane_wide": exc.lane_wide}
+                if state is not None:
+                    self.checkpoint_store.append("scope_failed", outcome)
+                else:
+                    self.checkpoint_store.append("scope_not_started", outcome)
+                result["failures"].append(f"{scope}: {outcome['error']}")
+                value = None
+            finally:
+                self._checkpoint_context = previous_context
+            result["scopes"][scope] = outcome
+            result["scope_statuses"][scope] = outcome
+            return value
+
+        def public_metadata(metadata):
+            if (metadata.get("private") is not False or type(metadata.get("id")) is not int or
+                    metadata["id"] != self.checkpoint_store.repository_id):
+                raise RuntimeError("Repository visibility/identity does not match bound public repository")
+
+        metadata = run("repository_metadata", "", kind="object", validate=public_metadata)
+        if metadata is None:
+            # Visibility/identity is a prerequisite. Preserve all prior successful
+            # records, but do not query new endpoints without that prerequisite.
+            names = ("events",) if mode == "events" else BASE_SCOPES[1:]
+            for name in names:
+                outcome = {"scope": name, "status": "not_attempted",
+                           "error": "Public repository identity/visibility prerequisite incomplete"}
+                if self._deferred is not None:
+                    outcome.update(status="deferred", retry_not_before=self._deferred.retry_not_before,
+                                   lane_wide=True)
+                self.checkpoint_store.append("scope_not_started", outcome)
+                result["scopes"][name] = result["scope_statuses"][name] = outcome
+            return result
+        result["repository_full_name"] = metadata.get("full_name")
+        self._repository_ids[prefix.lower()] = str(metadata["id"])
+        ordered = {"state": "all", "sort": "updated", "direction": "desc"}
+        comments = {"sort": "updated", "direction": "desc"}
+        definitions = [("events", "/events", {})] if mode == "events" else [
+            ("issues", "/issues", ordered), ("pulls", "/pulls", ordered),
+            ("issue_comments", "/issues/comments", comments),
+            ("review_comments", "/pulls/comments", comments),
+            ("releases", "/releases", {}), ("tags", "/tags", {}), ("events", "/events", {})]
+        changed_issues: set[int] = set()
+        changed_pulls: set[int] = set()
+        parent_issues = {"issues": set(), "pulls": set()}
+        parent_pulls = {"issues": set(), "pulls": set()}
+        requested_deep_parents: set[str] = set()
+        for name, route, original_params in definitions:
+            boundary = scope_since.get(name, since) if mode == "delta" else None
+            params = dict(original_params)
+            if name in ("issues", "issue_comments", "review_comments") and boundary is not None:
+                params["since"] = boundary
+            def public_release(items):
+                if any(item.get("draft") is True for item in items):
+                    raise RuntimeError("Nonpublic draft release; refuse collection result")
+            items = run(name, route, params, boundary=boundary if name == "pulls" else None,
+                        validate=public_release if name == "releases" else None)
+            if name in parent_issues:
+                deep_requested = deep_full or (mode == "delta" and boundary is not None)
+                if deep_requested:
+                    requested_deep_parents.add(name)
+                parent_outcome = result["scopes"][name]
+                parent_outcome.update(
+                    query_mode="delta" if boundary is not None else ("full_shallow_repair" if mode == "delta" else "full"),
+                    deep_selection="explicit_deep_full" if deep_full else (
+                        "bounded_delta_items" if deep_requested else "not_requested_for_full_listing"),
+                    selected_deep_item_count=0, skipped_historical_deep_count=0)
+                if items is not None:
+                    for item in items:
+                        number = item.get("number")
+                        if type(number) is not int:
+                            continue
+                        if name == "pulls" and boundary and (
+                                not isinstance(item.get("updated_at"), str) or
+                                parse_github_time(item["updated_at"]) < parse_github_time(boundary)):
+                            continue
+                        if not deep_requested:
+                            parent_outcome["skipped_historical_deep_count"] += 1
+                            continue
+                        parent_issues[name].add(number)
+                        if name == "pulls" or "pull_request" in item:
+                            parent_pulls[name].add(number)
+                    parent_outcome["selected_deep_item_count"] = len(parent_issues[name])
+                    changed_issues.update(parent_issues[name])
+                    changed_pulls.update(parent_pulls[name])
+            if items is None:
+                continue
+            if name == "events":
+                result["scopes"][name]["interpretation"] = "OPPORTUNISTIC_NOT_COMPLETE"
+                if len(items) >= 300:
+                    result["warnings"].append("Events API reached its 300-item observation window")
+        if mode != "events" and (mode == "delta" or deep_full):
+            timeline_scopes, pull_scopes = [], []
+            for number in sorted(changed_issues):
+                name = f"issue_timeline:{number}"
+                timeline_scopes.append(name)
+                run(name, f"/issues/{number}/timeline")
+            for number in sorted(changed_pulls):
+                detail_name = f"pull_detail:{number}"
+                pull_scopes.append(detail_name)
+                detail = run(detail_name, f"/pulls/{number}", kind="object")
+                for endpoint in ("reviews", "commits", "files"):
+                    name = f"pull_{endpoint}:{number}"
+                    pull_scopes.append(name)
+                    def endpoint_cap(items, endpoint=endpoint, detail=detail):
+                        key, cap = ("commits", 250) if endpoint == "commits" else ("changed_files", 3000)
+                        if endpoint in ("commits", "files"):
+                            if detail is None:
+                                raise RuntimeError("PR detail unavailable; cannot establish endpoint cap")
+                            if detail.get(key, len(items)) > cap:
+                                raise _ScopeCapped(f"PR {number}: {endpoint} endpoint limited to {cap}")
+                    run(name, f"/pulls/{number}/{endpoint}", validate=endpoint_cap)
+            # A parent cursor also selects its deep repair work. Advancing it
+            # past an incomplete child could make that unchanged item disappear
+            # from all later delta queries once the overlap window expires.
+            result["watermark_withheld"] = {}
+            for parent in ("issues", "pulls"):
+                dependencies = {f"issue_timeline:{number}" for number in parent_issues[parent]}
+                dependencies.update(f"pull_{endpoint}:{number}" for number in parent_pulls[parent]
+                                    for endpoint in ("detail", "reviews", "commits", "files"))
+                incomplete = sorted(name for name in dependencies
+                                    if result["scopes"][name]["status"] != "complete_for_query")
+                if incomplete and parent in result["watermark_candidates"]:
+                    result["watermark_candidates"].pop(parent)
+                    result["watermark_withheld"][parent] = {
+                        "reason": "Requested deep scopes incomplete; retain parent cursor for repair",
+                        "incomplete_scopes": incomplete,
+                    }
+            enumeration_complete = all(result["scopes"][name]["status"] == "complete_for_query"
+                                       for name in requested_deep_parents)
+            for name, names, count in (("deep_issue_timeline", timeline_scopes, len(changed_issues)),
+                                        ("deep_pull_details", pull_scopes, len(changed_pulls))):
+                complete = enumeration_complete and all(result["scopes"][key]["status"] == "complete_for_query" for key in names)
+                status = ("NOT_REQUESTED" if not requested_deep_parents else
+                          "complete_for_requested_items" if complete else "partial")
+                result["scopes"][name] = {
+                    "count": count, "status": status,
+                    "claim_scope": "requested_delta_or_explicit_deep_full_items",
+                    "requested_parent_scopes": sorted(requested_deep_parents),
+                }
+        elif mode == "full":
+            for name in ("deep_issue_timeline", "deep_pull_details"):
+                result["scopes"][name] = {"count": 0, "status": "NOT_COLLECTED"}
+            result["warnings"].append("Full scan did not include per-item timelines/reviews; use --deep-full")
+        return result
 
     def collect(self, slug: str, mode: str, since: str | None = None,
                 deep_full: bool = False) -> dict:

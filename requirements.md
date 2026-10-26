@@ -13,23 +13,25 @@ Create local, incremental, independently verifiable records of public GitHub obs
 ## Operating targets
 
 - **185 repositories**, selected from all rows of [public_patch_corpus_185.csv](public_patch_corpus_185.csv) and configured in [config.corpus.toml](icsot-observatory/config.corpus.toml). Preserve repository roles and measurement caveats; observation at a mirror does not establish availability at its upstream origin.
-- An always-on host is available; **GitHub Actions** is also being evaluated for periodic execution, with durable evidence/state stored separately. `libfuse/libfuse` remains the validated single-repository smoke target.
+- Execute on a trusted persistent host or **GitHub Actions** with authenticated durable working-state recovery. No host endpoint has been identified and no recurring deployment is enabled. `libfuse/libfuse` remains the validated single-repository smoke target.
 - Target **1–6 hours between observations**, according to measured feasibility; report actual gaps.
 - **Hard cap: 50 GB (50,000,000,000 stored bytes) of new evidence per UTC calendar month.** Pause collection before exceeding it; resume next month or after an explicit policy amendment. No automatic limit increase or deletion. No baseline exemption is assumed.
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.
-- Run the collector in a **public GitHub repository** on standard hosted runners. Store main evidence as encrypted XZ archive parts in Releases; metadata and the RSA public key may remain public. Recurring collection is not enabled; six hours remains the recommended starting cadence after incremental archiving is implemented.
+- The source repository is **public**. The one-time baseline uses standard hosted runners and encrypted XZ Release assets; metadata and the RSA public key may remain public. Incremental collection is implemented, but recurring execution still requires durable working state and operational budget enforcement. Six hours is the initial configurable cadence, not a measured guarantee.
 - Respect Actions runtime/disk/API limits; preserve explicit partial or missing outcomes and repair only affected targets/scopes. Avoid overwriting prior evidence or repeating the entire cohort to repair one failure.
 
 ## Functional requirements
 
 1. Find when a commit was **first observed within each watched repository**, with observation-time branch/ref attribution. Mark baseline commits; do not claim exact first-publication time.
-2. Report any collection interval and compare any two observations, including edits and ref changes. Distinguish absence from confirmed deletion.
+2. Report each repository/lane's original observation start/end in UTC ISO 8601 with microsecond representation and `Z`, labeled `runner_system_clock`, and compare observations including edits and ref changes. Publish state snapshot start/seal UTC separately; collection is an interval, not an atomic instant. Clock precision does not establish externally verified clock accuracy. Distinguish absence from confirmed deletion.
 3. Preserve original response bodies, Git objects, manifests, and proofs. Allow independent hash verification and history restoration without contacting upstream.
-4. Externally timestamp evidence digests using **RFC 3161 or OpenTimestamps**; distinguish pending and verified attestations. This is sufficient for v1; independent collection is optional. Evidence existence and GitHub provenance remain separate claims.
+4. Externally timestamp manifest digests using **RFC 3161 and/or OpenTimestamps**. Retain immutable receipts and canonical attestation metadata beside public observation indexes, with original UTC request/receipt times when recorded, subject hashes and trust/verification status. Pending OTS receipts are not verified Bitcoin evidence; RFC 3161 responses require explicit trusted-chain, nonce and imprint verification. Evidence existence and GitHub provenance remain separate claims.
 5. Record expected observations, attempts, partial results, failures, rate limits, clock uncertainty, and scope/configuration changes to reconstruct gaps and collection bias.
 6. Regenerate measurements and the analysis index from preserved evidence without trusting the working database.
 7. Resume safely after interruption; respect primary/secondary limits and pagination/caps without silent truncation or false success.
 8. Encrypt every uploaded evidence payload with AES-256-GCM and RSA-OAEP-SHA256 key wrapping for this machine's RSA key. Keep the private key local. Preserve original and encrypted hashes; reject tampering, wrong keys and truncated files. Migrate and verify existing payloads before exposing the repository publicly.
+
+GitHub-backed resumption uses a separately generated operational RSA recipient and an explicitly authorized Actions state-key secret. It encrypts the working API/Git corpus for runner recovery; the retained-evidence recipient and its local private key remain separate. State snapshot bytes must be reported separately from evidence-transfer bytes.
 
 ## Design direction
 
@@ -45,3 +47,9 @@ Create local, incremental, independently verifiable records of public GitHub obs
 - Timestamp provider and acceptable attestation precision/delay.
 - Off-host backups and their separate capacity/accounting policy.
 - Always-on host location and deployment; independent archive destination. See [storage decision](icsot-observatory/docs/STORAGE.md).
+
+## Implemented collection path
+
+`icsot-observe persistent` provides independent API/Git worker pools, durable leases and attempt telemetry, resumable raw-response/page checkpoints, frozen per-scope query boundaries, and watermark commits gated by immutable manifest/digest verification. Git storage uses a self-contained initial archive plus incremental or refs-only descriptors with explicit CAS prerequisites. Finalized manifests from both lanes share one append-locked hash chain; original observation times survive namespace clock clamping.
+
+Optional encrypted per-capture exports include only newly required CAS objects and record dependencies on previous packages. A manual selected-repository GitHub adapter restores encrypted working state, uploads evidence and publishes its final state pointer after remote verification. Offline tests restore the encrypted Git chain without upstream access. The legacy one-time baseline remains full-bundle by default and retains accepted-parent reuse. These implementations do not yet enforce the 50-GB monthly cap, enable recurrence, implement Discussions, or satisfy every requirement above; hosted pilot validation remains separate from offline tests. See [operation and deployment template](icsot-observatory/docs/PERSISTENT.md).

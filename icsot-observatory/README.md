@@ -2,9 +2,11 @@
 
 Prospective, **public-only** GitHub observation with raw byte preservation, content-addressed storage, Git ref pinning, SHA-256 hash-chained run manifests, optional OpenTimestamps attestation, and a regenerable CSV index.
 
-**This is a tested prototype + publication-grade protocol, NOT a ready-for-90-day unattended academic data collection deployment.** Read `docs/PROTOCOL.md`, `docs/METHODS.md`, `docs/BUILD_PLAN.md`, and `docs/PRODUCTION_GAPS.md` before using evidence in a publication. In particular: complete sharded backfill, queue-based retries, verified off-site storage, clock measurement, and event polling enforcement are NOT yet implemented.
+**This remains a prototype with explicit production gaps.** Read `docs/PROTOCOL.md`, `docs/METHODS.md`, and `docs/PRODUCTION_GAPS.md` before using evidence in a publication. Durable independent API/Git queues, resumable API scopes, incremental Git archives and a manual GitHub-backed state adapter are implemented; monthly-cap admission, independent backup, clock measurement and event polling enforcement remain open. Hosted pilot validation is separate from offline tests.
 
-**Current design work (2026-10-25):** [requirements](../requirements.md), [collector design](docs/DESIGN.md), and the [SQLite schema guide](docs/SCHEMA.md) describe the 185-repository scope, GitHub Discussions, SQLite metadata and proposed study Git history. [metadata.sql](schema/metadata.sql) is an executable draft for a fresh database. The existing CLI has not been upgraded to that design.
+The [persistent collector guide](docs/PERSISTENT.md) describes the implemented `persistent`/`run` command, encrypted incremental transfers, restoration and a deployment template. The [requirements](../requirements.md), [collector design](docs/DESIGN.md), and [SQLite schema guide](docs/SCHEMA.md) also describe future research metadata, Discussions and study Git history. [metadata.sql](schema/metadata.sql) remains a separate draft; `runtime.sqlite3` implements operational scheduling rather than that research schema.
+
+Public observation indexes include the original UTC observation interval and hash-linked timestamp sidecars. OpenTimestamps receipts remain pending until Bitcoin verification. The manual pilot also requests RFC 3161 receipts with explicit trust-chain, nonce and digest verification; live success is separate from offline validation. See [UTC and timestamp evidence](docs/PERSISTENT.md#utc-intervals-and-timestamp-evidence).
 
 The selected cohort is all 185 repositories in [public_patch_corpus_185.csv](../public_patch_corpus_185.csv), configured in [config.corpus.toml](config.corpus.toml) in CSV order. Pilot and priority labels do not filter the selection. Repository roles and measurement caveats remain in the CSV; observations of mirrors establish availability at those mirrors. Cohort changes must update both the CSV and configuration.
 
@@ -37,14 +39,18 @@ icsot-observe collect --config config.toml --mode delta
 icsot-observe verify --root ./evidence
 icsot-observe derive --root ./evidence --out ./analysis/observations.csv
 icsot-observe diff --root ./evidence --repository-id YOUR_NUMERIC_ID
+# Requires durable working state; first use creates a Git/API baseline.
+icsot-observe persistent --config config.toml --once
 pytest -q
 ```
 
-Run `full` for initial baseline, `events` every 15–60 minutes, `delta` every 3–6 hours, and `full` daily (or weekly for high-volume projects). `--deep-full` also enumerates all per-issue timeline and PR detail/review/commit/file endpoints, **which can be very expensive or rate limited**; on an existing large repository do not run it until the backfill queue and budget controls specified in `PRODUCTION_GAPS.md` are built. A delta run without an earlier complete baseline is automatically promoted to a shallow full run.
+Legacy `collect` keeps combined API/Git behavior and optional full bundles. Use `persistent` for separately scheduled lanes, per-scope cursors and true incremental Git archives; it defaults to six-hour API/Git intervals, one API worker and two Git workers. `--deep-full` enumerates per-item histories and can be expensive despite checkpoints. A delta without prior successful scope state starts with a shallow full API query. No recurring deployment is enabled by this command's existence; restore trusted working state before running on an ephemeral runner.
 
 `collect` returns nonzero if any repo is partial or if OTS stamping is unavailable. **Do not ignore that exit status.** The partial run manifest and any collected raw responses are retained for audit. `verify` always recomputes original-response hashes and manifest chains; optionally use `--check-ots` only after Bitcoin confirmation. `derive` recomputes a CSV from the original manifest+CAS rather than treating derived tables as evidence. `diff` reports newly *observed* issue/PR IDs, representation changes, and Git ref movements; it never labels absent delta-feed records as deleted or a commit as first-public.
 
 For Git objects, `git/<stable-repository-id>.git` is a bare mirror with permanent `refs/archive/<run-id>/...` references for each remotely advertised head, tag, and pull-head observed in that run. **Back up that directory**; the manifest's Git object IDs do not contain the objects themselves. With `--bundle-full`, a self-contained Git bundle is also stored by SHA-256 in the original evidence CAS and its digest is committed into the manifest (expensive for large projects).
+
+New manifests use `capture_id` for Git pin namespaces and allocate their final `run_id` only when appending to the shared repository chain. Persistent Git captures preserve a baseline plus explicit incremental/refs-only descriptors in CAS. `icsot-observe restore --root ...` rebuilds omitted mirrors offline from those prerequisites. API-only and Git-only manifests have independent cursors and comparisons; `diff` reports each lane's comparison IDs.
 
 ## OpenTimestamps proof lifecycle
 
@@ -68,6 +74,8 @@ evidence/
   runs/<numeric-repo-id>/<run>.manifest.json.ots
   proofs/initial/<manifest-sha256>.ots
   git/<numeric-repo-id>.git/         # bare Git repo + immutable ref namespace
+  checkpoints/api/<repo-id>/<capture-id>/ # resumable API response/page ledgers
+  runtime.sqlite3                   # durable leases, attempts and scope cursors
   quarantine/<run>.json              # identity-fetch errors, not baseline runs
   .collector.lock
 analysis/

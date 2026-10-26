@@ -73,7 +73,7 @@ jobs:
           exit "${statuses[1]}"
       - name: Collect full and delta evidence, verify, derive, and diff
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
         run: |
           set -euo pipefail
           failed=0

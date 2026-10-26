@@ -24,7 +24,7 @@ def local_capture(tmp_path, monkeypatch):
     run_git(["-C", str(source), "update-ref", "refs/pull/7/merge", commit])
     root = tmp_path / "evidence"
 
-    def local_git(args, *, timeout=1200):
+    def local_git(args, *, timeout=1200, input_text=None):
         # Keep the production HTTPS-only origin policy intact. This test-only
         # seam redirects just the network commands to the controlled local repo.
         redirected = list(args)
@@ -34,7 +34,7 @@ def local_capture(tmp_path, monkeypatch):
         elif len(redirected) > 2 and redirected[2] == "fetch" and "origin" in redirected:
             run_git(["-C", redirected[1], "config", "fetch.unpackLimit", "1000"])
             redirected[redirected.index("origin")] = str(source)
-        return run_git(redirected, timeout=timeout)
+        return run_git(redirected, timeout=timeout, input_text=input_text)
 
     monkeypatch.setattr(gitstore, "run_git", local_git)
     return root, source, commit
@@ -131,7 +131,7 @@ def test_valid_bundle_without_declared_capture_refs_is_rejected(local_capture, t
     assert any("does not restore declared ref" in error for error in result["errors"])
 
 
-def test_bundle_requiring_existing_objects_is_not_portable_full(local_capture, tmp_path):
+def test_bundle_requiring_existing_objects_is_not_portable_full(local_capture, tmp_path, monkeypatch):
     root, source, original_commit = local_capture
     collect_git(root, "test/repo", 17, "run1")
     (source / "file.txt").write_text("new version\n")
@@ -145,6 +145,7 @@ def test_bundle_requiring_existing_objects_is_not_portable_full(local_capture, t
     run_git(["-C", str(mirror), "bundle", "verify", str(incremental)])
     replace_bundle(root, info, incremental)
     archive_manifest(root, "run2", info)
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(mirror / "objects"))
     result = verify_all(root)
     assert not result["ok"]
     assert result["portable_git_bundles_verified"] == 0
@@ -160,3 +161,82 @@ def test_verification_checks_annotated_tag_peeled_metadata(local_capture):
     result = verify_all(root)
     assert not result["ok"]
     assert any("peeled target differs" in error for error in result["errors"])
+
+
+def test_ref_validation_and_pinning_use_constant_git_processes(local_capture, monkeypatch):
+    root, source, commit = local_capture
+    annotated = run_git(["-C", str(source), "rev-parse", "v1"]).strip()
+    names = {f"refs/heads/branch-{n}": commit for n in range(300)}
+    names.update({f"refs/tags/tag-{n}": annotated for n in range(100)})
+    run_git(["-C", str(source), "update-ref", "--stdin"],
+            input_text="".join(f"create {ref} {oid}\n" for ref, oid in names.items()))
+    local_git = gitstore.run_git
+    calls = []
+
+    def traced(args, **kwargs):
+        calls.append((args, kwargs))
+        return local_git(args, **kwargs)
+
+    monkeypatch.setattr(gitstore, "run_git", traced)
+    info = collect_git(root, "test/repo", 17, "run1")
+    assert info["git_ref_count"] == 404
+    assert len(calls) == 8
+    batches = [(args, kwargs) for args, kwargs in calls if "cat-file" in args]
+    updates = [(args, kwargs) for args, kwargs in calls if "update-ref" in args]
+    assert len(batches) == len(updates) == 1
+    assert batches[0][0][-1] == "--batch-check=%(objectname)"
+    assert updates[0][1]["input_text"].startswith("start\ncreate ")
+    assert updates[0][1]["input_text"].endswith("prepare\ncommit\n")
+
+
+def test_archive_ref_namespace_is_create_only_and_transactional(local_capture):
+    root, source, original = local_capture
+    info = collect_git(root, "test/repo", 17, "run1")
+    (source / "file.txt").write_text("new version\n")
+    run_git(["-C", str(source), "commit", "-a", "-m", "second"])
+    run_git(["-C", str(source), "branch", "a-new-branch"])
+    assert collect_git(root, "test/repo", 17, "run1") == info
+    mirror = root / info["mirror_path_relative"]
+    with pytest.raises(RuntimeError, match="reference already exists"):
+        gitstore._pin_refs(mirror, [
+            {"local_immutable_ref": "refs/archive/run1/heads/a-new-branch", "object_id": original},
+            {"local_immutable_ref": "refs/archive/run1/heads/main", "object_id": original},
+        ])
+    assert run_git(["-C", str(mirror), "rev-parse", "refs/archive/run1/heads/main"]).strip() == original
+    assert run_git(["-C", str(mirror), "for-each-ref", "refs/archive/run1/heads/a-new-branch"]) == ""
+
+
+@pytest.mark.parametrize("failure", ["missing", "wrong-peel", "conflicting-peels", "changed-refs", "changed-peel"])
+def test_capture_rejects_invalid_or_unstable_advertisements(local_capture, monkeypatch, failure):
+    root, _, original = local_capture
+    advertise = gitstore._remote_ref_advertisement
+    count = 0
+
+    def tampered(remote):
+        nonlocal count
+        count += 1
+        refs, peeled = advertise(remote)
+        if failure == "missing":
+            refs["refs/heads/not-fetched"] = "a" * 40
+        elif failure == "wrong-peel":
+            peeled["refs/tags/v1"] = refs["refs/tags/v1"]
+        elif failure == "conflicting-peels":
+            refs["refs/tags/v0-copy"] = refs["refs/tags/v1"]
+            peeled["refs/tags/v0-copy"] = refs["refs/tags/v1"]
+        elif failure == "changed-refs" and count == 2:
+            refs["refs/heads/late"] = original
+        elif failure == "changed-peel" and count == 2:
+            peeled["refs/tags/v1"] = refs["refs/tags/v1"]
+        return refs, peeled
+
+    monkeypatch.setattr(gitstore, "_remote_ref_advertisement", tampered)
+    with pytest.raises(RuntimeError):
+        collect_git(root, "test/repo", 17, "run1")
+    assert run_git(["-C", str(root / "git" / "17.git"), "for-each-ref", "refs/archive/"]) == ""
+
+
+def test_rejects_run_id_that_would_inject_stdin_commands(local_capture):
+    root, _, _ = local_capture
+    with pytest.raises(ValueError, match="Invalid immutable Git ref"):
+        collect_git(root, "test/repo", 17, "run1\ncommit\n")
+    assert not (root / "git").exists()

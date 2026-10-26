@@ -8,15 +8,28 @@ from pathlib import Path
 from typing import Any
 
 from .core import ObjectStore, canonical_json, sha256
-from .gitstore import run_git
+from .gitstore import _valid_refname, _verify_advertised_objects, run_git
+
+
+def _git_namespace(obj: dict[str, Any]) -> str:
+    git_info = obj["git"]
+    prefix = f"refs/archive/{obj.get('capture_id', obj['run_id'])}/"
+    if git_info.get("archive_ref_prefix", prefix) != prefix:
+        raise ValueError("Git archive namespace differs from manifest capture ID")
+    refs = git_info["advertised_refs"]
+    if len({ref["published_ref"] for ref in refs}) != len(refs):
+        raise ValueError("Duplicate advertised Git ref in manifest")
+    for ref in refs:
+        published = ref["published_ref"]
+        if (not _valid_refname(published) or not published.startswith(("refs/heads/", "refs/tags/", "refs/pull/")) or
+                (published.startswith("refs/pull/") and not published.endswith("/head")) or
+                ref["local_immutable_ref"] != prefix + published[len("refs/"):]):
+            raise ValueError("Git immutable ref differs from manifest capture namespace")
+    return prefix
 
 
 def _verify_peeled_targets(repo: Path, refs: list[dict[str, Any]]) -> None:
-    for ref in refs:
-        if ref.get("peeled_object_id") is not None:
-            actual = run_git(["-C", str(repo), "rev-parse", ref["object_id"] + "^{}"], timeout=30).strip()
-            if actual != ref["peeled_object_id"]:
-                raise RuntimeError(f"Git peeled target differs from manifest: {ref['published_ref']}")
+    _verify_advertised_objects(repo, refs, runner=run_git)
 
 
 def _verify_portable_bundle(bundle_path: Path, git_info: dict[str, Any]) -> None:
@@ -49,8 +62,12 @@ def verify_all(root: Path, *, check_git: bool = True, check_ots: bool = False) -
     stats = {"manifests": 0, "raw_observations": 0, "bytes_verified": 0,
              "git_refs_verified": 0, "git_repositories_verified": 0,
              "portable_git_bundles_verified": 0, "timestamp_proofs_verified": 0,
+             "portable_git_archives_verified": 0,
              "partial_runs": 0, "unstamped_runs": 0}
     integrity_checked: set[Path] = set()
+    archive_verifiers: dict[Path, Any] = {}
+    archive_bundles_checked: dict[str, bytes] = {}
+    archive_temporary = tempfile.TemporaryDirectory(prefix="icsot-verify-archives-")
     runs_root = root / "runs"
     for repo_dir in sorted(runs_root.iterdir()) if runs_root.exists() else []:
         if not repo_dir.is_dir():
@@ -76,6 +93,7 @@ def verify_all(root: Path, *, check_git: bool = True, check_ots: bool = False) -
                             errors.append(f"Body length mismatch {fn}: {r['purpose']}")
                         stats["bytes_verified"] += len(data)
                         stats["raw_observations"] += 1
+                prefix = _git_namespace(obj) if obj.get("git") else None
                 if obj.get("git") and obj["git"].get("portable_full_bundle"):
                     bundle = obj["git"]["portable_full_bundle"]
                     if not store.verify(bundle["sha256"]):
@@ -88,6 +106,20 @@ def verify_all(root: Path, *, check_git: bool = True, check_ots: bool = False) -
                             stats["portable_git_bundles_verified"] += 1
                         except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired) as e:
                             errors.append(f"Portable Git bundle restore failed {fn}: {e}")
+                if obj.get("git") and obj["git"].get("portable_archive"):
+                    from .gitarchive import PortableArchiveVerifier, verify_archive_integrity
+                    try:
+                        if obj["git"]["portable_archive"]["repository_id"] != obj["repository_id"]:
+                            raise ValueError("Portable Git archive repository differs from manifest")
+                        verify_archive_integrity(root, obj["git"], verified_bundles=archive_bundles_checked)
+                        if check_git:
+                            if repo_dir not in archive_verifiers:
+                                archive_verifiers[repo_dir] = PortableArchiveVerifier(
+                                    root, Path(archive_temporary.name) / str(len(archive_verifiers)))
+                            archive_verifiers[repo_dir].verify(obj["git"])
+                            stats["portable_git_archives_verified"] += 1
+                    except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired) as e:
+                        errors.append(f"Portable Git archive restore failed {fn}: {e}")
                 if check_git and obj.get("git"):
                     mirror = root / obj["git"]["mirror_path_relative"]
                     mirror_key = mirror.resolve()
@@ -100,7 +132,6 @@ def verify_all(root: Path, *, check_git: bool = True, check_ots: bool = False) -
                             stats["git_repositories_verified"] += 1
                         except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
                             errors.append(f"Git object graph integrity failed {mirror}: {e}")
-                    prefix = f"refs/archive/{obj['run_id']}/"
                     fetched = run_git(["-C", str(mirror), "for-each-ref", "--format=%(refname) %(objectname)", prefix])
                     live = {}
                     for line in fetched.splitlines():
@@ -128,4 +159,5 @@ def verify_all(root: Path, *, check_git: bool = True, check_ots: bool = False) -
                 errors.append(f"Error validating {fn}: {type(e).__name__}: {e}")
     stats["errors"] = errors
     stats["ok"] = len(errors) == 0
+    archive_temporary.cleanup()
     return stats

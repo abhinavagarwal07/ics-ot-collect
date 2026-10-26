@@ -38,15 +38,21 @@ def diff_latest(root: Path, repo_id: int) -> dict[str, Any]:
         raise ValueError(f"No evidence for repository id {repo_id}")
     mans = [json.loads(p.read_bytes()) for p in files]
     complete = [m for m in mans if m.get("status") == "complete" and m["mode"] != "events"]
-    if len(complete) < 2:
-        raise ValueError("Require two completed metadata/Git runs to compare")
-    old, new = complete[-2:]
+    api_runs = [m for m in complete if m.get("lane") in (None, "api")]
+    git_runs = [m for m in complete if m.get("lane") in (None, "git") and m.get("git")]
+    if len(api_runs) < 2 and len(git_runs) < 2:
+        raise ValueError("Require two completed observations in the same API or Git lane to compare")
+    old, new = (api_runs if len(api_runs) >= 2 else git_runs)[-2:]
     out: dict[str, Any] = {"repository_id": repo_id,
         "old_run_id": old["run_id"], "new_run_id": new["run_id"],
         "qualification": "Newly observed since earlier captured runs; not necessarily first created, first public, or exhaustively detected.",
-        "entity_types": {}}
-    prior = [m for m in mans if m["run_id"] < new["run_id"]]
-    for typ in ("issues", "pulls"):
+        "entity_types": {},
+        "api_comparison": {"old_run_id": api_runs[-2]["run_id"], "new_run_id": api_runs[-1]["run_id"]}
+                          if len(api_runs) >= 2 else None,
+        "git_comparison": {"old_run_id": git_runs[-2]["run_id"], "new_run_id": git_runs[-1]["run_id"]}
+                          if len(git_runs) >= 2 else None}
+    prior = [m for m in mans if m["run_id"] < new["run_id"] and m.get("lane") in (None, "api")]
+    for typ in ("issues", "pulls") if len(api_runs) >= 2 else ():
         before_seen: dict[str, dict] = {}
         for m in prior:
             before_seen.update(_entities(root, m, typ))
@@ -59,13 +65,15 @@ def diff_latest(root: Path, repo_id: int) -> dict[str, Any]:
             "current_scope_count": len(now),
             "warning": "A changed complete JSON representation may reflect counts, label changes or other metadata, not a text edit. Missing from a delta result is NOT deletion.",
         }
-    a = {e["published_ref"]: e["object_id"] for e in (old.get("git") or {}).get("advertised_refs", [])}
-    b = {e["published_ref"]: e["object_id"] for e in (new.get("git") or {}).get("advertised_refs", [])}
+    git_old, git_new = git_runs[-2:] if len(git_runs) >= 2 else ({}, {})
+    a = {e["published_ref"]: e["object_id"] for e in (git_old.get("git") or {}).get("advertised_refs", [])}
+    b = {e["published_ref"]: e["object_id"] for e in (git_new.get("git") or {}).get("advertised_refs", [])}
     out["git_refs"] = {
         "added": [{"ref": ref, "new_sha": b[ref]} for ref in sorted(set(b) - set(a))],
         "not_advertised_now": [{"ref": ref, "prior_sha": a[ref]} for ref in sorted(set(a) - set(b))],
         "moved": [{"ref": ref, "prior_sha": a[ref], "new_sha": b[ref]}
                   for ref in sorted(set(a) & set(b)) if a[ref] != b[ref]],
         "note": "Git refs show what was advertised at each collection interval, not time of commit authorship or universal first public visibility.",
+        "comparison_available": len(git_runs) >= 2,
     }
     return out

@@ -17,18 +17,20 @@ A research paper must not misrepresent this starter as a complete, unattended re
 - [x] CLI verification and fully regenerable observation CSV.
 - [x] Original initial OpenTimestamps proof kept separately when `ots` is present.
 - [x] Offline tests for immutable bytes, tamper detection, page drift, URL boundary, manifest chain and reproducible data extraction.
-- [x] Observed API failures become partial runs; partial runs are **not** advanced as a delta watermark.
+- [x] Legacy API failures become partial runs without advancing their combined cursor. Persistent mode advances only independently successful scope cursors after immutable finalization; deferred captures retain frozen query options.
+- [x] Independent durable API/Git queues with leases, attempt telemetry and finalization-only retries; resumable raw-response/page/item checkpoints.
+- [x] Baseline plus incremental/refs-only Git CAS archives, explicit prerequisites, crash-safe capture replay, independent offline restoration and encrypted per-capture transfers.
 
 ## Blockers before unattended production data collection
 
 **P0 — implement before making strong scientific completeness/timing claims**
 
-- [ ] Persistent SQLite/PostgreSQL **per-scope task queue and checkpoints** (one monster `--deep-full` run is not scalable, and interrupting it should resume individual item pages/reviews).
+- [x] Persistent SQLite repository/lane queue and individual API page/item-scope checkpoints. Deep scopes resume within their durable capture; a separate research metadata database remains future work.
 - [ ] Full rate-limit controller: primary/secondary budget, `Retry-After` (seconds AND HTTP-date), `X-RateLimit-Reset`, `X-Poll-Interval`, adaptive polling, separate concurrency caps. Current client has bounded retries, but not a full policy controller.
-- [ ] Explicit endpoint result ledger: `COMPLETE_FOR_QUERY`, `PARTIAL`, `NON_ATOMIC`, `NOT_POLLED`, `CAP_REACHED`, `NOT_PUBLIC`, `HTTP_ERROR`, with scope-specific watermarks and no false deletion inferences.
+- [x] Explicit resumable endpoint outcomes, including complete, failed, capped, non-atomic, not attempted and deferred results, with scope-specific watermarks and no false deletion inferences.
 - [ ] PR commits/files **cap handling** (PR commit listing 250, files 3000), fallback to validated Git graph/compare. Starter now aborts and flags partial when known PR totals exceed caps; full alternative must be added.
 - [ ] NTP/chrony offset/uncertainty collection and wall-clock health gates; host clock alone is insufficient for tight time claims.
-- [ ] Automated off-host immutable/WORM replication **and restore audits**, explicit retention and access separation; Git objects must be backed up alongside raw API data. At present only local files are retained.
+- [ ] Automated off-host immutable/WORM replication **and restore audits**, explicit retention and access separation. The baseline transfers encrypted Release assets; persistent mode can emit encrypted local transfers, which alone are not an off-host backup.
 - [ ] Scheduled integrity/restore audits, off-host packfile backup verification and race/backfill handling after force pushes. On-demand mirror `fsck` and full-bundle restoration are implemented.
 - [ ] Full explicit repository rename/transfer handling by stable numeric ID, with immutable cohort-amendment record. Current implementation fails closed and requires manual config amendment.
 - [ ] Immutable publication of checkpoint digests to an independent witness. Private hash-chains can be discarded/replaced until witnessed.

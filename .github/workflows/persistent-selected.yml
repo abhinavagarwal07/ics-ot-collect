@@ -1,0 +1,130 @@
+name: Persistent selected repository (manual)
+
+# Review and explicit dispatch only. No cron or automatic full-cohort launch.
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'One public repository from the declared cohort'
+        required: true
+        default: 'libfuse/libfuse'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: persistent-selected-${{ inputs.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      repository_id: ${{ steps.selected.outputs.repository_id }}
+    steps:
+      - name: Check out reviewed collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Resolve one declared public repository
+        id: selected
+        env:
+          GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
+          CAPTURE_SLUG: ${{ inputs.repository }}
+        run: |
+          python - <<'PY'
+          import os
+          import tempfile
+          from dataclasses import replace
+          from pathlib import Path
+          from icsot_observer.core import Config, ObjectStore
+          from icsot_observer.github import GitHubAPI
+          config = Config.load("config.corpus.toml")
+          slug = os.environ["CAPTURE_SLUG"]
+          if slug not in config.repositories:
+              raise SystemExit("Selected repository is outside the declared cohort")
+          with tempfile.TemporaryDirectory(prefix="icsot-identity-") as temporary:
+              config = replace(config, root=Path(temporary), repositories=(slug,))
+              meta = GitHubAPI(config, ObjectStore(config.root), []).get_json(f"/repos/{slug}", "repository_identity")
+          if meta.get("private") is not False or type(meta.get("id")) is not int or meta["id"] <= 0:
+              raise SystemExit("Selected repository is not unambiguously public")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"repository_id={meta['id']}\n")
+          PY
+
+  observe:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    concurrency:
+      group: persistent-selected-id-${{ needs.resolve.outputs.repository_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out reviewed collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector and pinned timestamp client
+        run: python -m pip install --disable-pip-version-check -e . opentimestamps-client==0.7.2
+      - name: Materialize the separate operational state key
+        env:
+          COLLECTOR_STATE_PRIVATE_KEY: ${{ secrets.COLLECTOR_STATE_PRIVATE_KEY }}
+        run: |
+          set +x
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          key = os.environ.get("COLLECTOR_STATE_PRIVATE_KEY", "")
+          if not key.strip():
+              raise SystemExit("COLLECTOR_STATE_PRIVATE_KEY is required; evidence private keys stay local")
+          path = Path(os.environ["RUNNER_TEMP"]) / "icsot-state-private.pem"
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w") as output:
+              output.write(key)
+              output.flush()
+              os.fsync(output.fileno())
+          PY
+      - name: Restore state, collect independent lanes, publish encrypted evidence and state
+        env:
+          GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
+          CAPTURE_SLUG: ${{ inputs.repository }}
+          SOURCE_REPOSITORY_ID: ${{ needs.resolve.outputs.repository_id }}
+        run: |
+          set +x
+          trap 'rm -f "$RUNNER_TEMP/icsot-state-private.pem"' EXIT
+          icsot-observe github-run \
+            --config config.corpus.toml \
+            --slug "$CAPTURE_SLUG" \
+            --repository-id "$SOURCE_REPOSITORY_ID" \
+            --destination-repository "$GITHUB_REPOSITORY" \
+            --state-public-key keys/working-state-rsa-public.pem \
+            --state-private-key "$RUNNER_TEMP/icsot-state-private.pem" \
+            --evidence-public-key keys/results-rsa-public.pem \
+            --code-sha "$GITHUB_SHA" \
+            --observation-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --rfc3161-url http://timestamp.digicert.com \
+            --rfc3161-ca keys/digicert-trusted-root-g4.pem \
+            --rfc3161-chain keys/digicert-timestamp-2025-intermediate.pem
+      - name: Remove runner operational key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/icsot-state-private.pem"

@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install project and test dependency
-        run: python -m pip install --disable-pip-version-check -e . pytest==9.1.1
+        run: python -m pip install --disable-pip-version-check -e . pytest==9.1.1 opentimestamps-client==0.7.2
       - name: Run complete test suite
         run: |
           mkdir -p analysis/ci

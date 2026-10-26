@@ -30,7 +30,7 @@ from icsot_observer.checks import verify_all
 from icsot_observer.core import Config, ObjectStore, REPO_RE, canonical_json, sha256, utc_iso
 from icsot_observer.gitstore import run_git
 from icsot_observer.encryption import encrypt_file, public_key_fingerprint
-from icsot_observer.pipeline import collect_one
+from icsot_observer.pipeline import collect_one, restore_mirrors as restore_evidence_mirrors
 
 PART_BYTES = 1024 ** 3
 EXPECTED_REPOSITORIES = 185
@@ -703,34 +703,8 @@ def finalize(args) -> int:
 
 
 def restore_mirrors(root: Path) -> dict:
-    """Recreate disposable mirrors offline using only retained portable bundles."""
-    initial = verify_all(root, check_git=False)
-    if not initial["ok"]:
-        raise RuntimeError("Archived bytes failed verification before offline restore")
-    store = ObjectStore(root)
-    for path in sorted((root / "runs").glob("*/*.manifest.json")):
-        manifest = json.loads(path.read_bytes())
-        git = manifest.get("git")
-        if not git:
-            continue
-        expected = f"git/{manifest['repository_id']}.git"
-        if git["mirror_path_relative"] != expected:
-            raise ValueError("Unexpected mirror path in manifest")
-        mirror = root / expected
-        if mirror.exists():
-            continue  # A retained partial mirror is checked by the full verifier.
-        bundle = git.get("portable_full_bundle")
-        if not bundle:
-            raise RuntimeError("No portable bundle for missing mirror")
-        mirror.parent.mkdir(parents=True, exist_ok=True)
-        object_format = git.get("git_object_hash_algorithm", "sha1")
-        if object_format not in ("sha1", "sha256"):
-            raise ValueError("Unsupported Git object format")
-        run_git(["init", "--bare", f"--object-format={object_format}", str(mirror)])
-        archive = str(store.location(bundle["sha256"]).resolve())
-        run_git(["-C", str(mirror), "bundle", "verify", archive], timeout=1800)
-        run_git(["-C", str(mirror), "fetch", "--no-tags", archive, "+refs/*:refs/*"], timeout=1800)
-    return verify_all(root)
+    """Compatibility entry point for offline full/incremental Git restoration."""
+    return restore_evidence_mirrors(root)
 
 
 def main(argv=None) -> int:

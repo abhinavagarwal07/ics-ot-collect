@@ -28,7 +28,7 @@ The manual `Corpus baseline (one time)` workflow plans all 185 repositories in C
 
 Each archive contains source/configuration hashes, request and outcome reports, raw evidence, manifests, receipts and the portable bundle. Verified bundles replace the disposable mirror in the retained package. Archive parts carry individual SHA-256 digests; a per-repository index is uploaded after its parts. The aggregate inventory lists all 185 dispositions. A draft release is published after all capture jobs terminate, including when some captures are incomplete.
 
-XZ here is the **baseline transport/archive format**. The current collector's individual CAS files still use original bytes; native per-object XZ and SQLite integration remain implementation work. Pending OTS receipts are not completed Bitcoin attestations.
+XZ here is the **transport/archive format**. Individual CAS files still use original bytes; native per-object XZ and the proposed research metadata schema remain implementation work. Operational queue/lease/cursor SQLite storage is implemented. Pending OTS receipts are not completed Bitcoin attestations.
 
 To restore a downloaded target, verify each part against its index, concatenate the parts in the listed order, then decompress and extract the tar archive. Reconstruct the omitted mirror and run full offline verification from the collector directory:
 
@@ -38,8 +38,8 @@ python scripts/capture_baseline.py restore --root /path/to/extracted/evidence
 
 ## Recurring collection
 
-**No recurring interval is enabled yet.** Recommend an initial six-hour timer on the available always-on host, with persistent mirrors and durable queue/state. Actions can validate or trigger recovery. Hosted Actions cron is best effort and can be delayed or dropped. [Scheduled events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+**No recurring interval is enabled yet.** The implemented `persistent` command defaults to independent six-hour API/Git intervals with durable mirrors, queue and state. Execution may use a persistent host or a GitHub-backed adapter that restores authenticated working state before each bounded run; a host has not been deployed. Hosted Actions cron is best effort and can be delayed or dropped. [Scheduled events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 
-Before recurrence, implement genuine incremental Git archives with explicit prerequisites, retain only new CAS objects, and test restoration of the complete dependency chain. The current `--bundle-full` rewrites essentially the whole Git history, including new observation refs; repeating it four times daily would exceed the intended growth budget. Fresh runners also require prior state to avoid turning a requested delta into another baseline.
+Genuine incremental Git archives with explicit prerequisites and encrypted per-capture transfers are now implemented and tested offline. Legacy `--bundle-full` still rewrites the full Git history; the active one-time baseline keeps that behavior. Recurring execution must retain and restore prior working state to avoid another baseline, enforce the monthly storage cap, and verify remote retention. See [durable collection](PERSISTENT.md).
 
 Record proof upgrades in later append-only checkpoints rather than replacing original receipts. Keep the evidence backend replaceable so Release assets can be copied unchanged into an independent object store and verified by digest.
