@@ -9,7 +9,7 @@ description = "Prospective, timestamped public GitHub evidence collector (resear
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name="ICS/OT observatory research"}]
-dependencies = []
+dependencies = ["cryptography[ssh]==50.0.2"]
 
 [project.scripts]
 icsot-observe = "icsot_observer.cli:main"

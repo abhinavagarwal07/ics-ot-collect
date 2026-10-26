@@ -10,6 +10,7 @@ from .core import Config
 from .derive import make_observations
 from .diff import diff_latest
 from .pipeline import collect_all
+from .encryption import encrypt_file, decrypt_file
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,7 +32,18 @@ def main(argv: list[str] | None = None) -> int:
     df = subs.add_parser("diff", help="Compare latest two complete metadata/Git runs; never interpret absence as deletion")
     df.add_argument("--root", required=True)
     df.add_argument("--repository-id", required=True, type=int)
+    for command in ("encrypt", "decrypt"):
+        crypto = subs.add_parser(command, help=f"{command.capitalize()} an archive using an RSA recipient key")
+        crypto.add_argument("--input", required=True)
+        crypto.add_argument("--output", required=True)
+        crypto.add_argument("--public-key" if command == "encrypt" else "--private-key", required=True)
     args = ap.parse_args(argv)
+    if args.command == "encrypt":
+        print(json.dumps(encrypt_file(args.input, args.output, args.public_key), indent=2))
+        return 0
+    if args.command == "decrypt":
+        print(json.dumps(decrypt_file(args.input, args.output, args.private_key), indent=2))
+        return 0
     if args.command == "collect":
         config = Config.load(args.config)
         result = collect_all(config, args.mode, deep_full=args.deep_full,

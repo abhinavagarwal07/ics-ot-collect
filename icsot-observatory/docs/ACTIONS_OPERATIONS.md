@@ -2,7 +2,7 @@
 
 ## Active baseline
 
-[Run 40249527444](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40249527444) started at 2026-10-26 00:28 UTC from collector commit `796c6b4764f6eac27bd444f3fc06bca114a4dc00`. It queues the complete 185-target cohort, with four captures at a time. Captures have a 180-minute job timeout; finalization has 90 minutes. **No recurring interval is enabled.** A code fix pushed afterward does not change this run's checkout.
+[Run 40249527444](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40249527444) started at 2026-10-26 00:28 UTC from collector commit `796c6b4764f6eac27bd444f3fc06bca114a4dc00` and was canceled. Retained payloads are migrated into encrypted replacements before public exposure. The resumed workflow skips verified complete parent captures and encrypts new payloads before upload. Captures have a 180-minute job timeout; finalization has 90 minutes. **No recurring interval is enabled.** A code fix pushed afterward does not change an already-running checkout.
 
 The first four completed captures took 63–183 seconds. These small early targets do not establish an ETA for large repositories. The CSV's approximately 30.88 GiB is a declared GitHub repository-size metric, not a measured archive or peak-disk bound.
 
@@ -23,6 +23,8 @@ The documented 24-hour queued-job limit appears under **self-hosted runners**; i
 Even empty targets require at least nine source reads each before rechecks, retries and transfers: 1,665 for 185 repositories. Busy repositories require thousands of pages. A per-job one-hour primary wait is bounded, but does not coordinate the shared allowance or guarantee complete metadata. The 40-request transfer reserve is a local precaution, not an atomic global reservation.
 
 ## Compute cost
+
+The public repository uses free standard hosted Ubuntu compute. The private-repository figures below explain the original baseline and remain useful if execution moves back to a private repository. API, concurrency and job-runtime limits still apply publicly.
 
 Public target repositories do not make execution free in this **private collector repository**. Standard Linux x64 costs $0.006 per billed minute beyond included usage; each job is rounded up to a whole minute. Account plan, remaining included minutes and billing stop limits have not been verified. [Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [runner pricing](https://docs.github.com/en/billing/reference/actions-runner-pricing).
 

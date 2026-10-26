@@ -13,6 +13,9 @@ import pytest
 
 from icsot_observer.core import Config, ObjectStore, canonical_json
 from icsot_observer.gitstore import run_git
+from icsot_observer.encryption import decrypt_file
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 spec = importlib.util.spec_from_file_location("capture_baseline", Path(__file__).parents[1] / "scripts/capture_baseline.py")
@@ -34,10 +37,15 @@ def sources(tmp_path, slugs=("example/one", "example/two")):
 
 
 def args_for(tmp_path, config, csv):
+    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_path, private_path = tmp_path / "results-public.pem", tmp_path / "results-private.pem"
+    public_path.write_bytes(private.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    private_path.write_bytes(private.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     return argparse.Namespace(
         config=config, csv=csv, slug="example/one", code_sha="a" * 40,
         release_tag="corpus-baseline-123-1", release_repository="owner/private",
         work_root=tmp_path / "work",
+        public_key=public_path, test_private_key=private_path,
     )
 
 
@@ -58,12 +66,19 @@ def accepted_index(identities, args):
     }
 
 
-def unpack_archive(assets, archive, destination):
+def unpack_archive(assets, archive, destination, private_key=None):
     combined = bytearray()
     for part in archive["parts"]:
         data = (assets / part["name"]).read_bytes()
         assert hashlib.sha256(data).hexdigest() == part["sha256"]
         assert len(data) == part["bytes"]
+        if part.get("encryption"):
+            assert private_key is not None
+            output = assets / (part["name"] + ".decrypted")
+            result = decrypt_file(assets / part["name"], output, private_key)
+            assert result["plaintext_sha256"] == part["plaintext"]["sha256"]
+            data = output.read_bytes()
+            output.unlink()
         combined.extend(data)
     with tarfile.open(fileobj=io.BytesIO(lzma.decompress(bytes(combined))), mode="r:") as restored:
         names = restored.getnames()
@@ -131,8 +146,23 @@ def test_failed_capture_and_verifier_still_transfer_bytes_and_index_last(tmp_pat
     assert "synthetic capture interruption" in index["collector_result"]["error"]
     assert "synthetic verifier failure" in index["verification"]["errors"][0]
     assert index["archive"]["git_mirror_included"]
-    names = unpack_archive(uploads[0].parent, index["archive"], tmp_path / "restored")
+    names = unpack_archive(uploads[0].parent, index["archive"], tmp_path / "restored", args.test_private_key)
     assert "evidence/git/17.git/objects/partial.pack" in names
+
+
+def test_encryption_failure_never_uploads_plaintext(tmp_path, monkeypatch):
+    config, csv, config_obj, identities = sources(tmp_path)
+    args = args_for(tmp_path, config, csv)
+    monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config_obj, identities))
+    monkeypatch.setattr(baseline, "collect_one", lambda *a, **kw: {"repo": args.slug, "status": "partial"})
+    monkeypatch.setattr(baseline, "encrypt_file", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("synthetic encryption failure")))
+    uploads = []
+    monkeypatch.setattr(baseline, "upload_asset", lambda tag, path, repo: uploads.append(path))
+    assert baseline.capture(args) == 2
+    assert len(uploads) == 1 and uploads[0].name.endswith(".index.json")
+    index = json.loads(uploads[0].read_bytes())
+    assert not index["complete"] and index["archive"]["parts"] == []
+    assert any("Encryption:" in message for message in index["errors"])
 
 
 def make_portable_capture(config, slug, mode, **kwargs):
@@ -191,7 +221,8 @@ def test_complete_capture_omits_verified_mirror_and_restores_offline(tmp_path, m
     assert not index["archive"]["git_mirror_included"]
     assert index["csv_sha256"] == identities["csv_sha256"]
     restored = tmp_path / "restored"
-    names = unpack_archive(uploads[0].parent, index["archive"], restored)
+    assert index["archive"]["encrypted"] and all(part["name"].endswith(".enc") for part in index["archive"]["parts"])
+    names = unpack_archive(uploads[0].parent, index["archive"], restored, args.test_private_key)
     assert not any(name.startswith("evidence/git") for name in names)
     manifest = restored / "evidence" / index["manifests"][0]["path"]
     assert hashlib.sha256(manifest.read_bytes()).hexdigest() == index["manifests"][0]["sha256"]
@@ -461,3 +492,115 @@ def test_deadline_transfers_partial_outcome_and_index(tmp_path, monkeypatch, pha
     assert any("PhaseDeadlineExceeded" in error for error in index["errors"])
     assert uploads[-1].name.endswith(".index.json")
     assert index["archive"]["complete"] and all(part["uploaded"] for part in index["archive"]["parts"])
+
+
+def parent_fixture(tmp_path, monkeypatch):
+    config, csv, config_obj, identities = sources(tmp_path)
+    args = args_for(tmp_path, config, csv)
+    args.parent_release_tag = "corpus-baseline-99-1"
+    parent_args = argparse.Namespace(**vars(args))
+    parent_args.release_tag = args.parent_release_tag
+    index = accepted_index(identities, parent_args)
+    data = {12: canonical_json(index)}
+    assets = [
+        {"id": 12, "name": baseline.repository_key(args.slug) + ".index.json", "size": len(data[12]),
+         "digest": "sha256:" + hashlib.sha256(data[12]).hexdigest(), "state": "uploaded"},
+        {"id": 13, "name": "part-1", "size": 5, "digest": "sha256:" + "e" * 64, "state": "uploaded"},
+    ]
+
+    def github(*arguments, **kwargs):
+        if "/releases/assets/" in arguments[1]:
+            return data[int(arguments[1].rsplit("/", 1)[1])]
+        assert arguments[:2] == ("api", f"repos/{args.release_repository}/releases/tags/{args.parent_release_tag}")
+        return json.dumps({"id": 10, "draft": True, "target_commitish": parent_args.code_sha}).encode()
+
+    monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config_obj, identities))
+    monkeypatch.setattr(baseline, "release_assets", lambda *a: assets)
+    monkeypatch.setattr(baseline, "gh", github)
+    return args, config_obj, identities, index, data, assets
+
+
+def test_resume_plan_keeps_full_cohort_but_skips_only_verified_parent(tmp_path, monkeypatch):
+    args, _, _, _, _, _ = parent_fixture(tmp_path, monkeypatch)
+    args.github_output = tmp_path / "outputs"
+    assert baseline.plan(args) == 0
+    outputs = dict(line.split("=", 1) for line in args.github_output.read_text().splitlines())
+    assert outputs["cohort_count"] == "2" and outputs["inherited_complete_count"] == "1"
+    assert outputs["remaining_count"] == "1"
+    assert [row["slug"] for row in json.loads(outputs["matrix"])["include"]] == ["example/two"]
+
+
+@pytest.mark.parametrize("invalid", ["source_hash", "index_hash", "missing_part_hash", "partial"])
+def test_resume_does_not_skip_invalid_parent_or_download_archive(tmp_path, monkeypatch, invalid):
+    args, config, identities, index, data, assets = parent_fixture(tmp_path, monkeypatch)
+    if invalid == "source_hash":
+        index["csv_sha256"] = "0" * 64
+    elif invalid == "index_hash":
+        assets[0]["digest"] = "sha256:" + "0" * 64
+    elif invalid == "missing_part_hash":
+        assets[1]["digest"] = None
+    else:
+        index["collector_result"]["status"] = "partial"
+    if invalid in ("source_hash", "partial"):
+        data[12] = canonical_json(index)
+        assets[0].update(size=len(data[12]), digest="sha256:" + hashlib.sha256(data[12]).hexdigest())
+    monkeypatch.setattr(baseline, "downloaded_asset_identity", lambda *a: pytest.fail("Resume downloaded archive bytes"))
+    outcome = baseline.parent_capture_outcomes(config, identities, args.release_repository, args.parent_release_tag)
+    assert not outcome[args.slug]["complete"] and outcome[args.slug]["errors"]
+
+
+@pytest.mark.parametrize("invalid", [None, "plaintext", "ciphertext"])
+def test_resume_accepts_verified_encrypted_parent_transport(tmp_path, monkeypatch, invalid):
+    args, config, identities, index, data, assets = parent_fixture(tmp_path, monkeypatch)
+    assets.pop()  # Original plaintext has been removed after verified migration.
+    alias = {"plaintext": {key: index["archive"]["parts"][0][key] for key in ("name", "sha256", "bytes")},
+             "ciphertext": {"name": "part-1.age", "bytes": 101, "sha256": "c" * 64},
+             "recipient": "age1test"}
+    if invalid == "plaintext":
+        alias["plaintext"]["sha256"] = "0" * 64
+    data[15] = canonical_json({"schema_version": 1, "parts": {"part-1": alias}})
+    assets.extend([
+        {"id": 14, "name": "part-1.age", "size": 101, "digest": "sha256:" + ("0" if invalid == "ciphertext" else "c") * 64,
+         "state": "uploaded"},
+        {"id": 15, "name": "encryption-migration-index.json", "size": len(data[15]),
+         "digest": "sha256:" + hashlib.sha256(data[15]).hexdigest(), "state": "uploaded"},
+    ])
+    row = baseline.parent_capture_outcomes(config, identities, args.release_repository, args.parent_release_tag)[args.slug]
+    assert row["complete"] == (invalid is None)
+    if invalid is None:
+        assert row["archive_transport_aliases"] == [alias]
+        assert row["transport_index_sha256"] == hashlib.sha256(data[15]).hexdigest()
+
+
+def test_finalizer_combines_parent_and_current_capture_with_original_shas(tmp_path, monkeypatch):
+    args, _, identities, parent_index, data, parent_assets = parent_fixture(tmp_path, monkeypatch)
+    args.code_sha = "b" * 40
+    args.slug = "example/two"
+    index = accepted_index(identities, args)
+    data[22] = canonical_json(index)
+    current_assets = [
+        {"id": 22, "name": baseline.repository_key(args.slug) + ".index.json", "size": len(data[22]),
+         "digest": "sha256:" + hashlib.sha256(data[22]).hexdigest(), "state": "uploaded"},
+        {"id": 23, "name": "part-1", "size": 5, "digest": "sha256:" + "e" * 64, "state": "uploaded"},
+    ]
+
+    def github(*arguments, **kwargs):
+        if arguments[:2] == ("release", "edit"):
+            return b""
+        if "/releases/assets/" in arguments[1]:
+            return data[int(arguments[1].rsplit("/", 1)[1])]
+        parent = arguments[1].endswith(args.parent_release_tag)
+        return json.dumps({"id": 10 if parent else 20, "draft": True,
+                           "target_commitish": parent_index["collector_code_sha"] if parent else args.code_sha}).encode()
+
+    monkeypatch.setattr(baseline, "gh", github)
+    monkeypatch.setattr(baseline, "release_assets", lambda repo, release_id: parent_assets if release_id == 10 else current_assets)
+    inventories = []
+    monkeypatch.setattr(baseline, "upload_asset", lambda tag, path, repo: inventories.append(json.loads(path.read_bytes())))
+    assert baseline.finalize(args) == 0
+    summary = inventories[0]
+    assert summary["complete_repositories"] == 2 and summary["parent_release_tag"] == args.parent_release_tag
+    assert summary["collector_code_sha"] == "b" * 40
+    inherited = summary["repositories"][0]
+    assert inherited["collector_code_sha"] == "a" * 40 and inherited["source_release_tag"] == args.parent_release_tag
+    assert inherited["index_sha256"] == hashlib.sha256(data[12]).hexdigest()

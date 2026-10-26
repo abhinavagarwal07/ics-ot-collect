@@ -1,8 +1,8 @@
 # Storage and launch decision
 
-The first 185-target baseline uses **private GitHub Release assets**, with XZ-compressed archives split into parts of at most 1 GiB. Keep large evidence outside ordinary Git. Retain the original CSV, collector configuration and small documentation in Git; a PR can review future observation indexes.
+The 185-target baseline uses **encrypted GitHub Release assets**, with XZ-compressed archives split into plaintext parts of at most 1 GiB and encrypted for the machine's RSA recipient. Keep large evidence outside ordinary Git. Retain the original CSV, collector configuration and small documentation in Git; a PR can review future observation indexes. See [encryption](ENCRYPTION.md).
 
-The [baseline is running](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40249527444). See [Actions limits, errors and recovery](ACTIONS_OPERATIONS.md) for execution limits, cost bounds, remaining failure modes and the first downloaded-archive restore check.
+The [original baseline](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40249527444) was canceled; its retained results are migrated into encrypted replacements. The resumed workflow reuses verified complete captures. See [Actions limits, errors and recovery](ACTIONS_OPERATIONS.md) for execution limits, cost bounds, remaining failure modes and the first downloaded-archive restore check.
 
 This choice starts capture without a new provider account. Releases have no automatic expiry configured by this project. Owner deletion remains possible, and an independent backup is still an open requirement.
 

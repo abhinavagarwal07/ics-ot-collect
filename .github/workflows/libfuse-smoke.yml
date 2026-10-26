@@ -82,7 +82,7 @@ jobs:
             shift
             local rc=0
             "$@" > "analysis/libfuse-smoke/${label}.json" 2> "analysis/libfuse-smoke/${label}.stderr.log" || rc=$?
-            cat "analysis/libfuse-smoke/${label}.json"
+            if [[ "$label" != diff ]]; then cat "analysis/libfuse-smoke/${label}.json"; fi
             cat "analysis/libfuse-smoke/${label}.stderr.log" >&2
             printf '%s\t%s\n' "$label" "$rc" | tee -a analysis/libfuse-smoke/exit-status.tsv
             if (( rc != 0 )); then failed=1; fi
@@ -162,14 +162,33 @@ jobs:
               output.write(text)
           print(text)
           PY
-      - name: Preserve temporary evidence and reports
+      - name: Encrypt evidence and reports for the machine RSA recipient
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import tarfile
+          from pathlib import Path
+          from icsot_observer.encryption import encrypt_file
+          transfer = Path("analysis/encrypted-transfer")
+          transfer.mkdir(parents=True, exist_ok=True)
+          archive = transfer / "libfuse-smoke.tar.xz"
+          with tarfile.open(archive, "w:xz", preset=1) as output:
+              for source in (Path("evidence/libfuse"), Path("analysis/libfuse-smoke")):
+                  if source.exists():
+                      output.add(source, arcname=str(source))
+          metadata = encrypt_file(archive, Path(str(archive) + ".enc"), "keys/results-rsa-public.pem")
+          (transfer / "encryption-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          print(json.dumps(metadata, indent=2))
+          PY
+      - name: Preserve encrypted evidence and public metadata
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: libfuse-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            icsot-observatory/evidence/libfuse/
-            icsot-observatory/analysis/libfuse-smoke/
+            icsot-observatory/analysis/encrypted-transfer/*.enc
+            icsot-observatory/analysis/encrypted-transfer/encryption-metadata.json
           include-hidden-files: true
           compression-level: 0
           retention-days: 7

@@ -1,6 +1,6 @@
-"""One-time, sharded baseline transfer through private GitHub Release assets.
+"""One-time, sharded baseline transfer through encrypted GitHub Release assets.
 
-Release parts are temporary working transfers to an owner-controlled private
+Release parts are encrypted transfers to an owner-controlled
 release; this helper does not promise an independent or indefinite archive.
 """
 from __future__ import annotations
@@ -29,12 +29,14 @@ from urllib.parse import urlsplit
 from icsot_observer.checks import verify_all
 from icsot_observer.core import Config, ObjectStore, REPO_RE, canonical_json, sha256, utc_iso
 from icsot_observer.gitstore import run_git
+from icsot_observer.encryption import encrypt_file, public_key_fingerprint
 from icsot_observer.pipeline import collect_one
 
 PART_BYTES = 1024 ** 3
 EXPECTED_REPOSITORIES = 185
 CAPTURE_TIMEOUT_SECONDS = 120 * 60
 VERIFICATION_TIMEOUT_SECONDS = 20 * 60
+RESULTS_PUBLIC_KEY = Path(__file__).resolve().parents[1] / "keys/results-rsa-public.pem"
 SCOPE = (
     "One initial public GitHub observation: shallow full REST listings, advertised "
     "branch/tag/pull-head Git refs and reachable Git objects. Per-item historical "
@@ -202,6 +204,23 @@ def package_archive(work: Path, assets: Path, key: str, *, include_mirror: bool,
     }
 
 
+def encrypt_archive_parts(archive: dict, assets: Path, public_key: Path) -> dict:
+    """Fail closed: this function never returns a plaintext upload candidate."""
+    recipient = public_key_fingerprint(public_key)
+    encrypted = {**archive, "encrypted": True, "recipient_spki_sha256": recipient, "parts": []}
+    for original in archive["parts"]:
+        source = assets / original["name"]
+        destination = source.with_name(source.name + ".enc")
+        record = encrypt_file(source, destination, public_key)
+        if (record["plaintext_sha256"] != original["sha256"] or record["plaintext_bytes"] != original["bytes"]):
+            raise ValueError("Archive changed before encryption")
+        encrypted["parts"].append({
+            "name": destination.name, "sha256": record["ciphertext_sha256"], "bytes": record["ciphertext_bytes"],
+            "plaintext": {key: original[key] for key in ("name", "sha256", "bytes")}, "encryption": record,
+        })
+    return encrypted
+
+
 def inspect_manifests(root: Path) -> list[dict]:
     manifests = []
     for path in sorted((root / "runs").glob("*/*.manifest.json")):
@@ -367,6 +386,115 @@ def index_capture_accepted(index: dict) -> bool:
     )
 
 
+def release_capture_outcome(slug: str, repository: str, tag: str, assets: dict,
+                            sources: dict, code_sha: str | None, *, parent: bool = False,
+                            transport_aliases: dict | None = None) -> dict:
+    """Verify one transferred outcome; resume never downloads large archive parts."""
+    name = repository_key(slug) + ".index.json"
+    row = {"repository": slug, "index_asset": name, "complete": False, "errors": []}
+    try:
+        asset = assets[name]
+        if parent and not asset.get("digest"):
+            raise ValueError("Parent index has no remote SHA-256 digest")
+        index, raw = read_json_asset(repository, asset)
+        capture_sha = index["collector_code_sha"]
+        if (index["repository"] != slug or index["release_tag"] != tag or
+                index.get("release_repository", repository) != repository or
+                not isinstance(capture_sha, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", capture_sha) or
+                (code_sha is not None and capture_sha != code_sha) or
+                any(index[key] != value for key, value in sources.items())):
+            raise ValueError("Index source identity mismatch")
+        row.update({"index_sha256": sha256(raw), "capture_status": index["status"],
+                    "capture_accepted": index["capture_accepted"], "manifests": index["manifests"]})
+        if parent:
+            row.update({"source_release_tag": tag, "source_release_repository": repository,
+                        "source_index_asset_id": asset["id"], "collector_code_sha": capture_sha})
+        if not isinstance(index["errors"], list) or not all(isinstance(error, str) for error in index["errors"]):
+            raise ValueError("Invalid index errors")
+        row["errors"] = list(index["errors"])
+        if not isinstance(index["archive"], dict):
+            raise ValueError("Invalid archive record")
+        parts = index["archive"]["parts"]
+        if not isinstance(parts, list) or not all(isinstance(part, dict) for part in parts):
+            raise ValueError("Invalid archive part list")
+        if len({part["name"] for part in parts}) != len(parts):
+            raise ValueError("Duplicate archive part names")
+        for part in parts:
+            remote = assets.get(part["name"])
+            if (part.get("uploaded") is not True or type(part.get("bytes")) is not int or
+                    part["bytes"] <= 0 or not isinstance(part.get("sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", part["sha256"])):
+                raise ValueError("Missing or wrong-sized archive part")
+            identity = part
+            if parent and transport_aliases and part["name"] in transport_aliases:
+                alias = transport_aliases[part["name"]]
+                expected = {key: part[key] for key in ("name", "sha256", "bytes")}
+                if not isinstance(alias, dict) or alias.get("plaintext") != expected:
+                    raise ValueError("Parent transport alias plaintext identity mismatch")
+                identity = alias.get("ciphertext")
+                if (not isinstance(identity, dict) or not isinstance(identity.get("name"), str) or
+                        type(identity.get("bytes")) is not int or identity["bytes"] <= 0 or
+                        not isinstance(identity.get("sha256"), str) or
+                        not re.fullmatch(r"[0-9a-f]{64}", identity["sha256"])):
+                    raise ValueError("Invalid parent ciphertext identity")
+                remote = assets.get(identity["name"])
+                row.setdefault("archive_transport_aliases", []).append(alias)
+            if remote is None:
+                raise ValueError("Missing archive transport asset")
+            if parent and not remote.get("digest"):
+                raise ValueError("Parent archive part has no remote SHA-256 digest")
+            verify_remote_asset(repository, remote, identity)
+        row["complete"] = bool(index_capture_accepted(index) and index["archive"].get("complete") is True and parts)
+        if index.get("complete") and not row["complete"]:
+            row["errors"].append("Index claims completion but acceptance evidence is inconsistent")
+    except (KeyError, ValueError, TypeError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        row["errors"].append(f"{type(error).__name__}: {error}")
+    return row
+
+
+def parent_capture_outcomes(config: Config, sources: dict, repository: str, tag: str) -> dict[str, dict]:
+    if not REPO_RE.fullmatch(repository) or not re.fullmatch(r"corpus-baseline-[0-9]+-[0-9]+", tag):
+        raise ValueError("Invalid parent release destination")
+    release = json.loads(gh("api", f"repos/{repository}/releases/tags/{tag}"))
+    target = release.get("target_commitish", "")
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target):
+        raise ValueError("Parent release must identify a full capture code SHA")
+    assets = {asset["name"]: asset for asset in release_assets(repository, release["id"])}
+    migration_asset = assets.get("encryption-migration-index.json")
+    aliases, migration_raw = {}, None
+    if migration_asset:
+        if not migration_asset.get("digest"):
+            raise ValueError("Parent encryption migration index has no remote SHA-256 digest")
+        migration, migration_raw = read_json_asset(repository, migration_asset)
+        if migration.get("schema_version") != 1 or not isinstance(migration.get("parts"), dict):
+            raise ValueError("Invalid parent encryption migration index")
+        aliases = migration["parts"]
+    outcomes = {slug: release_capture_outcome(slug, repository, tag, assets, sources, target, parent=True,
+                                             transport_aliases=aliases) for slug in config.repositories}
+    for row in outcomes.values():
+        if row.get("archive_transport_aliases"):
+            row.update({"transport_index_asset": migration_asset["name"],
+                        "transport_index_sha256": sha256(migration_raw)})
+    return outcomes
+
+
+def plan(args) -> int:
+    config, sources = load_sources(args.config, args.csv)
+    parent_tag = getattr(args, "parent_release_tag", None)
+    inherited = parent_capture_outcomes(config, sources, args.release_repository, parent_tag) if parent_tag else {}
+    remaining = [slug for slug in config.repositories if not inherited.get(slug, {}).get("complete")]
+    outputs = {"matrix": json.dumps({"include": [{"slug": slug, "key": repository_key(slug)} for slug in remaining]},
+                                    separators=(",", ":")),
+               "remaining_count": len(remaining), "inherited_complete_count": len(config.repositories) - len(remaining),
+               **sources}
+    if args.github_output:
+        with args.github_output.open("a") as output:
+            for key, value in outputs.items():
+                output.write(f"{key}={value}\n")
+    print(json.dumps(outputs, indent=2))
+    return 0
+
+
 def upload_asset(tag: str, path: Path, repository: str):
     try:
         # A retry following an uncertain upload must first check the existing
@@ -394,6 +522,8 @@ def write_json(path: Path, value: dict):
 
 def capture(args) -> int:
     config, sources = load_sources(args.config, args.csv)
+    public_key = Path(getattr(args, "public_key", RESULTS_PUBLIC_KEY))
+    recipient = public_key_fingerprint(public_key)  # fail before capture when no valid public key is configured
     if args.slug not in config.repositories:
         raise ValueError("Target is outside the declared cohort")
     key = repository_key(args.slug)
@@ -412,8 +542,9 @@ def capture(args) -> int:
         "collector_code_sha": args.code_sha, **sources,
         "github_run_id": os.getenv("GITHUB_RUN_ID"), "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT"),
         "started_at": utc_iso(), "scope": SCOPE,
-        "retention": "Private GitHub Release assets have no expiry configured by this workflow; deletion remains possible. No independent or indefinite-retention guarantee.",
+        "retention": "Encrypted Release assets have no automatic expiry configured; owner deletion remains possible. The RSA private key stays local.",
         "timestamp_status": "OTS submission requested; completed Bitcoin verification is not performed here.",
+        "results_encryption": {"format": "icsot-encrypted-v1", "recipient_spki_sha256": recipient},
         "errors": [],
     }
     write_json(reports / "capture-request.json", index)
@@ -452,6 +583,12 @@ def capture(args) -> int:
                 "complete": False, "git_mirror_included": include_mirror,
                 "parts": [file_identity(path) for path in sorted(assets.glob(f"{key}.tar.xz.part-*"))],
             }
+        try:
+            archive = encrypt_archive_parts(archive, assets, public_key)
+        except BaseException as error:
+            index["errors"].append(f"Encryption: {type(error).__name__}: {error}")
+            # Preserve diagnostics without ever falling back to uploading plaintext.
+            archive = {"complete": False, "encrypted": True, "parts": [], "recipient_spki_sha256": recipient}
         index["archive"] = archive
         for part in archive["parts"]:
             try:
@@ -482,6 +619,10 @@ def finalize(args) -> int:
         raise ValueError("Release target commit differs from expected capture code SHA")
     observed_assets = release_assets(args.release_repository, release["id"])
     assets = {asset["name"]: asset for asset in observed_assets}
+    parent_tag = getattr(args, "parent_release_tag", None)
+    if parent_tag == args.release_tag:
+        raise ValueError("Parent and current release must differ")
+    inherited = parent_capture_outcomes(config, sources, args.release_repository, parent_tag) if parent_tag else {}
     summary = {
         "schema_version": 1, "release_tag": args.release_tag, "collector_code_sha": args.code_sha,
         "finalizer_code_sha": getattr(args, "finalizer_code_sha", args.code_sha),
@@ -494,40 +635,12 @@ def finalize(args) -> int:
         "repositories": [], "timestamp_status": "Pending OTS receipts are not verified Bitcoin timestamps.",
         "retention": "No automatic expiry/deletion configured; GitHub owner/admin deletion remains possible. No independent backup is configured.",
     }
+    if parent_tag:
+        summary["parent_release_tag"] = parent_tag
     for slug in config.repositories:
-        name = repository_key(slug) + ".index.json"
-        row = {"repository": slug, "index_asset": name, "complete": False, "errors": []}
-        try:
-            asset = assets[name]
-            index, raw = read_json_asset(args.release_repository, asset)
-            if (index["repository"] != slug or index["release_tag"] != args.release_tag or
-                    index["collector_code_sha"] != args.code_sha or
-                    any(index[key] != value for key, value in sources.items())):
-                raise ValueError("Index source identity mismatch")
-            row.update({"index_sha256": sha256(raw), "capture_status": index["status"],
-                        "capture_accepted": index["capture_accepted"], "manifests": index["manifests"]})
-            if not isinstance(index["errors"], list) or not all(isinstance(error, str) for error in index["errors"]):
-                raise ValueError("Invalid index errors")
-            row["errors"] = list(index["errors"])
-            if not isinstance(index["archive"], dict):
-                raise ValueError("Invalid archive record")
-            parts = index["archive"]["parts"]
-            if not isinstance(parts, list) or not all(isinstance(part, dict) for part in parts):
-                raise ValueError("Invalid archive part list")
-            if len({part["name"] for part in parts}) != len(parts):
-                raise ValueError("Duplicate archive part names")
-            for part in parts:
-                remote = assets.get(part["name"])
-                if (part.get("uploaded") is not True or remote is None or type(part.get("bytes")) is not int or
-                        part["bytes"] <= 0 or not isinstance(part.get("sha256"), str) or
-                        not re.fullmatch(r"[0-9a-f]{64}", part["sha256"])):
-                    raise ValueError("Missing or wrong-sized archive part")
-                verify_remote_asset(args.release_repository, remote, part)
-            row["complete"] = bool(index_capture_accepted(index) and index["archive"].get("complete") is True and parts)
-            if index.get("complete") and not row["complete"]:
-                row["errors"].append("Index claims completion but acceptance evidence is inconsistent")
-        except (KeyError, ValueError, TypeError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-            row["errors"].append(f"{type(error).__name__}: {error}")
+        row = release_capture_outcome(slug, args.release_repository, args.release_tag, assets, sources, args.code_sha)
+        if not row["complete"] and inherited.get(slug, {}).get("complete"):
+            row = inherited[slug]
         summary["repositories"].append(row)
     summary["complete_repositories"] = sum(row["complete"] for row in summary["repositories"])
     summary["incomplete_repositories"] = len(config.repositories) - summary["complete_repositories"]
@@ -540,6 +653,8 @@ def finalize(args) -> int:
         recorded, recorded_raw = read_json_asset(args.release_repository, existing_inventory)
         stable_keys = ("schema_version", "release_tag", "collector_code_sha", *sources,
                        "repositories", "complete_repositories", "incomplete_repositories", "complete", "status")
+        if parent_tag:
+            stable_keys += ("parent_release_tag",)
         if any(recorded.get(key) != summary[key] for key in stable_keys):
             raise ValueError("Existing inventory differs from verified current capture outcomes; refusing overwrite")
         inventory.write_bytes(recorded_raw)
@@ -561,9 +676,11 @@ def finalize(args) -> int:
         "A missing index represents missing/failed transfer, not successful coverage.\n\n"
         f"Collector commit: `{args.code_sha}`. Config SHA-256: `{sources['config_source_sha256']}`. CSV SHA-256: `{sources['csv_sha256']}`.\n\n"
         f"Finalizer commit: `{getattr(args, 'finalizer_code_sha', args.code_sha)}`.\n\n"
+        + (f"Accepted captures referenced from parent release: `{parent_tag}`. Parent assets remain in that release; "
+           "each inherited inventory row records its source release, original collector commit, and index SHA-256.\n\n" if parent_tag else "") +
         f"{SCOPE}\n\n"
         "All matrix jobs have reached a terminal state. This release is published once after collection; no cron, later state restore, "
-        "automatic deletion or expiry is configured. Private Release storage remains deletable and is not an independent backup.\n"
+        "automatic deletion or expiry is configured. Payloads are encrypted; Release storage remains deletable and is not an independent backup.\n"
     )
     # All assets and the inventory are present before publication. This also
     # works where the repository makes published releases immutable.
@@ -615,6 +732,7 @@ def main(argv=None) -> int:
         child.add_argument("--csv", type=Path, required=True)
         if command == "plan":
             child.add_argument("--github-output", type=Path)
+            child.add_argument("--release-repository")
         else:
             child.add_argument("--release-tag", required=True)
             child.add_argument("--release-repository", required=True)
@@ -622,21 +740,18 @@ def main(argv=None) -> int:
             child.add_argument("--work-root", type=Path, required=True)
             if command == "capture":
                 child.add_argument("--slug", required=True)
+                child.add_argument("--public-key", type=Path, default=RESULTS_PUBLIC_KEY)
+        if command in ("plan", "finalize"):
+            child.add_argument("--parent-release-tag")
     args = parser.parse_args(argv)
     if args.command == "restore":
         verification = restore_mirrors(args.root)
         print(json.dumps(verification, indent=2))
         return 0 if verification["ok"] else 3
     if args.command == "plan":
-        config, sources = load_sources(args.config, args.csv)
-        outputs = {"matrix": json.dumps({"include": [{"slug": slug, "key": repository_key(slug)} for slug in config.repositories]}, separators=(",", ":")),
-                   **sources}
-        if args.github_output:
-            with args.github_output.open("a") as output:
-                for key, value in outputs.items():
-                    output.write(f"{key}={value}\n")
-        print(json.dumps(outputs, indent=2))
-        return 0
+        if args.parent_release_tag and not args.release_repository:
+            parser.error("--release-repository is required with --parent-release-tag")
+        return plan(args)
     if not REPO_RE.fullmatch(args.release_repository) or not re.fullmatch(r"corpus-baseline-[0-9]+-[0-9]+", args.release_tag):
         raise ValueError("Invalid release destination")
     actual_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()

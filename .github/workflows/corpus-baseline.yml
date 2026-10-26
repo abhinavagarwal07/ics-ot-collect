@@ -3,6 +3,11 @@ name: Corpus baseline (one time)
 # Manual only. This is an initial shallow observation, not recurring deployment.
 on:
   workflow_dispatch:
+    inputs:
+      parent_release_tag:
+        description: 'Optional prior baseline release; reuse only verified complete captures'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -24,6 +29,7 @@ jobs:
       contents: write
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      remaining_count: ${{ steps.plan.outputs.remaining_count }}
       release_tag: ${{ steps.release.outputs.release_tag }}
     steps:
       - name: Check out collector
@@ -36,20 +42,34 @@ jobs:
           python-version: '3.12'
       - name: Install collector
         run: python -m pip install --disable-pip-version-check -e .
+      - name: Require the configured RSA public recipient
+        run: |
+          python - <<'PY'
+          from icsot_observer.encryption import public_key_fingerprint
+          print("Encrypted evidence recipient:", public_key_fingerprint("keys/results-rsa-public.pem"))
+          PY
       - name: Validate complete cohort and plan independent captures
         id: plan
-        run: python scripts/capture_baseline.py plan --config config.corpus.toml --csv ../public_patch_corpus_185.csv --github-output "$GITHUB_OUTPUT"
-      - name: Create private draft transfer release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARENT_RELEASE_TAG: ${{ inputs.parent_release_tag }}
+        run: |
+          resume_args=()
+          if test -n "$PARENT_RELEASE_TAG"; then
+            resume_args+=(--parent-release-tag "$PARENT_RELEASE_TAG" --release-repository "$GITHUB_REPOSITORY")
+          fi
+          python scripts/capture_baseline.py plan --config config.corpus.toml --csv ../public_patch_corpus_185.csv --github-output "$GITHUB_OUTPUT" "${resume_args[@]}"
+      - name: Create draft transfer release
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
           CONFIG_SHA256: ${{ steps.plan.outputs.config_source_sha256 }}
           CSV_SHA256: ${{ steps.plan.outputs.csv_sha256 }}
+          PARENT_RELEASE_TAG: ${{ inputs.parent_release_tag }}
+          INHERITED_COMPLETE_COUNT: ${{ steps.plan.outputs.inherited_complete_count }}
+          REMAINING_COUNT: ${{ steps.plan.outputs.remaining_count }}
         run: |
           set -euo pipefail
-          test "$REPOSITORY_PRIVATE" = true
-          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" = true
           release_tag="corpus-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p analysis/baseline-plan
           cat > analysis/baseline-plan/release-notes.md <<EOF
@@ -59,16 +79,22 @@ jobs:
           Collector commit: $GITHUB_SHA
           Configuration SHA-256: $CONFIG_SHA256
           CSV SHA-256: $CSV_SHA256
+          Parent release: ${PARENT_RELEASE_TAG:-none}
+          Verified complete parent captures referenced: $INHERITED_COMPLETE_COUNT
+          Targets selected for this run: $REMAINING_COUNT
 
-          Each target attempts shallow full REST listings and advertised Git refs with a portable full bundle. Historical per-item backfill and Discussions are excluded. Pending OpenTimestamps receipts are not verified Bitcoin timestamps.
+          Accepted parent captures remain in the parent release and are referenced by the final inventory with their original collector commit and index hash. Incomplete parent outcomes are retried.
 
-          Per-repository indexes are uploaded after archive-part attempts, including partial/error outcomes. The final inventory identifies missing and incomplete targets before this draft is published once. No recurring schedule, later state restore, automatic deletion or expiry is configured. Private Release assets remain deletable and are not an independent backup or an indefinite-retention guarantee.
+          Each target attempts shallow full REST listings and advertised Git refs with a portable full bundle. Main payloads are encrypted using AES-256-GCM with RSA-OAEP-SHA256 key wrapping before upload. Only metadata and the public recipient key remain public. Historical per-item backfill and Discussions are excluded. Pending OpenTimestamps receipts are not verified Bitcoin timestamps.
+
+          Per-repository indexes are uploaded after encrypted archive-part attempts, including partial/error outcomes. The final inventory identifies missing and incomplete targets before this draft is published once. No recurring schedule, automatic deletion or expiry is configured. Release assets remain deletable; the RSA private key stays on the owner's machine.
           EOF
           gh release create "$release_tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "Corpus baseline ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}" --notes-file analysis/baseline-plan/release-notes.md
           printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
 
   capture:
     needs: plan
+    if: ${{ needs.plan.outputs.remaining_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
@@ -128,11 +154,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
           BASELINE_MATRIX_RESULT: ${{ needs.capture.result }}
+          PARENT_RELEASE_TAG: ${{ inputs.parent_release_tag }}
         run: |
+          resume_args=()
+          if test -n "$PARENT_RELEASE_TAG"; then
+            resume_args+=(--parent-release-tag "$PARENT_RELEASE_TAG")
+          fi
           python scripts/capture_baseline.py finalize \
             --config config.corpus.toml \
             --csv ../public_patch_corpus_185.csv \
             --release-tag "$RELEASE_TAG" \
             --release-repository "$GITHUB_REPOSITORY" \
             --code-sha "$GITHUB_SHA" \
-            --work-root analysis/corpus-baseline-finalize
+            --work-root analysis/corpus-baseline-finalize \
+            "${resume_args[@]}"

@@ -17,7 +17,7 @@ Create local, incremental, independently verifiable records of public GitHub obs
 - Target **1–6 hours between observations**, according to measured feasibility; report actual gaps.
 - **Hard cap: 50 GB (50,000,000,000 stored bytes) of new evidence per UTC calendar month.** Pause collection before exceeding it; resume next month or after an explicit policy amendment. No automatic limit increase or deletion. No baseline exemption is assumed.
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.
-- Initial capture uses private GitHub Release assets, split into XZ archive parts with hashed indexes. Recurring collection is not enabled; six hours on the always-on host is the recommended starting cadence after incremental archiving is implemented.
+- Run the collector in a **public GitHub repository** on standard hosted runners. Store main evidence as encrypted XZ archive parts in Releases; metadata and the RSA public key may remain public. Recurring collection is not enabled; six hours remains the recommended starting cadence after incremental archiving is implemented.
 - Respect Actions runtime/disk/API limits; preserve explicit partial or missing outcomes and repair only affected targets/scopes. Avoid overwriting prior evidence or repeating the entire cohort to repair one failure.
 
 ## Functional requirements
@@ -29,6 +29,7 @@ Create local, incremental, independently verifiable records of public GitHub obs
 5. Record expected observations, attempts, partial results, failures, rate limits, clock uncertainty, and scope/configuration changes to reconstruct gaps and collection bias.
 6. Regenerate measurements and the analysis index from preserved evidence without trusting the working database.
 7. Resume safely after interruption; respect primary/secondary limits and pagination/caps without silent truncation or false success.
+8. Encrypt every uploaded evidence payload with AES-256-GCM and RSA-OAEP-SHA256 key wrapping for this machine's RSA key. Keep the private key local. Preserve original and encrypted hashes; reject tampering, wrong keys and truncated files. Migrate and verify existing payloads before exposing the repository publicly.
 
 ## Design direction
 

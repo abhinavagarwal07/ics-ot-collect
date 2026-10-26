@@ -12,7 +12,7 @@ The selected cohort is all 185 repositories in [public_patch_corpus_185.csv](../
 
 See [the first live libfuse validation](docs/LIBFUSE_VALIDATION.md) for measured results, preserved failures, evidence digests and remaining implementation limits.
 
-The manual `Corpus baseline (one time)` Actions workflow captures the full selected cohort in separate jobs and preserves verified portable bundles, raw evidence and explicit partial outcomes in private Release assets. XZ archive parts are at most 1 GiB; per-repository indexes and the final inventory record integrity and coverage. This workflow has no recurring schedule. See [storage and launch decisions](docs/STORAGE.md) for the alternatives reviewed and the proposed six-hour deployment on a persistent host.
+The manual `Corpus baseline (one time)` Actions workflow captures the selected cohort in separate jobs and preserves portable bundles, raw evidence and partial outcomes in **encrypted Release assets**. XZ plaintext parts are at most 1 GiB before encryption; public indexes record integrity and coverage. An optional parent release reuses verified complete captures. The machine's RSA public key is tracked; its private key stays local. See [encryption and restoration](docs/ENCRYPTION.md). This workflow has no recurring schedule. See [storage and launch decisions](docs/STORAGE.md) for the alternatives reviewed and the proposed six-hour deployment on a persistent host.
 
 ## Quickstart
 
