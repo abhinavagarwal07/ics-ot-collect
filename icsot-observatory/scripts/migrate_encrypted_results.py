@@ -122,7 +122,8 @@ class GitHub:
     def download(self, endpoint: str, destination: Path) -> None:
         with destination.open("xb") as stream:
             os.chmod(destination, 0o600)
-            self._run(["api", endpoint, "-H", "Accept: application/octet-stream"], output=stream)
+            accept = "application/json" if "/actions/artifacts/" in endpoint else "application/octet-stream"
+            self._run(["api", endpoint, "-H", f"Accept: {accept}"], output=stream)
 
     def download_asset(self, asset: dict, destination: Path) -> None:
         self.download(f"repos/{self.repository}/releases/assets/{asset['id']}", destination)
