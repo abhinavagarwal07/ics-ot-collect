@@ -24,7 +24,7 @@ defaults:
 jobs:
   plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 75
     permissions:
       contents: write
     outputs:
