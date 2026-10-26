@@ -7,7 +7,9 @@ Incremental preservation of public repository observations, with independently v
 - [Design](icsot-observatory/docs/DESIGN.md)
 - [SQLite schema](icsot-observatory/docs/SCHEMA.md)
 
-The first target is [`libfuse/libfuse`](https://github.com/libfuse/libfuse), configured in [config.libfuse.toml](icsot-observatory/config.libfuse.toml).
+The selected cohort is all **185 repositories** in [public_patch_corpus_185.csv](public_patch_corpus_185.csv), configured in [config.corpus.toml](icsot-observatory/config.corpus.toml): 42 healthcare, 51 ICS/OT/IIoT and 92 cross-sector projects. CSV order and all selections are preserved, regardless of pilot or priority labels. The CSV retains repository roles, source links and measurement caveats.
+
+[`libfuse/libfuse`](https://github.com/libfuse/libfuse) remains the single-repository smoke target in [config.libfuse.toml](icsot-observatory/config.libfuse.toml).
 
 [The first live validation](icsot-observatory/docs/LIBFUSE_VALIDATION.md) passed in GitHub Actions, with a full capture, delta capture, two independently restored Git bundles, and byte-identical local CSV regeneration. Timestamp receipts remain pending verification.
 

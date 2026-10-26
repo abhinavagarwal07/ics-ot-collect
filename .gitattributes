@@ -1,0 +1,2 @@
+# Preserve the supplied corpus byte-for-byte, including its CRLF line endings.
+public_patch_corpus_185.csv -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

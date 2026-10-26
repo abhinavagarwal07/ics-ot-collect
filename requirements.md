@@ -12,8 +12,8 @@ Create local, incremental, independently verifiable records of public GitHub obs
 
 ## Operating targets
 
-- Approximately **100 repositories**. An always-on host is available; **GitHub Actions** is also being evaluated for periodic execution, with durable evidence/state stored separately.
-- First selected target: [`libfuse/libfuse`](https://github.com/libfuse/libfuse).
+- **185 repositories**, selected from all rows of [public_patch_corpus_185.csv](public_patch_corpus_185.csv) and configured in [config.corpus.toml](icsot-observatory/config.corpus.toml). Preserve repository roles and measurement caveats; observation at a mirror does not establish availability at its upstream origin.
+- An always-on host is available; **GitHub Actions** is also being evaluated for periodic execution, with durable evidence/state stored separately. `libfuse/libfuse` remains the validated single-repository smoke target.
 - Target **1–6 hours between observations**, according to measured feasibility; report actual gaps.
 - **Hard cap: 50 GB (50,000,000,000 stored bytes) of new evidence per UTC calendar month.** Pause collection before exceeding it; resume next month or after an explicit policy amendment. No automatic limit increase or deletion. No baseline exemption is assumed.
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.

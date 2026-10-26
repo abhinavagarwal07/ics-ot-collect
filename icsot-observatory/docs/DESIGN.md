@@ -4,7 +4,7 @@ Status: requirements/design work, 2026-10-25. The existing collector does **not*
 
 ## Confirmed targets
 
-Approximately 100 public repositories; an always-on host; 1–6 hour target observation gaps; a hard cap of 50 GB of new evidence each UTC calendar month; indefinite retention; native XZ compression/decompression by default for archive payloads. The primary Git question is the earliest observation of a commit anywhere within a particular watched repository, with observation-time branch/ref attribution. Include readily accessible issues, PRs, comments, reviews, GitHub Discussions and replies, and release metadata.
+185 public repositories selected in [public_patch_corpus_185.csv](../../public_patch_corpus_185.csv) and configured in [config.corpus.toml](../config.corpus.toml); an always-on host; 1–6 hour target observation gaps; a hard cap of 50 GB of new evidence each UTC calendar month; indefinite retention; native XZ compression/decompression by default for archive payloads. The primary Git question is the earliest observation of a commit anywhere within a particular watched repository, with observation-time branch/ref attribution. Include readily accessible issues, PRs, comments, reviews, GitHub Discussions and replies, and release metadata.
 
 Externally timestamped evidence from the documented collector is sufficient for v1, using RFC 3161 or OpenTimestamps. Independent collection is optional. Backup accounting, timestamp provider and acceptable attestation delay remain open. No baseline exemption from the hard cap is assumed. The earlier 30–50 repository/90-day study and downstream vulnerability analyses are not prerequisites for this collector.
 
@@ -112,7 +112,7 @@ Start with WAL and `synchronous=FULL` for acknowledged operational writes, subje
 
 REST, GraphQL and Git transfer budgets are separate. Standard authenticated REST access normally has 5,000 requests/hour per user; GraphQL normally has a separate 5,000-point/hour user budget. Authentication method and secondary restrictions matter. Persist cooldowns from response headers and error bodies, honor `Retry-After`/reset times and event polling intervals, and reserve capacity for normal collection before backfill. An extra token for the same user does not create a fresh personal REST budget. [REST limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api), [GraphQL limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api), [Retry guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
 
-At 100 repositories, the target implies roughly 400–2,400 Git observations per day; API requests and bytes depend on repository sizes and activity. Measure baseline size, daily unique archive growth, metadata row growth, queue latency and backup overhead before committing to a fleet-wide cadence. Warn as the allowance approaches exhaustion, then enforce the hard-cap pause. Do not silently delete retained evidence or conceal budget-induced gaps.
+At 185 repositories, the target implies roughly 740–4,440 Git observations per day; API requests and bytes depend on repository sizes and activity. Measure baseline size, daily unique archive growth, metadata row growth, queue latency and backup overhead before committing to a fleet-wide cadence. Warn as the allowance approaches exhaustion, then enforce the hard-cap pause. Do not silently delete retained evidence or conceal budget-induced gaps.
 
 ## Verification and implementation gates
 

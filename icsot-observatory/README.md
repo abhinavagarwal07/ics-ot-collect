@@ -4,9 +4,11 @@ Prospective, **public-only** GitHub observation with raw byte preservation, cont
 
 **This is a tested prototype + publication-grade protocol, NOT a ready-for-90-day unattended academic data collection deployment.** Read `docs/PROTOCOL.md`, `docs/METHODS.md`, `docs/BUILD_PLAN.md`, and `docs/PRODUCTION_GAPS.md` before using evidence in a publication. In particular: complete sharded backfill, queue-based retries, verified off-site storage, clock measurement, and event polling enforcement are NOT yet implemented.
 
-**Current design work (2026-10-25):** [requirements](../requirements.md), [collector design](docs/DESIGN.md), and the [SQLite schema guide](docs/SCHEMA.md) describe the updated approximately 100-repository scope, GitHub Discussions, SQLite metadata and proposed study Git history. [metadata.sql](schema/metadata.sql) is an executable draft for a fresh database. The existing CLI has not been upgraded to that design.
+**Current design work (2026-10-25):** [requirements](../requirements.md), [collector design](docs/DESIGN.md), and the [SQLite schema guide](docs/SCHEMA.md) describe the 185-repository scope, GitHub Discussions, SQLite metadata and proposed study Git history. [metadata.sql](schema/metadata.sql) is an executable draft for a fresh database. The existing CLI has not been upgraded to that design.
 
-The first selected target is `libfuse/libfuse`, configured in `config.libfuse.toml`. The workspace-root manual Actions workflow runs a shallow full capture, a delta capture, full-bundle restoration, byte verification and CSV/diff generation. It requests OpenTimestamps receipts but does not equate pending receipts with verified Bitcoin attestations. Artifact downloads are temporary transfer copies, not the indefinite archive.
+The selected cohort is all 185 repositories in [public_patch_corpus_185.csv](../public_patch_corpus_185.csv), configured in [config.corpus.toml](config.corpus.toml) in CSV order. Pilot and priority labels do not filter the selection. Repository roles and measurement caveats remain in the CSV; observations of mirrors establish availability at those mirrors. Cohort changes must update both the CSV and configuration.
+
+`libfuse/libfuse` remains the smoke target in `config.libfuse.toml`. The workspace-root manual Actions workflow runs a shallow full capture, a delta capture, full-bundle restoration, byte verification and CSV/diff generation. It requests OpenTimestamps receipts but does not equate pending receipts with verified Bitcoin attestations. Artifact downloads are temporary transfer copies, not the indefinite archive.
 
 See [the first live libfuse validation](docs/LIBFUSE_VALIDATION.md) for measured results, preserved failures, evidence digests and remaining implementation limits.
 
@@ -20,8 +22,9 @@ python3 -m venv .venv
 pip install -e .
 pip install pytest
 pip install opentimestamps-client
-cp config.example.toml config.toml
-# edit cohort/repositories + collector/root; do not add any token to config
+cp config.corpus.toml config.toml
+# review collector/root; all 185 selected repositories are included
+# config.toml is machine-local and ignored by Git; never add a token
 export GITHUB_TOKEN="<read-only-public-GitHub-token>"
 
 icsot-observe collect --config config.toml --mode full
