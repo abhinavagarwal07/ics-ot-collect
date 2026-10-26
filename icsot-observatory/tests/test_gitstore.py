@@ -116,6 +116,27 @@ def test_verification_detects_missing_reachable_blob_with_unchanged_ref_ids(loca
     assert any("Git object graph integrity failed" in error and "missing blob" in error for error in result["errors"])
 
 
+def test_fsck_failure_reports_pack_companions_and_git_build(local_capture):
+    root, _, _ = local_capture
+    info = collect_git(root, "test/repo", 17, "run1")
+    mirror = root / info["mirror_path_relative"]
+    run_git(["-C", str(mirror), "repack", "-ad"])
+    run_git(["-C", str(mirror), "prune-packed"])
+    pack = next((mirror / "objects" / "pack").glob("*.pack"))
+    index = pack.with_suffix(".idx")
+    index.unlink()
+    with pytest.raises(RuntimeError) as failure:
+        run_git(["-C", str(mirror), "fsck", "--full", "--no-reflogs"])
+    message = str(failure.value)
+    assert "Git fsck diagnostics:" in message
+    assert "Git build: git version " in message
+    assert f"{pack.name} bytes=" in message
+    assert "read=ok header12=5041434b" in message
+    assert f"{index.name} missing" in message
+    assert pack.with_suffix(".rev").name in message
+    assert "inode=" in message and "nlink=" in message
+
+
 def test_valid_bundle_without_declared_capture_refs_is_rejected(local_capture, tmp_path):
     root, _, _ = local_capture
     info = collect_git(root, "test/repo", 17, "run1")

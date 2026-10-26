@@ -13,6 +13,58 @@ from .core import ObjectStore, canonical_json, sha256, utc_iso, write_once
 ALLOWED_REF_PREFIXES = ("refs/heads/", "refs/tags/", "refs/pull/")
 
 
+def _fsck_failure_diagnostics(args: list[str], env: dict[str, str], detail: str) -> str:
+    """Bounded failure evidence; leave successful verification and its cost alone."""
+    if len(args) < 3 or args[0] != "-C" or args[2] != "fsck":
+        return ""
+    lines = ["Git fsck diagnostics:"]
+    try:
+        version = subprocess.run(["git", "version", "--build-options"], env=env,
+                                 capture_output=True, text=True, timeout=10)
+        lines.append("Git build: " + (version.stdout or version.stderr).strip()[:1500])
+    except (OSError, subprocess.TimeoutExpired) as error:
+        lines.append(f"Git build unavailable: {type(error).__name__}: {error}")
+    directory = Path(args[1]) / "objects" / "pack"
+    lines.append(f"Pack directory: {directory}")
+    try:
+        names = sorted(path.name for path in directory.iterdir())
+        # Include missing companions explicitly, and put the named failure first
+        # when a large repository has more packs than the diagnostic cap.
+        stems = list(dict.fromkeys(re.findall(r"pack-[0-9a-f]{40,64}(?=\.pack)", detail)))[:8]
+        for name in names:
+            if len(stems) >= 8:
+                break
+            if name.endswith(".pack") and name[:-5] not in stems:
+                stems.append(name[:-5])
+        ordered = [stem + suffix for stem in stems for suffix in (".pack", ".idx", ".rev")]
+        for name in names:
+            if len(ordered) >= 24:
+                break
+            if name not in ordered:
+                ordered.append(name)
+        lines.append(f"Pack entries: {len(names)}; showing at most 24 paths (including missing companions)")
+        for name in ordered[:24]:
+            path = directory / name
+            try:
+                metadata = path.stat()
+                try:
+                    with path.open("rb") as stream:
+                        header = stream.read(12).hex()
+                    access = f"read=ok header12={header}"
+                except OSError as error:
+                    access = f"read={type(error).__name__} errno={error.errno}"
+                lines.append(f"{name} bytes={metadata.st_size} mode={metadata.st_mode & 0o777:o} "
+                             f"inode={metadata.st_ino} nlink={metadata.st_nlink} "
+                             f"mtime_ns={metadata.st_mtime_ns} {access}")
+            except FileNotFoundError:
+                lines.append(f"{name} missing")
+            except OSError as error:
+                lines.append(f"{name} stat={type(error).__name__} errno={error.errno}")
+    except OSError as error:
+        lines.append(f"Pack listing unavailable: {type(error).__name__} errno={error.errno}")
+    return "\n".join(lines)
+
+
 def run_git(args: list[str], *, timeout: int = 1200, input_text: str | None = None) -> str:
     # No accidental access to nonpublic code via local Git credential helpers.
     env = os.environ.copy()
@@ -34,7 +86,9 @@ def run_git(args: list[str], *, timeout: int = 1200, input_text: str | None = No
         # fsck reports missing-object diagnostics on stdout even when stderr
         # contains a harmless HEAD notice; retain both channels on failure.
         detail = "\n".join(part.strip() for part in (p.stderr, p.stdout) if part.strip())
-        raise RuntimeError(f"Git command failed (exit {p.returncode}): {detail[-1200:]}")
+        diagnostics = _fsck_failure_diagnostics(args, env, detail)
+        raise RuntimeError(f"Git command failed (exit {p.returncode}): {detail[-1200:]}" +
+                           ("\n" + diagnostics if diagnostics else ""))
     return p.stdout
 
 
