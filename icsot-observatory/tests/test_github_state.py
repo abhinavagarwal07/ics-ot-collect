@@ -631,10 +631,12 @@ class FakeGhApiRunner:
             if not self.existing_release:
                 code, value = 404, {"message": "Not Found"}
             else:
-                value = {"id": 1, "assets": []}
+                value = {"id": 1, "tag_name": endpoint.rsplit("/", 1)[1], "draft": False, "assets": []}
+        elif "/releases?per_page=" in endpoint:
+            value = []
         elif endpoint.endswith("/releases") and method == "POST":
             self.existing_release = True
-            value = {"id": 1, "assets": []}
+            value = {"id": 1, "tag_name": json.loads(kwargs["input"])["tag_name"], "draft": False, "assets": []}
         elif endpoint.startswith("https://uploads.github.com/"):
             from urllib.parse import parse_qs, urlsplit
             name = parse_qs(urlsplit(endpoint).query)["name"][0]
@@ -671,7 +673,7 @@ def test_transport_upload_captures_asset_id_without_relisting_and_counts_request
         destination = tmp_path / name
         transport.download_asset("snapshot", name, destination)
         assert destination.read_bytes() == source.read_bytes()
-    assert transport.request_count == len(runner.calls) == 6
+    assert transport.request_count == len(runner.calls) == 7
     assert not any("/assets?per_page=" in endpoint for _, endpoint in runner.calls)
     assert sum("/releases/tags/" in endpoint for _, endpoint in runner.calls) == 1
 
@@ -849,3 +851,153 @@ def test_transport_runtime_clone_preserves_constraints_and_probe_metadata():
     assert original._last_repo_rate_headers["remaining"] == 600
     with pytest.raises(ValueError, match="cannot cross"):
         original.copy_runtime_state_to(GhCliStateTransport("other/repository"))
+
+
+def metadata_response(args, value, *, status=200, stderr=b""):
+    raw = f"HTTP/2.0 {status} Response\r\n\r\n".encode() + json.dumps(value).encode()
+    return subprocess.CompletedProcess(args, int(status >= 400), raw, stderr)
+
+
+def test_draft_release_tag_404_falls_back_to_exact_id_and_caches_without_create():
+    calls = []
+    draft = {"id": 424020503, "tag_name": "sealed-baseline", "draft": True,
+             "assets": [{"id": 1, "name": "inventory.json", "size": 10}]}
+    def runner(args, **kwargs):
+        endpoint = args[2]
+        calls.append((args[args.index("--method") + 1], endpoint))
+        if "/releases/tags/" in endpoint:
+            return metadata_response(args, {"message": "Not Found"}, status=404)
+        if "/releases?" in endpoint:
+            return metadata_response(args, [{"id": 5, "tag_name": "unrelated", "draft": False}, draft])
+        if endpoint.endswith("/releases/424020503"):
+            return metadata_response(args, draft)
+        raise AssertionError("Unexpected metadata endpoint")
+    transport = GhCliStateTransport("owner/collector", runner=runner)
+    assert transport._release("sealed-baseline") == draft
+    transport.ensure_release("sealed-baseline")
+    assert transport._release("sealed-baseline") == draft
+    assert transport._assets["sealed-baseline"]["inventory.json"]["id"] == 1
+    assert transport.request_count == 3
+    assert all(method == "GET" for method, _ in calls)
+    assert calls[-1] == ("GET", "repos/owner/collector/releases/424020503")
+
+
+def test_published_release_tag_fast_path_never_lists_drafts():
+    calls = []
+    release = {"id": 15, "tag_name": "published", "draft": False, "assets": []}
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        return metadata_response(args, release)
+    transport = GhCliStateTransport("owner/collector", runner=runner)
+    assert transport._release("published") == release
+    assert calls == ["repos/owner/collector/releases/tags/published"]
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_draft_lookup_does_not_mask_non_404_header_with_misleading_stderr(status):
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        return metadata_response(args, {"message": "denied"}, status=status,
+                                 stderr=b"untrusted diagnostic mentions HTTP 404")
+    transport = GhCliStateTransport("owner/collector", runner=runner, transient_retries=0)
+    with pytest.raises(StateError):
+        transport.ensure_release("sealed-baseline")
+    assert calls == ["repos/owner/collector/releases/tags/sealed-baseline"]
+
+
+def test_draft_lookup_rate_response_defers_without_listing_or_create():
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        raw = b'HTTP/2.0 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n{"message":"rate limit"}'
+        return subprocess.CompletedProcess(args, 1, raw, b"")
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    with pytest.raises(StateDeferredError) as failure:
+        transport.ensure_release("sealed-baseline")
+    assert failure.value.retry_not_before == 1060
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("malformation", ["ambiguous", "invalid_list", "wrong_id", "wrong_tag", "changed_draft"])
+def test_draft_lookup_rejects_ambiguity_or_malformed_identity_without_create(malformation):
+    calls = []
+    draft = {"id": 42, "tag_name": "sealed-baseline", "draft": True, "assets": []}
+    def runner(args, **kwargs):
+        endpoint = args[2]
+        calls.append((args[args.index("--method") + 1], endpoint))
+        if "/releases/tags/" in endpoint:
+            return metadata_response(args, {}, status=404)
+        if "/releases?" in endpoint:
+            if malformation == "invalid_list":
+                return metadata_response(args, {"id": 42})
+            values = [draft]
+            if malformation == "ambiguous":
+                values += [{**draft, "id": 43}]
+            return metadata_response(args, values)
+        if endpoint.endswith("/releases/42"):
+            result = dict(draft)
+            if malformation == "wrong_id":
+                result["id"] = 43
+            elif malformation == "wrong_tag":
+                result["tag_name"] = "another-baseline"
+            elif malformation == "changed_draft":
+                result["draft"] = False
+            return metadata_response(args, result)
+        raise AssertionError("Unexpected endpoint")
+    transport = GhCliStateTransport("owner/collector", runner=runner)
+    with pytest.raises(StateError):
+        transport.ensure_release("sealed-baseline")
+    assert all(method == "GET" for method, _ in calls)
+    assert "sealed-baseline" not in transport._releases
+
+
+def test_draft_lookup_bound_cannot_turn_unknown_absence_into_create(monkeypatch):
+    monkeypatch.setattr("icsot_observer.github_state.RELEASE_LOOKUP_MAX_PAGES", 2)
+    calls = []
+    def runner(args, **kwargs):
+        endpoint = args[2]
+        calls.append((args[args.index("--method") + 1], endpoint))
+        if "/releases/tags/" in endpoint:
+            return metadata_response(args, {}, status=404)
+        page = int(endpoint.rsplit("=", 1)[1])
+        return metadata_response(args, [{"id": page * 100 + n, "tag_name": f"unrelated-{page}-{n}", "draft": False}
+                                        for n in range(100)])
+    transport = GhCliStateTransport("owner/collector", runner=runner)
+    with pytest.raises(StateError, match="lookup bound reached"):
+        transport.ensure_release("sealed-baseline")
+    assert len(calls) == 3
+    assert all(method == "GET" for method, _ in calls)
+
+
+def test_draft_lookup_paginates_before_exact_id_recheck():
+    calls = []
+    draft = {"id": 424020503, "tag_name": "sealed-baseline", "draft": True, "assets": []}
+    def runner(args, **kwargs):
+        endpoint = args[2]
+        calls.append(endpoint)
+        if "/releases/tags/" in endpoint:
+            return metadata_response(args, {}, status=404)
+        if endpoint.endswith("page=1"):
+            return metadata_response(args, [{"id": n + 1, "tag_name": f"old-{n}", "draft": False} for n in range(100)])
+        if endpoint.endswith("page=2"):
+            return metadata_response(args, [draft])
+        if endpoint.endswith("/releases/424020503"):
+            return metadata_response(args, draft)
+        raise AssertionError("Unexpected endpoint")
+    transport = GhCliStateTransport("owner/collector", runner=runner)
+    assert transport._release("sealed-baseline")["id"] == 424020503
+    assert len(calls) == 4
+    assert calls[-1].endswith("/releases/424020503")
+
+
+@pytest.mark.parametrize("body", [b"null", b"", b"{malformed"])
+def test_draft_lookup_malformed_success_is_not_interpreted_as_404(body):
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        return subprocess.CompletedProcess(args, 0, b"HTTP/2.0 200 OK\r\n\r\n" + body, b"")
+    transport = GhCliStateTransport("owner/collector", runner=runner)
+    with pytest.raises(StateError):
+        transport.ensure_release("sealed-baseline")
+    assert calls == ["repos/owner/collector/releases/tags/sealed-baseline"]

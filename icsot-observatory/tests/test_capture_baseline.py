@@ -984,7 +984,7 @@ def test_scope_failure_preserves_later_api_bytes_and_verified_git_but_baseline_s
 
 def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and_idempotent(tmp_path, monkeypatch, ots_dependency):
     from icsot_observer.attestations import inspect_ots_receipt
-    from icsot_observer.proof_maintenance import empty_state
+    from icsot_observer.proof_maintenance import ProofTransport, empty_state
     _, _, config, identities = sources(tmp_path, ("example/one",))
     args = args_for(tmp_path, tmp_path / "config.toml", tmp_path / "cohort.csv")
     monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config, identities))
@@ -1012,6 +1012,30 @@ def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and
             return contents[next(asset["name"] for asset in assets if asset["id"] == identifier)]
         return canonical_json(release)
 
+    transport_calls = []
+
+    def read_only_runner(arguments, **kwargs):
+        endpoint = arguments[2]
+        method = arguments[arguments.index("--method") + 1]
+        transport_calls.append((method, endpoint))
+        assert method == "GET", "Draft lookup/registration reads must not recreate the Release"
+        value = {**release, "tag_name": args.release_tag, "assets": list(assets)}
+        if "/releases/tags/" in endpoint and release["draft"]:
+            return subprocess.CompletedProcess(arguments, 1, b'HTTP/2.0 404 Not Found\r\n\r\n{"message":"Not Found"}', b"")
+        if "/releases?" in endpoint:
+            value = [value]
+        elif "/releases/assets/" in endpoint:
+            identifier = int(endpoint.rsplit("/", 1)[1])
+            raw = contents[next(asset["name"] for asset in assets if asset["id"] == identifier)]
+            assert kwargs["stdout"] != subprocess.PIPE
+            kwargs["stdout"].write(raw)
+            return subprocess.CompletedProcess(arguments, 0, b"", b"")
+        else:
+            assert endpoint.endswith("/releases/101") or "/releases/tags/" in endpoint
+        return subprocess.CompletedProcess(arguments, 0, b"HTTP/2.0 200 OK\r\n\r\n" + canonical_json(value), b"")
+
+    public_reads = ProofTransport(args.release_repository, runner=read_only_runner)
+
     class Registry:
         def __init__(self):
             self.head, self.state, self.records, self.saves = None, empty_state(), {}, 0
@@ -1024,7 +1048,10 @@ def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and
             return self.records.get(path)
 
         def fetch(self, ref):
-            raw = contents[ref["name"]]
+            # Exercise the production draft lookup + asset-ID read, not a
+            # direct dictionary shortcut that would miss a tag-only 404 bug.
+            assert release["draft"] is True
+            raw = public_reads.fetch(ref)
             assert ref["release_tag"] == args.release_tag
             assert hashlib.sha256(raw).hexdigest() == ref["sha256"] and len(raw) == ref["bytes"]
             return raw
@@ -1065,6 +1092,10 @@ def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and
     assert baseline.finalize(args) == 0
     assert len(uploads) == upload_count
     assert events[-2:] == ["register", "publish"]
+    assert any("/releases/tags/" in endpoint for _, endpoint in transport_calls)
+    assert any("/releases?" in endpoint for _, endpoint in transport_calls)
+    assert ("GET", "repos/owner/private/releases/101") in transport_calls
+    assert all(method == "GET" for method, _ in transport_calls)
     marker = json.loads(contents["metadata-catalog.json"])
     assert marker["observations"][0]["manifest_sha256"] == index["manifest_sha256"]
     assert marker["observations"][0]["index"]["sha256"] == hashlib.sha256(contents[index_name]).hexdigest()

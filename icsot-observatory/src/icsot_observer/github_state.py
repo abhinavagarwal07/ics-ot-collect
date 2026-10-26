@@ -41,6 +41,7 @@ from .runtime import ControllerLock
 SCHEMA_VERSION = 1
 BRANCH = "collector-state"
 MAX_PART_BYTES = 1024 ** 3
+RELEASE_LOOKUP_MAX_PAGES = 10
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _ASSET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\Z")
@@ -285,7 +286,7 @@ class GhCliStateTransport:
             if not result.returncode:
                 return body if capture_headers else result.stdout
             error = result.stderr.decode("utf-8", "replace") if result.stderr else ""
-            if missing_ok and (status == 404 or "HTTP 404" in error):
+            if missing_ok and (status == 404 or status is None and "HTTP 404" in error):
                 return None
             combined = (body.decode("utf-8", "replace") if capture_headers else "") + error
             retry = None
@@ -324,7 +325,15 @@ class GhCliStateTransport:
             args += ["--input", "-"]
             data = canonical_json(payload)
         raw = self._run(args, data=data, missing_ok=missing_ok)
-        return json.loads(raw) if raw else None
+        if raw is None:
+            return None  # Only _run's explicit missing_ok 404 path.
+        try:
+            value = json.loads(raw) if raw else None
+        except (ValueError, UnicodeError) as exc:
+            raise StateError("Invalid GitHub API JSON response") from exc
+        if missing_ok and value is None:
+            raise StateError("Empty GitHub API response cannot establish a missing resource")
+        return value
 
     def publication_budget(self, required_requests: int) -> dict:
         """Measure repository headers and generic core without widening headroom."""
@@ -432,19 +441,67 @@ class GhCliStateTransport:
             # The caller rereads the branch after conflicts/uncertain responses.
             return False
 
+    @staticmethod
+    def _validate_release(release: Any, tag: str, *, expected_id: int | None = None) -> dict:
+        if (not isinstance(release, dict) or type(release.get("id")) is not int or release["id"] < 1 or
+                release.get("tag_name") != tag or type(release.get("draft")) is not bool or
+                expected_id is not None and release["id"] != expected_id or
+                not isinstance(release.get("assets", []), list)):
+            raise StateError("Invalid or mismatched GitHub release identity")
+        assets = release.get("assets", [])
+        if any(not isinstance(asset, dict) or not isinstance(asset.get("name"), str) for asset in assets):
+            raise StateError("Invalid GitHub release asset metadata")
+        if len({asset["name"] for asset in assets}) != len(assets):
+            raise StateError("Duplicate GitHub release asset metadata")
+        return release
+
+    def _find_release_after_tag_404(self, tag: str) -> dict | None:
+        # GitHub's tag route can omit authorized drafts. Search only metadata,
+        # and require a complete bounded listing before treating a tag as absent.
+        # Never interpret an authorization/rate failure as permission to create.
+        candidate = None
+        seen_ids = set()
+        for page in range(1, RELEASE_LOOKUP_MAX_PAGES + 1):
+            listed = self._api(f"repos/{self.repository}/releases?per_page=100&page={page}")
+            if not isinstance(listed, list) or len(listed) > 100:
+                raise StateError("Invalid GitHub draft-release listing")
+            for release in listed:
+                if (not isinstance(release, dict) or type(release.get("id")) is not int or
+                        release["id"] < 1 or not isinstance(release.get("tag_name"), str) or
+                        not release["tag_name"] or type(release.get("draft")) is not bool or
+                        release["id"] in seen_ids):
+                    raise StateError("Malformed or duplicate GitHub release listing identity")
+                seen_ids.add(release["id"])
+                if release["tag_name"] == tag:
+                    if candidate is not None:
+                        raise StateError("Ambiguous GitHub release tag")
+                    candidate = release
+            if len(listed) < 100:
+                if candidate is None:
+                    return None
+                release = self._api(f"repos/{self.repository}/releases/{candidate['id']}")
+                self._validate_release(release, tag, expected_id=candidate["id"])
+                if release["draft"] != candidate["draft"]:
+                    raise StateError("GitHub release draft status changed during lookup")
+                return release
+        raise StateError("GitHub draft-release lookup bound reached; refusing ambiguous absence")
+
     def _release(self, tag: str, *, create: bool = False) -> dict:
         if not _ASSET.fullmatch(tag):
             raise StateError("Invalid state release tag")
         if tag in self._releases:
             return self._releases[tag]
-        release = self._api(f"repos/{self.repository}/releases/tags/{tag}", missing_ok=create)
+        release = self._api(f"repos/{self.repository}/releases/tags/{tag}", missing_ok=True)
+        if release is None:
+            release = self._find_release_after_tag_404(tag)
         new = release is None
         if new:
+            if not create:
+                raise StateError("GitHub release tag was not found")
             release = self._api(f"repos/{self.repository}/releases", method="POST", payload={
                 "tag_name": tag, "prerelease": True, "name": tag,
                 "body": "Encrypted collector working state; retain prerequisites."})
-        if not isinstance(release, dict) or type(release.get("id")) is not int:
-            raise StateError("Invalid GitHub release metadata")
+        self._validate_release(release, tag)
         self._releases[tag] = release
         self._assets[tag] = {asset["name"]: asset for asset in release.get("assets", [])}
         if new:
@@ -999,7 +1056,7 @@ class GitHubStateStore:
         old_release_reads = 12 * len({part["release_tag"] for part in unverified}) + len(unverified)
         # Upload+verification per payload/index, release lookup+creation, and
         # generous fixed Git blob/tree/commit/CAS plus one-conflict headroom.
-        return 2 * (parts + 1) + 2 * releases + 18 + old_release_reads
+        return 2 * (parts + 1) + (RELEASE_LOOKUP_MAX_PAGES + 2) * releases + 18 + old_release_reads
 
     def publish(self, selection: StateSelection, *, dependencies: list[dict] | tuple = (),
                 code_hashes: dict | None = None, config_hashes: dict | None = None,
