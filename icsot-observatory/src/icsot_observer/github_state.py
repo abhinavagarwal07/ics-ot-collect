@@ -41,7 +41,6 @@ from .runtime import ControllerLock
 SCHEMA_VERSION = 1
 BRANCH = "collector-state"
 MAX_PART_BYTES = 1024 ** 3
-RELEASE_LOOKUP_MAX_PAGES = 10
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _ASSET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\Z")
@@ -161,8 +160,14 @@ class GhCliStateTransport:
         self.rate_reset: float | None = None
         self.retry_not_before: float | None = None
         self._rate_windows: dict[tuple, int] = {}
+        self.graphql_request_count = 0
+        self.graphql_rate_remaining: int | None = None
+        self.graphql_rate_reset: float | None = None
+        self._graphql_rate_windows: dict[tuple, int] = {}
+        self._last_graphql_rate_headers: dict[str, Any] = {}
         self._last_repo_rate_headers: dict[str, Any] = {}
         self._last_response_rate_headers: dict[str, Any] = {}
+        self._last_response_retry_not_before: float | None = None
         self.last_budget_metrics: dict[str, Any] = {}
         self._releases: dict[str, dict] = {}
         self._assets: dict[str, dict[str, dict]] = {}
@@ -175,6 +180,8 @@ class GhCliStateTransport:
             raise ValueError("Destination transport state cannot cross repositories")
         for name in ("request_count", "rate_remaining", "rate_reset", "retry_not_before",
                      "_rate_windows", "_last_repo_rate_headers", "_last_response_rate_headers",
+                     "graphql_request_count", "graphql_rate_remaining", "graphql_rate_reset",
+                     "_graphql_rate_windows", "_last_graphql_rate_headers", "_last_response_retry_not_before",
                      "last_budget_metrics"):
             setattr(other, name, copy.deepcopy(getattr(self, name)))
         # These caches name immutable Git objects and uploaded asset identities;
@@ -219,6 +226,38 @@ class GhCliStateTransport:
         self._rate_windows[key] = min(previous, measured["remaining"]) if previous is not None else measured["remaining"]
         self._refresh_rate_windows()
 
+    def _refresh_graphql_windows(self) -> None:
+        for key in list(self._graphql_rate_windows):
+            if key[0] <= self.clock():
+                del self._graphql_rate_windows[key]
+        if self._graphql_rate_windows:
+            key, remaining = min(self._graphql_rate_windows.items(), key=lambda item: (item[1], -item[0][0]))
+            self.graphql_rate_remaining, self.graphql_rate_reset = remaining, key[0]
+        else:
+            self.graphql_rate_remaining, self.graphql_rate_reset = None, None
+
+    def _observe_graphql_rate(self, measured: dict[str, Any]) -> None:
+        if (type(measured.get("remaining")) is not int or measured["remaining"] < 0 or
+                not isinstance(measured.get("reset"), (int, float)) or measured["reset"] <= self.clock()):
+            return
+        key = (float(measured["reset"]), measured.get("limit"))
+        previous = self._graphql_rate_windows.get(key)
+        self._graphql_rate_windows[key] = min(previous, measured["remaining"]) if previous is not None else measured["remaining"]
+        self._last_graphql_rate_headers = dict(measured)
+        self._refresh_graphql_windows()
+
+    def _retry_after(self, value: str | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            return self.clock() + max(0, float(value))
+        except ValueError:
+            from email.utils import parsedate_to_datetime
+            try:
+                return parsedate_to_datetime(value).timestamp()
+            except (ValueError, TypeError, OverflowError):
+                return None
+
     def _destination_endpoint(self, endpoint: str) -> bool:
         path = f"repos/{self.repository}"
         return endpoint == path or endpoint.startswith(path + "/") or endpoint.startswith(
@@ -252,34 +291,52 @@ class GhCliStateTransport:
         error = StateDeferredError("GitHub state publication deferred: " + reason,
                                    retry_not_before=retry, reason=reason, request_count=self.request_count)
         error.rate_measurements = dict(self.last_budget_metrics)
+        if self._last_graphql_rate_headers:
+            error.rate_measurements["destination_github_graphql_rate_probe"] = dict(self._last_graphql_rate_headers)
         return error
 
-    def _guard_rate(self) -> None:
+    def _guard_rate(self, *, graphql: bool = False) -> None:
         self._refresh_rate_windows()
+        self._refresh_graphql_windows()
         now = self.clock()
         if self.retry_not_before is not None and now < self.retry_not_before:
             raise self._defer("destination Retry-After has not elapsed", self.retry_not_before)
-        if (self.rate_remaining is not None and self.rate_remaining <= self.rate_reserve and
+        if graphql and self.graphql_rate_remaining is not None and self.graphql_rate_remaining <= 0:
+            raise self._defer("destination GraphQL quota exhausted", self.graphql_rate_reset)
+        if (not graphql and self.rate_remaining is not None and self.rate_remaining <= self.rate_reserve and
                 (self.rate_reset is None or now < self.rate_reset)):
             raise self._defer("destination primary API reserve reached", self.rate_reset)
 
     def _run(self, args: list[str], *, data: bytes | None = None,
              stdout: Any = subprocess.PIPE, missing_ok: bool = False) -> Any:
         is_get = "--method" not in args or args[args.index("--method") + 1] == "GET"
+        graphql = args[1] == "graphql"
         capture_headers = stdout == subprocess.PIPE
         command = ["gh", *args, *(["--include"] if capture_headers else [])]
         for attempt in range(self.transient_retries + 1):
-            self._guard_rate()
+            self._guard_rate(graphql=graphql)
             self.request_count += 1
-            for key in self._rate_windows:
-                self._rate_windows[key] = max(0, self._rate_windows[key] - 1)
-            self._refresh_rate_windows()
+            if graphql:
+                self.graphql_request_count += 1
+                # This fixed scalar lookup has cost one; response headers/body
+                # provide the authoritative remaining GraphQL points.
+                for key in self._graphql_rate_windows:
+                    self._graphql_rate_windows[key] = max(0, self._graphql_rate_windows[key] - 1)
+                self._refresh_graphql_windows()
+            else:
+                for key in self._rate_windows:
+                    self._rate_windows[key] = max(0, self._rate_windows[key] - 1)
+                self._refresh_rate_windows()
             result = self.runner(command, input=data, stdout=stdout, stderr=subprocess.PIPE, check=False)
             raw = result.stdout or b""
             headers, body, status = self._response(raw) if capture_headers else ({}, raw, None)
             observed = self._rate_headers(headers)
             self._last_response_rate_headers = observed
-            if self._destination_endpoint(args[1]):
+            retry = self._retry_after(headers.get("retry-after"))
+            self._last_response_retry_not_before = retry
+            if graphql:
+                self._observe_graphql_rate(observed)
+            elif self._destination_endpoint(args[1]):
                 if "remaining" in observed and "reset" in observed:
                     self._last_repo_rate_headers = dict(observed)
                 self._observe_rate(observed, scope="repository")
@@ -289,23 +346,17 @@ class GhCliStateTransport:
             if missing_ok and (status == 404 or status is None and "HTTP 404" in error):
                 return None
             combined = (body.decode("utf-8", "replace") if capture_headers else "") + error
-            retry = None
-            if "retry-after" in headers:
-                try:
-                    retry = self.clock() + max(0, float(headers["retry-after"]))
-                except ValueError:
-                    from email.utils import parsedate_to_datetime
-                    try:
-                        retry = parsedate_to_datetime(headers["retry-after"]).timestamp()
-                    except (ValueError, TypeError, OverflowError):
-                        pass
             rate_failure = (status == 429 or "HTTP 429" in error or
                             "rate limit" in combined.lower() or "secondary rate" in combined.lower() or
                             status == 403 and observed.get("remaining") == 0 or retry is not None)
             if rate_failure:
                 if retry is None and observed.get("remaining") == 0:
-                    retry = observed.get("reset", self.rate_reset)
-                self.retry_not_before = retry
+                    retry = observed.get("reset", self.graphql_rate_reset if graphql else self.rate_reset)
+                secondary = "secondary" in combined.lower() or "abuse" in combined.lower()
+                if retry is None:
+                    retry, secondary = self.clock() + 60, True
+                if self._last_response_retry_not_before is not None or secondary:
+                    self.retry_not_before = retry
                 raise self._defer("destination API rate limit", retry)
             transient = (status in (502, 503, 504) or any(text in error.lower() for text in
                          ("connection reset", "connection timed out", "unexpected eof")))
@@ -455,36 +506,72 @@ class GhCliStateTransport:
             raise StateError("Duplicate GitHub release asset metadata")
         return release
 
+    def _record_graphql_quota(self, quota: Any) -> None:
+        if (not isinstance(quota, dict) or type(quota.get("remaining")) is not int or quota["remaining"] < 0 or
+                type(quota.get("limit")) is not int or quota["limit"] < 1 or quota["remaining"] > quota["limit"] or
+                type(quota.get("cost")) is not int or quota["cost"] < 0 or
+                not isinstance(quota.get("resetAt"), str) or not quota["resetAt"].endswith("Z")):
+            raise StateError("Malformed GitHub GraphQL quota response")
+        try:
+            reset = datetime.fromisoformat(quota["resetAt"].replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            raise StateError("Malformed GitHub GraphQL quota reset") from None
+        self._observe_graphql_rate({"remaining": quota["remaining"], "reset": reset, "cost": quota["cost"],
+                                    "limit": quota["limit"], "resource": "graphql"})
+
     def _find_release_after_tag_404(self, tag: str) -> dict | None:
-        # GitHub's tag route can omit authorized drafts. Search only metadata,
-        # and require a complete bounded listing before treating a tag as absent.
-        # Never interpret an authorization/rate failure as permission to create.
-        candidate = None
-        seen_ids = set()
-        for page in range(1, RELEASE_LOOKUP_MAX_PAGES + 1):
-            listed = self._api(f"repos/{self.repository}/releases?per_page=100&page={page}")
-            if not isinstance(listed, list) or len(listed) > 100:
-                raise StateError("Invalid GitHub draft-release listing")
-            for release in listed:
-                if (not isinstance(release, dict) or type(release.get("id")) is not int or
-                        release["id"] < 1 or not isinstance(release.get("tag_name"), str) or
-                        not release["tag_name"] or type(release.get("draft")) is not bool or
-                        release["id"] in seen_ids):
-                    raise StateError("Malformed or duplicate GitHub release listing identity")
-                seen_ids.add(release["id"])
-                if release["tag_name"] == tag:
-                    if candidate is not None:
-                        raise StateError("Ambiguous GitHub release tag")
-                    candidate = release
-            if len(listed) < 100:
-                if candidate is None:
-                    return None
-                release = self._api(f"repos/{self.repository}/releases/{candidate['id']}")
-                self._validate_release(release, tag, expected_id=candidate["id"])
-                if release["draft"] != candidate["draft"]:
-                    raise StateError("GitHub release draft status changed during lookup")
-                return release
-        raise StateError("GitHub draft-release lookup bound reached; refusing ambiguous absence")
+        # Exact GraphQL lookup includes authorized drafts, unlike REST's tag
+        # route. GitHub CLI uses this same lookup followed by REST's numeric ID.
+        owner, name = self.repository.split("/", 1)
+        query = ("query CollectorReleaseByTag($owner:String!,$name:String!,$tag:String!){"
+                 "repository(owner:$owner,name:$name){nameWithOwner release(tagName:$tag){databaseId tagName isDraft}}"
+                 " rateLimit{cost remaining resetAt limit}}")
+        result = self._api("graphql", method="POST", payload={
+            "query": query, "variables": {"owner": owner, "name": name, "tag": tag}})
+        if not isinstance(result, dict):
+            raise StateError("Malformed GitHub GraphQL release response")
+        data = result.get("data")
+        if isinstance(data, dict) and "rateLimit" in data:
+            self._record_graphql_quota(data["rateLimit"])
+        errors = result.get("errors", [])
+        if not isinstance(errors, list):
+            raise StateError("Malformed GitHub GraphQL errors")
+        if errors:
+            if any(not isinstance(error, dict) for error in errors):
+                raise StateError("Malformed GitHub GraphQL errors")
+            rate_limited = any(error.get("type") in ("RATE_LIMITED", "RATE_LIMIT") or
+                               "rate limit" in str(error.get("message", "")).lower() or
+                               "abuse" in str(error.get("message", "")).lower() for error in errors)
+            if rate_limited:
+                secondary = any("secondary" in str(error.get("message", "")).lower() or
+                                "abuse" in str(error.get("message", "")).lower() for error in errors)
+                retry = self._last_response_retry_not_before
+                if retry is None and self.graphql_rate_remaining == 0:
+                    retry = self.graphql_rate_reset
+                if retry is None:
+                    retry, secondary = self.clock() + 60, True
+                if self._last_response_retry_not_before is not None or secondary:
+                    self.retry_not_before = retry
+                raise self._defer("destination GraphQL API rate limit", retry)
+            raise StateError("GitHub GraphQL release lookup returned errors")
+        repository = data.get("repository") if isinstance(data, dict) else None
+        if (not isinstance(repository, dict) or not isinstance(repository.get("nameWithOwner"), str) or
+                repository["nameWithOwner"].lower() != self.repository.lower() or "release" not in repository):
+            raise StateError("GraphQL release lookup did not bind the destination repository")
+        if "rateLimit" not in data:
+            raise StateError("Missing GitHub GraphQL quota response")
+        candidate = repository["release"]
+        if candidate is None:
+            return None  # A valid error-free exact lookup, never a transport/auth failure.
+        if (not isinstance(candidate, dict) or type(candidate.get("databaseId")) is not int or
+                candidate["databaseId"] < 1 or candidate.get("tagName") != tag or
+                type(candidate.get("isDraft")) is not bool):
+            raise StateError("Malformed or mismatched GraphQL release identity")
+        release = self._api(f"repos/{self.repository}/releases/{candidate['databaseId']}")
+        self._validate_release(release, tag, expected_id=candidate["databaseId"])
+        if release["draft"] != candidate["isDraft"]:
+            raise StateError("GitHub release draft status changed during lookup")
+        return release
 
     def _release(self, tag: str, *, create: bool = False) -> dict:
         if not _ASSET.fullmatch(tag):
@@ -1053,16 +1140,21 @@ class GitHubStateStore:
         releases = max(1, (parts + self.max_assets_per_release - 2) // (self.max_assets_per_release - 1))
         unverified = [part for part in prior["parts"].values()
                       if _asset_identity(part) not in self._verified_parts]
-        old_release_reads = 12 * len({part["release_tag"] for part in unverified}) + len(unverified)
+        # A cold authorized draft can need REST tag 404 + numeric ID recheck
+        # + up to eleven asset-list pages; GraphQL lookup has its own bucket.
+        old_release_reads = 13 * len({part["release_tag"] for part in unverified}) + len(unverified)
         # Upload+verification per payload/index, release lookup+creation, and
         # generous fixed Git blob/tree/commit/CAS plus one-conflict headroom.
-        return 2 * (parts + 1) + (RELEASE_LOOKUP_MAX_PAGES + 2) * releases + 18 + old_release_reads
+        # Exact draft checks use the separate GraphQL bucket; each new
+        # Release still needs only REST tag lookup + create in this estimate.
+        return 2 * (parts + 1) + 2 * releases + 18 + old_release_reads
 
     def publish(self, selection: StateSelection, *, dependencies: list[dict] | tuple = (),
                 code_hashes: dict | None = None, config_hashes: dict | None = None,
                 lane_heads: dict | None = None, evidence_heads: dict | None = None,
                 quiescent: bool = False) -> dict:
         request_start = getattr(self.transport, "request_count", 0)
+        graphql_start = getattr(self.transport, "graphql_request_count", 0)
         if not quiescent:
             raise StateError("Snapshot publication requires joined capture/finalizer callbacks")
         if selection.pointer is not None:
@@ -1214,8 +1306,16 @@ class GitHubStateStore:
         state_release_count = len(metrics.pop("_releases"))
         metrics.pop("_asset_count")
         request_total = getattr(self.transport, "request_count", 0)
+        graphql_total = getattr(self.transport, "graphql_request_count", 0)
         return {**metrics, "state_release_count": state_release_count,
                 "destination_github_api_requests_total": request_total,
+                "destination_github_graphql_api_requests_total": graphql_total,
+                "destination_github_graphql_api_requests_for_publish": graphql_total - graphql_start,
+                "destination_github_rest_api_requests_total": request_total - graphql_total,
+                "destination_github_rest_api_requests_for_publish": request_total - request_start - (graphql_total - graphql_start),
+                "destination_github_graphql_rate_probe": dict(getattr(self.transport, "_last_graphql_rate_headers", {})),
+                "destination_github_graphql_rate_remaining": getattr(self.transport, "graphql_rate_remaining", None),
+                "destination_github_graphql_rate_reset": getattr(self.transport, "graphql_rate_reset", None),
                 "destination_github_api_requests_for_publish": request_total - request_start,
                 "state_encoding": "per-part XZ by default; already compressed Git data stays raw",
                 "generation": generation, "pointer_commit": commit,

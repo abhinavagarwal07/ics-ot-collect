@@ -1018,12 +1018,17 @@ def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and
         endpoint = arguments[2]
         method = arguments[arguments.index("--method") + 1]
         transport_calls.append((method, endpoint))
-        assert method == "GET", "Draft lookup/registration reads must not recreate the Release"
+        assert method == "GET" or (method == "POST" and endpoint == "graphql"), "Read paths must not recreate the Release"
         value = {**release, "tag_name": args.release_tag, "assets": list(assets)}
         if "/releases/tags/" in endpoint and release["draft"]:
             return subprocess.CompletedProcess(arguments, 1, b'HTTP/2.0 404 Not Found\r\n\r\n{"message":"Not Found"}', b"")
-        if "/releases?" in endpoint:
-            value = [value]
+        if endpoint == "graphql":
+            payload = json.loads(kwargs["input"])
+            assert payload["variables"] == {"owner": "owner", "name": "private", "tag": args.release_tag}
+            assert payload["query"].lstrip().startswith("query ") and "mutation" not in payload["query"].lower()
+            value = {"data": {"repository": {"nameWithOwner": args.release_repository,
+                "release": {"databaseId": release["id"], "tagName": args.release_tag, "isDraft": release["draft"]}},
+                "rateLimit": {"cost": 1, "remaining": 4999, "limit": 5000, "resetAt": "2099-01-01T00:00:00Z"}}}
         elif "/releases/assets/" in endpoint:
             identifier = int(endpoint.rsplit("/", 1)[1])
             raw = contents[next(asset["name"] for asset in assets if asset["id"] == identifier)]
@@ -1093,9 +1098,10 @@ def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and
     assert len(uploads) == upload_count
     assert events[-2:] == ["register", "publish"]
     assert any("/releases/tags/" in endpoint for _, endpoint in transport_calls)
-    assert any("/releases?" in endpoint for _, endpoint in transport_calls)
+    assert ("POST", "graphql") in transport_calls
+    assert not any("/releases?" in endpoint for _, endpoint in transport_calls)
     assert ("GET", "repos/owner/private/releases/101") in transport_calls
-    assert all(method == "GET" for method, _ in transport_calls)
+    assert all(method == "GET" or (method == "POST" and endpoint == "graphql") for method, endpoint in transport_calls)
     marker = json.loads(contents["metadata-catalog.json"])
     assert marker["observations"][0]["manifest_sha256"] == index["manifest_sha256"]
     assert marker["observations"][0]["index"]["sha256"] == hashlib.sha256(contents[index_name]).hexdigest()

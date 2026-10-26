@@ -615,6 +615,7 @@ class FakeGhApiRunner:
     def __init__(self, *, existing_release=False, remaining=1000):
         self.existing_release = existing_release
         self.remaining = remaining
+        self.graphql_remaining = 5000
         self.calls = []
         self.assets = {}
         self.next_id = 10
@@ -623,6 +624,13 @@ class FakeGhApiRunner:
         endpoint = args[2]
         method = args[args.index("--method") + 1] if "--method" in args else "GET"
         self.calls.append((method, endpoint))
+        if endpoint == "graphql":
+            self.graphql_remaining -= 1
+            value = graphql_result(None, remaining=self.graphql_remaining)
+            headers = (f"HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: {self.graphql_remaining}\r\n"
+                       "X-RateLimit-Reset: 4070908800\r\nX-RateLimit-Limit: 5000\r\n"
+                       "X-RateLimit-Resource: graphql\r\n\r\n").encode()
+            return subprocess.CompletedProcess(args, 0, headers + json.dumps(value).encode(), b"")
         self.remaining -= 1
         code, value = 200, {}
         if endpoint == "rate_limit":
@@ -858,7 +866,13 @@ def metadata_response(args, value, *, status=200, stderr=b""):
     return subprocess.CompletedProcess(args, int(status >= 400), raw, stderr)
 
 
-def test_draft_release_tag_404_falls_back_to_exact_id_and_caches_without_create():
+def graphql_result(release, *, repository="owner/collector", remaining=4999):
+    return {"data": {"repository": {"nameWithOwner": repository, "release": release},
+                     "rateLimit": {"cost": 1, "remaining": remaining, "limit": 5000,
+                                   "resetAt": "2099-01-01T00:00:00Z"}}}
+
+
+def test_draft_release_tag_404_uses_constant_exact_graphql_id_lookup_and_cache():
     calls = []
     draft = {"id": 424020503, "tag_name": "sealed-baseline", "draft": True,
              "assets": [{"id": 1, "name": "inventory.json", "size": 10}]}
@@ -867,22 +881,25 @@ def test_draft_release_tag_404_falls_back_to_exact_id_and_caches_without_create(
         calls.append((args[args.index("--method") + 1], endpoint))
         if "/releases/tags/" in endpoint:
             return metadata_response(args, {"message": "Not Found"}, status=404)
-        if "/releases?" in endpoint:
-            return metadata_response(args, [{"id": 5, "tag_name": "unrelated", "draft": False}, draft])
+        if endpoint == "graphql":
+            payload = json.loads(kwargs["input"])
+            assert payload["variables"] == {"owner": "owner", "name": "collector", "tag": "sealed-baseline"}
+            assert "release(tagName:$tag)" in payload["query"]
+            return metadata_response(args, graphql_result({"databaseId": 424020503, "tagName": "sealed-baseline", "isDraft": True}))
         if endpoint.endswith("/releases/424020503"):
             return metadata_response(args, draft)
-        raise AssertionError("Unexpected metadata endpoint")
+        raise AssertionError("Repository-wide release lists are forbidden")
     transport = GhCliStateTransport("owner/collector", runner=runner)
     assert transport._release("sealed-baseline") == draft
     transport.ensure_release("sealed-baseline")
     assert transport._release("sealed-baseline") == draft
     assert transport._assets["sealed-baseline"]["inventory.json"]["id"] == 1
-    assert transport.request_count == 3
-    assert all(method == "GET" for method, _ in calls)
-    assert calls[-1] == ("GET", "repos/owner/collector/releases/424020503")
+    assert transport.request_count == 3 and transport.graphql_request_count == 1
+    assert calls == [("GET", "repos/owner/collector/releases/tags/sealed-baseline"),
+                     ("POST", "graphql"), ("GET", "repos/owner/collector/releases/424020503")]
 
 
-def test_published_release_tag_fast_path_never_lists_drafts():
+def test_published_release_tag_fast_path_never_queries_graphql_or_lists_drafts():
     calls = []
     release = {"id": 15, "tag_name": "published", "draft": False, "assets": []}
     def runner(args, **kwargs):
@@ -891,6 +908,7 @@ def test_published_release_tag_fast_path_never_lists_drafts():
     transport = GhCliStateTransport("owner/collector", runner=runner)
     assert transport._release("published") == release
     assert calls == ["repos/owner/collector/releases/tags/published"]
+    assert transport.graphql_request_count == 0
 
 
 @pytest.mark.parametrize("status", [401, 403, 500])
@@ -906,7 +924,7 @@ def test_draft_lookup_does_not_mask_non_404_header_with_misleading_stderr(status
     assert calls == ["repos/owner/collector/releases/tags/sealed-baseline"]
 
 
-def test_draft_lookup_rate_response_defers_without_listing_or_create():
+def test_draft_lookup_rate_response_defers_without_graphql_or_create():
     calls = []
     def runner(args, **kwargs):
         calls.append(args[2])
@@ -919,8 +937,9 @@ def test_draft_lookup_rate_response_defers_without_listing_or_create():
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("malformation", ["ambiguous", "invalid_list", "wrong_id", "wrong_tag", "changed_draft"])
-def test_draft_lookup_rejects_ambiguity_or_malformed_identity_without_create(malformation):
+@pytest.mark.parametrize("malformation", ["errors", "errors_null", "null_data", "null_repository", "wrong_repository",
+                                           "missing_release", "invalid_quota", "invalid_candidate", "wrong_id", "wrong_tag", "changed_draft"])
+def test_graphql_draft_lookup_rejects_malformed_or_ambiguous_response_without_create(malformation):
     calls = []
     draft = {"id": 42, "tag_name": "sealed-baseline", "draft": True, "assets": []}
     def runner(args, **kwargs):
@@ -928,13 +947,26 @@ def test_draft_lookup_rejects_ambiguity_or_malformed_identity_without_create(mal
         calls.append((args[args.index("--method") + 1], endpoint))
         if "/releases/tags/" in endpoint:
             return metadata_response(args, {}, status=404)
-        if "/releases?" in endpoint:
-            if malformation == "invalid_list":
-                return metadata_response(args, {"id": 42})
-            values = [draft]
-            if malformation == "ambiguous":
-                values += [{**draft, "id": 43}]
-            return metadata_response(args, values)
+        if endpoint == "graphql":
+            value = graphql_result({"databaseId": 42, "tagName": "sealed-baseline", "isDraft": True})
+            if malformation == "errors":
+                value["errors"] = [{"type": "FORBIDDEN", "message": "denied"}]
+                value["data"]["repository"]["release"] = None
+            elif malformation == "errors_null":
+                value["errors"] = None
+            elif malformation == "null_data":
+                value["data"] = None
+            elif malformation == "null_repository":
+                value["data"]["repository"] = None
+            elif malformation == "wrong_repository":
+                value["data"]["repository"]["nameWithOwner"] = "other/repository"
+            elif malformation == "missing_release":
+                del value["data"]["repository"]["release"]
+            elif malformation == "invalid_quota":
+                value["data"]["rateLimit"] = None
+            elif malformation == "invalid_candidate":
+                value["data"]["repository"]["release"] = [{"databaseId": 42}]
+            return metadata_response(args, value)
         if endpoint.endswith("/releases/42"):
             result = dict(draft)
             if malformation == "wrong_id":
@@ -944,51 +976,73 @@ def test_draft_lookup_rejects_ambiguity_or_malformed_identity_without_create(mal
             elif malformation == "changed_draft":
                 result["draft"] = False
             return metadata_response(args, result)
-        raise AssertionError("Unexpected endpoint")
+        raise AssertionError("Release creation or listing must not happen")
     transport = GhCliStateTransport("owner/collector", runner=runner)
     with pytest.raises(StateError):
         transport.ensure_release("sealed-baseline")
-    assert all(method == "GET" for method, _ in calls)
+    assert all(method == "GET" or endpoint == "graphql" for method, endpoint in calls)
     assert "sealed-baseline" not in transport._releases
 
 
-def test_draft_lookup_bound_cannot_turn_unknown_absence_into_create(monkeypatch):
-    monkeypatch.setattr("icsot_observer.github_state.RELEASE_LOOKUP_MAX_PAGES", 2)
+def test_graphql_valid_exact_absence_allows_one_create_independent_of_release_count():
     calls = []
     def runner(args, **kwargs):
-        endpoint = args[2]
-        calls.append((args[args.index("--method") + 1], endpoint))
+        method, endpoint = args[args.index("--method") + 1], args[2]
+        calls.append((method, endpoint))
         if "/releases/tags/" in endpoint:
             return metadata_response(args, {}, status=404)
-        page = int(endpoint.rsplit("=", 1)[1])
-        return metadata_response(args, [{"id": page * 100 + n, "tag_name": f"unrelated-{page}-{n}", "draft": False}
-                                        for n in range(100)])
+        if endpoint == "graphql":
+            return metadata_response(args, graphql_result(None))
+        if endpoint == "repos/owner/collector/releases" and method == "POST":
+            return metadata_response(args, {"id": 424020504, "tag_name": "new-generation", "draft": False, "assets": []}, status=201)
+        raise AssertionError("Cannot enumerate Releases, including repositories with over 1000 Releases")
     transport = GhCliStateTransport("owner/collector", runner=runner)
-    with pytest.raises(StateError, match="lookup bound reached"):
-        transport.ensure_release("sealed-baseline")
-    assert len(calls) == 3
-    assert all(method == "GET" for method, _ in calls)
+    transport.ensure_release("new-generation")
+    transport.ensure_release("new-generation")
+    assert calls == [("GET", "repos/owner/collector/releases/tags/new-generation"),
+                     ("POST", "graphql"), ("POST", "repos/owner/collector/releases")]
 
 
-def test_draft_lookup_paginates_before_exact_id_recheck():
+def test_graphql_http200_rate_errors_defer_without_create_or_rest_bucket_corruption():
     calls = []
-    draft = {"id": 424020503, "tag_name": "sealed-baseline", "draft": True, "assets": []}
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if args[2] == "graphql":
+            raw = (b'HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 5000\r\n'
+                   b'X-RateLimit-Limit: 1000\r\nX-RateLimit-Resource: graphql\r\n\r\n'
+                   b'{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}],"data":null}')
+            return subprocess.CompletedProcess(args, 0, raw, b"")
+        return metadata_response(args, {}, status=404)
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    with pytest.raises(StateDeferredError) as failure:
+        transport.ensure_release("sealed-baseline")
+    assert failure.value.retry_not_before == 5000
+    assert transport.graphql_rate_remaining == 0 and transport.rate_remaining is None
+    with pytest.raises(StateDeferredError):
+        transport._find_release_after_tag_404("sealed-baseline")
+    assert len(calls) == 2
+
+
+def test_graphql_and_rest_primary_buckets_are_independent_but_secondary_wait_is_shared():
+    calls = []
     def runner(args, **kwargs):
         endpoint = args[2]
         calls.append(endpoint)
-        if "/releases/tags/" in endpoint:
-            return metadata_response(args, {}, status=404)
-        if endpoint.endswith("page=1"):
-            return metadata_response(args, [{"id": n + 1, "tag_name": f"old-{n}", "draft": False} for n in range(100)])
-        if endpoint.endswith("page=2"):
-            return metadata_response(args, [draft])
-        if endpoint.endswith("/releases/424020503"):
-            return metadata_response(args, draft)
-        raise AssertionError("Unexpected endpoint")
-    transport = GhCliStateTransport("owner/collector", runner=runner)
-    assert transport._release("sealed-baseline")["id"] == 424020503
-    assert len(calls) == 4
-    assert calls[-1].endswith("/releases/424020503")
+        if endpoint == "graphql":
+            raw = (b'HTTP/2.0 200 OK\r\nRetry-After: 60\r\n\r\n'
+                   b'{"errors":[{"type":"RATE_LIMITED","message":"secondary rate limit"}],"data":null}')
+            return subprocess.CompletedProcess(args, 0, raw, b"")
+        return rate_response(args, {}, remaining=800)
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    transport._api("repos/owner/collector")
+    rest_remaining = transport.rate_remaining
+    with pytest.raises(StateDeferredError) as failure:
+        transport._find_release_after_tag_404("sealed-baseline")
+    assert failure.value.retry_not_before == 1060
+    assert transport.rate_remaining == rest_remaining  # GraphQL did not spend a REST request.
+    with pytest.raises(StateDeferredError):
+        transport._api("repos/owner/collector")
+    assert calls == ["repos/owner/collector", "graphql"]
 
 
 @pytest.mark.parametrize("body", [b"null", b"", b"{malformed"])
@@ -1001,3 +1055,79 @@ def test_draft_lookup_malformed_success_is_not_interpreted_as_404(body):
     with pytest.raises(StateError):
         transport.ensure_release("sealed-baseline")
     assert calls == ["repos/owner/collector/releases/tags/sealed-baseline"]
+
+
+
+def test_graphql_primary_exhaustion_preserves_rest_quota_and_survives_adapter_clone():
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if args[2] == "graphql":
+            raw = (b'HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 5000\r\n'
+                   b'X-RateLimit-Limit: 1000\r\nX-RateLimit-Resource: graphql\r\n\r\n'
+                   b'{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}],"data":null}')
+            return subprocess.CompletedProcess(args, 0, raw, b"")
+        return rate_response(args, {}, remaining=800)
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    with pytest.raises(StateDeferredError):
+        transport._find_release_after_tag_404("sealed-baseline")
+    transport._api("repos/owner/collector")
+    assert transport.rate_remaining == 800
+    assert transport.graphql_rate_remaining == 0
+    assert transport.request_count == 2 and transport.graphql_request_count == 1
+    wrapped = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    transport.copy_runtime_state_to(wrapped)
+    with pytest.raises(StateDeferredError):
+        wrapped._find_release_after_tag_404("sealed-baseline")
+    assert wrapped._graphql_rate_windows == transport._graphql_rate_windows
+    assert wrapped._last_graphql_rate_headers["resource"] == "graphql"
+    assert calls == ["graphql", "repos/owner/collector"]
+
+
+
+def test_graphql_http200_rate_error_uses_partial_body_quota_when_headers_omit_it():
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        value = graphql_result(None, remaining=0)
+        value["errors"] = [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]
+        return metadata_response(args, value)
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    with pytest.raises(StateDeferredError) as failure:
+        transport._find_release_after_tag_404("sealed-baseline")
+    assert failure.value.retry_not_before == 4070908800
+    assert transport.graphql_rate_remaining == 0
+    with pytest.raises(StateDeferredError):
+        transport._find_release_after_tag_404("sealed-baseline")
+    assert calls == ["graphql"]
+
+
+
+def test_graphql_secondary_limit_without_retry_header_defers_one_minute():
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        value = {"errors": [{"type": "RATE_LIMITED", "message": "secondary rate limit"}], "data": None}
+        return metadata_response(args, value)
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    with pytest.raises(StateDeferredError) as failure:
+        transport._find_release_after_tag_404("sealed-baseline")
+    assert failure.value.retry_not_before == 1060
+    with pytest.raises(StateDeferredError):
+        transport._api("repos/owner/collector")
+    assert calls == ["graphql"]
+
+
+
+@pytest.mark.parametrize("distinct_releases,expected", [(False, 37), (True, 50)])
+def test_cold_draft_publish_estimate_reserves_thirteen_rest_metadata_requests_per_release(setup, distinct_releases, expected):
+    _, make, _ = setup
+    store = make()
+    refs = {}
+    for number in range(2):
+        refs[str(number)] = {"release_tag": f"old-draft-{number if distinct_releases else 0}",
+                             "name": f"part-{number}.enc", "ciphertext_sha256": str(number) * 64,
+                             "ciphertext_bytes": 100}
+    # No new payloads: fixed index/control estimate is 22. Each distinct cold
+    # draft needs 13 metadata reads, plus one ciphertext GET for each old part.
+    assert store._publication_requests_estimate([], {"parts": refs, "files": []}) == expected
