@@ -304,6 +304,18 @@ def release_assets(repository: str, release_id: int) -> list[dict]:
     return [asset for page in pages for asset in page]
 
 
+def release_by_tag(repository: str, tag: str) -> dict:
+    """Unpublished draft tags may not resolve through the tag endpoint."""
+    try:
+        return json.loads(gh("api", f"repos/{repository}/releases/tags/{tag}"))
+    except RuntimeError:
+        pages = json.loads(gh("api", f"repos/{repository}/releases?per_page=100", "--paginate", "--slurp"))
+        matches = [release for page in pages for release in page if release.get("tag_name") == tag]
+        if len(matches) != 1:
+            raise RuntimeError("Could not identify one accessible release for the requested tag")
+        return matches[0]
+
+
 def downloaded_asset_identity(repository: str, asset: dict) -> dict:
     """Hash a remote asset with bounded memory when GitHub omits its digest."""
     arguments = ["gh", "api", f"repos/{repository}/releases/assets/{asset['id']}",
@@ -455,7 +467,7 @@ def release_capture_outcome(slug: str, repository: str, tag: str, assets: dict,
 def parent_capture_outcomes(config: Config, sources: dict, repository: str, tag: str) -> dict[str, dict]:
     if not REPO_RE.fullmatch(repository) or not re.fullmatch(r"corpus-baseline-[0-9]+-[0-9]+", tag):
         raise ValueError("Invalid parent release destination")
-    release = json.loads(gh("api", f"repos/{repository}/releases/tags/{tag}"))
+    release = release_by_tag(repository, tag)
     target = release.get("target_commitish", "")
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target):
         raise ValueError("Parent release must identify a full capture code SHA")
@@ -503,7 +515,7 @@ def upload_asset(tag: str, path: Path, repository: str):
         return
     except (RuntimeError, subprocess.TimeoutExpired):
         wait_for_github_reset()
-    release = json.loads(gh("api", f"repos/{repository}/releases/tags/{tag}"))
+    release = release_by_tag(repository, tag)
     identity = file_identity(path)
     for asset in release_assets(repository, release["id"]):
         if asset["name"] == path.name:
@@ -613,7 +625,7 @@ def capture(args) -> int:
 
 def finalize(args) -> int:
     config, sources = load_sources(args.config, args.csv)
-    release = json.loads(gh("api", f"repos/{args.release_repository}/releases/tags/{args.release_tag}"))
+    release = release_by_tag(args.release_repository, args.release_tag)
     target = release.get("target_commitish", "")
     if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", target) and target.lower() != args.code_sha.lower():
         raise ValueError("Release target commit differs from expected capture code SHA")

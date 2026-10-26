@@ -49,6 +49,28 @@ def args_for(tmp_path, config, csv):
     )
 
 
+def test_draft_release_lookup_falls_back_to_authenticated_listing(monkeypatch):
+    expected = {"id": 123, "tag_name": "corpus-baseline-1-1", "draft": True}
+    def fake_gh(*args, **kwargs):
+        if "/releases/tags/" in args[1]:
+            raise RuntimeError("Draft tag is not published")
+        assert args == ("api", "repos/owner/repo/releases?per_page=100", "--paginate", "--slurp")
+        return json.dumps([[expected]]).encode()
+    monkeypatch.setattr(baseline, "gh", fake_gh)
+    assert baseline.release_by_tag("owner/repo", expected["tag_name"]) == expected
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_draft_release_lookup_rejects_missing_or_ambiguous_matches(monkeypatch, count):
+    def fake_gh(*args, **kwargs):
+        if "/releases/tags/" in args[1]:
+            raise RuntimeError("Not found")
+        return json.dumps([[{"id": i, "tag_name": "corpus-baseline-1-1"} for i in range(count)]]).encode()
+    monkeypatch.setattr(baseline, "gh", fake_gh)
+    with pytest.raises(RuntimeError, match="identify one accessible release"):
+        baseline.release_by_tag("owner/repo", "corpus-baseline-1-1")
+
+
 def accepted_index(identities, args):
     manifest = {"sha256": "b" * 64, "run_id": "baseline", "repository_id": 17,
                 "status": "complete", "mode": "full", "has_git": True,
