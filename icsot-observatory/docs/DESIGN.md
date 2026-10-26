@@ -98,7 +98,7 @@ Support arbitrary observation-pair and interval queries. Report `not_observed_in
 
 ### GitHub Actions execution
 
-The workspace includes push/PR validation and a manually triggered libfuse smoke workflow. This tests hosted execution of the current prototype, not a recurring deployment of this design. The smoke uploads temporary seven-day artifacts for transfer to local indefinite storage; no cron schedule is enabled.
+The workspace includes push/PR validation, a manually triggered libfuse smoke workflow and a one-time 185-target baseline workflow. The baseline preserves XZ archive parts and explicit outcome indexes in private Release assets. The smoke uses temporary seven-day Actions artifacts. Neither workflow enables a recurring deployment or cron schedule. See [storage decision](STORAGE.md).
 
 Scheduled Actions can supply periodic compute, but hosted jobs start on fresh machines and have a six-hour execution limit. Persist the authoritative archive and a consistent state/database snapshot outside the runner, then restore the needed state for each bounded batch. Actions artifacts/caches have retention or eviction policies and are not the indefinite evidence store. [Hosted runners](https://docs.github.com/en/actions/concepts/runners/github-hosted-runners), [Actions limits](https://docs.github.com/en/actions/reference/limits), [Artifact retention](https://docs.github.com/en/organizations/managing-organization-settings/configuring-the-retention-period-for-github-actions-artifacts-and-logs-in-your-organization)
 

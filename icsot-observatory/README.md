@@ -12,6 +12,8 @@ The selected cohort is all 185 repositories in [public_patch_corpus_185.csv](../
 
 See [the first live libfuse validation](docs/LIBFUSE_VALIDATION.md) for measured results, preserved failures, evidence digests and remaining implementation limits.
 
+The manual `Corpus baseline (one time)` Actions workflow captures the full selected cohort in separate jobs and preserves verified portable bundles, raw evidence and explicit partial outcomes in private Release assets. XZ archive parts are at most 1 GiB; per-repository indexes and the final inventory record integrity and coverage. This workflow has no recurring schedule. See [storage and launch decisions](docs/STORAGE.md) for the alternatives reviewed and the proposed six-hour deployment on a persistent host.
+
 ## Quickstart
 
 Requirements: Linux/macOS, Python >=3.11, Git, OpenTimestamps CLI (`ots`) from [official client](https://github.com/opentimestamps/opentimestamps-client). For local development tests `ots` can be omitted using `--no-stamp`. Prefer a narrowly scoped **read-only** GitHub App/token restricted to public repositories; `GITHUB_TOKEN` is read from your environment, never stored in run manifests.

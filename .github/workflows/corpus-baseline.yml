@@ -1,0 +1,138 @@
+name: Corpus baseline (one time)
+
+# Manual only. This is an initial shallow observation, not recurring deployment.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-baseline
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+    steps:
+      - name: Check out collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Validate complete cohort and plan independent captures
+        id: plan
+        run: python scripts/capture_baseline.py plan --config config.corpus.toml --csv ../public_patch_corpus_185.csv --github-output "$GITHUB_OUTPUT"
+      - name: Create private draft transfer release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          CONFIG_SHA256: ${{ steps.plan.outputs.config_source_sha256 }}
+          CSV_SHA256: ${{ steps.plan.outputs.csv_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY_PRIVATE" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" = true
+          release_tag="corpus-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p analysis/baseline-plan
+          cat > analysis/baseline-plan/release-notes.md <<EOF
+          Initial capture is INCOMPLETE and remains a draft while jobs run.
+
+          Declared cohort: all 185 repositories in the source CSV, in configuration order.
+          Collector commit: $GITHUB_SHA
+          Configuration SHA-256: $CONFIG_SHA256
+          CSV SHA-256: $CSV_SHA256
+
+          Each target attempts shallow full REST listings and advertised Git refs with a portable full bundle. Historical per-item backfill and Discussions are excluded. Pending OpenTimestamps receipts are not verified Bitcoin timestamps.
+
+          Per-repository indexes are uploaded after archive-part attempts, including partial/error outcomes. The final inventory identifies missing and incomplete targets before this draft is published once. No recurring schedule, later state restore, automatic deletion or expiry is configured. Private Release assets remain deletable and are not an independent backup or an indefinite-retention guarantee.
+          EOF
+          gh release create "$release_tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "Corpus baseline ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}" --notes-file analysis/baseline-plan/release-notes.md
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+
+  capture:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: Capture ${{ matrix.slug }}
+    steps:
+      - name: Check out collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector and pinned timestamp client
+        run: python -m pip install --disable-pip-version-check -e . opentimestamps-client==0.7.2
+      - name: Capture, verify, split archive, and transfer even partial outcomes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          CAPTURE_SLUG: ${{ matrix.slug }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        run: |
+          python scripts/capture_baseline.py capture \
+            --config config.corpus.toml \
+            --csv ../public_patch_corpus_185.csv \
+            --slug "$CAPTURE_SLUG" \
+            --release-tag "$RELEASE_TAG" \
+            --release-repository "$GITHUB_REPOSITORY" \
+            --code-sha "$GITHUB_SHA" \
+            --work-root analysis/corpus-baseline
+
+  finalize:
+    needs: [plan, capture]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Check out collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Inventory terminal outcomes and publish once, including explicit gaps
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          BASELINE_MATRIX_RESULT: ${{ needs.capture.result }}
+        run: |
+          python scripts/capture_baseline.py finalize \
+            --config config.corpus.toml \
+            --csv ../public_patch_corpus_185.csv \
+            --release-tag "$RELEASE_TAG" \
+            --release-repository "$GITHUB_REPOSITORY" \
+            --code-sha "$GITHUB_SHA" \
+            --work-root analysis/corpus-baseline-finalize

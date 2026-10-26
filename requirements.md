@@ -17,6 +17,7 @@ Create local, incremental, independently verifiable records of public GitHub obs
 - Target **1–6 hours between observations**, according to measured feasibility; report actual gaps.
 - **Hard cap: 50 GB (50,000,000,000 stored bytes) of new evidence per UTC calendar month.** Pause collection before exceeding it; resume next month or after an explicit policy amendment. No automatic limit increase or deletion. No baseline exemption is assumed.
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.
+- Initial capture uses private GitHub Release assets, split into XZ archive parts with hashed indexes. Recurring collection is not enabled; six hours on the always-on host is the recommended starting cadence after incremental archiving is implemented.
 
 ## Functional requirements
 
@@ -41,3 +42,4 @@ Create local, incremental, independently verifiable records of public GitHub obs
 
 - Timestamp provider and acceptable attestation precision/delay.
 - Off-host backups and their separate capacity/accounting policy.
+- Always-on host location and deployment; independent archive destination. See [storage decision](icsot-observatory/docs/STORAGE.md).

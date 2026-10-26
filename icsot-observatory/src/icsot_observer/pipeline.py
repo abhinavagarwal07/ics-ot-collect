@@ -106,6 +106,8 @@ def collect_one(config: Config, slug: str, mode: str, *, deep_full: bool = False
         "overlap_hours": config.overlap_hours,
         "max_pages": config.max_pages,
         "max_response_bytes": config.max_response_bytes,
+        "primary_rate_wait_seconds": config.primary_rate_wait_seconds,
+        "primary_rate_reserve": config.primary_rate_reserve,
         "deep_full": deep_full,
         "bundle_full": bundle_full,
     }

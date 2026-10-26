@@ -47,6 +47,8 @@ class GitHubAPI:
         self.token = os.getenv(config.token_env, "").strip()
         self.opener = urllib.request.build_opener(NoRedirect)
         self.requests = 0
+        self.primary_rate_waited_seconds = 0.0
+        self._last_rate_record: dict | None = None
         self._repository_ids: dict[str, str] = {}
 
     @staticmethod
@@ -66,8 +68,32 @@ class GitHubAPI:
         GitHubAPI.validate_url(url)
         return url
 
+    def _preserve_primary_reserve(self, purpose: str) -> None:
+        record = self._last_rate_record
+        if self.config.primary_rate_reserve == 0 or record is None:
+            return
+        headers = record.get("headers", {})
+        try:
+            remaining = int(headers["x-ratelimit-remaining"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if remaining > self.config.primary_rate_reserve:
+            return
+        try:
+            duration = max(1.0, int(headers["x-ratelimit-reset"]) - time.time() + 1.0)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            duration = None
+        available = self.config.primary_rate_wait_seconds - self.primary_rate_waited_seconds
+        if duration is None or duration > available:
+            raise RuntimeError(f"Rate-limit reserve reached for {purpose}; preserve transfer capacity and retry later")
+        record["primary_rate_reserve_wait_seconds"] = duration
+        self.primary_rate_waited_seconds += duration
+        time.sleep(duration)
+        self._last_rate_record = None  # reset elapsed; obtain current headers on the next request
+
     def get(self, url: str, purpose: str) -> Response:
         self.validate_url(url)
+        self._preserve_primary_reserve(purpose)
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": self.config.api_version,
@@ -117,14 +143,26 @@ class GitHubAPI:
                 "error": failure, "attempt": attempt + 1, "auth": "token_present" if self.token else "anonymous"
             }
             self.records.append(rec)
+            self._last_rate_record = rec
             self.requests += 1
             if failure is None and status == 200:
                 return Response(body=body, record=rec)
 
             # Rate-limit and server issues: bounded retry, no invented successful response.
-            if status in (403, 429) and (response_headers.get("X-RateLimit-Remaining") == "0" or
-                                           response_headers.get("x-ratelimit-remaining") == "0"):
-                # Never hammer an exhausted primary bucket.
+            if status in (403, 429) and hdrs.get("x-ratelimit-remaining") == "0":
+                # Hosted jobs may opt into a bounded wait for the shared token
+                # bucket. Preserve the refusal and the announced reset as evidence.
+                try:
+                    reset = int(hdrs.get("x-ratelimit-reset", ""))
+                    duration = max(1.0, reset - time.time() + 1.0)
+                except (TypeError, ValueError, OverflowError):
+                    duration = None
+                available = self.config.primary_rate_wait_seconds - self.primary_rate_waited_seconds
+                if attempt < 3 and duration is not None and duration <= available:
+                    rec["primary_rate_wait_seconds"] = duration
+                    self.primary_rate_waited_seconds += duration
+                    time.sleep(duration)
+                    continue
                 raise RuntimeError(f"Rate-limit budget exhausted for {purpose}; retry in next scheduled run")
             if (status in (403, 429, 500, 502, 503, 504)) and attempt < 3:
                 retry = response_headers.get("Retry-After") or response_headers.get("retry-after")
