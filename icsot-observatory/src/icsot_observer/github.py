@@ -59,6 +59,10 @@ class _ScopeCapped(RuntimeError):
     pass
 
 
+class _PaginationDrift(RuntimeError):
+    pass
+
+
 class GitHubAPI:
     """Captures original HTTP body and a redacted provenance envelope."""
 
@@ -70,6 +74,8 @@ class GitHubAPI:
         self._checkpoint_context: dict | None = None
         self._deferred: APIRequestDeferred | None = None
         self._checkpoint_integrity_errors: dict[str, list[str]] = {}
+        self._json_decode_errors: list[dict] = []
+        self._scope_observations: dict[str, dict] = {}
         if checkpoint_store is not None:
             if (config.root.resolve() != checkpoint_store.root or
                     store.root.resolve() != checkpoint_store.root):
@@ -77,6 +83,8 @@ class GitHubAPI:
             # Identity may have been fetched before the stable numeric binding was
             # known. Persist those envelopes before any subsequent network call.
             old_records = checkpoint_store.responses()
+            self._json_decode_errors = [event["data"] for event in checkpoint_store.events
+                                        if event["kind"] == "response_decode_error"]
             for record in old_records:
                 try:
                     self._validate_record_body(record)
@@ -339,85 +347,136 @@ class GitHubAPI:
             raise RuntimeError(f"API failure {purpose}: HTTP {status}, {failure or 'unexpected status'}")
         raise AssertionError("unreachable")
 
+    def _request_json(self, url: str, purpose: str, kind: str, *, checkpointed: bool = False) -> tuple[Response, Any]:
+        """Retry malformed 2xx JSON at most twice; retain every original body."""
+        for decode_attempt in range(1, 4):
+            response = self._checkpoint_get(url, purpose) if checkpointed else self.get(url, purpose)
+            try:
+                return response, self._decode_scope_body(response.body, kind, purpose)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                failure = {"purpose": purpose, "url": url, "decode_attempt": decode_attempt,
+                           "body_sha256": response.record.get("body_sha256"),
+                           "response_sequence": response.record.get("checkpoint_provenance", {}).get("event_sequence"),
+                           "error": type(exc).__name__, "message": str(exc)}
+                self._json_decode_errors.append(failure)
+                if self.checkpoint_store is not None:
+                    self.checkpoint_store.append("response_decode_error", failure)
+                if decode_attempt == 3:
+                    raise
+        raise AssertionError("unreachable")
+
     def get_json(self, path: str, purpose: str) -> dict:
-        r = self.get(self.url(path), purpose)
-        obj = json.loads(r.body)
-        if not isinstance(obj, dict):
-            raise ValueError(f"Expected JSON object for {purpose}")
+        _, obj = self._request_json(self.url(path), purpose, "object")
         route = _REPOSITORY_PATH_RE.fullmatch(path)
         if route and not route["endpoint"] and type(obj.get("id")) is int and obj["id"] > 0:
             self._repository_ids[route["repository"].lower()] = str(obj["id"])
         return obj
 
+    @staticmethod
+    def _item_identity(item: dict) -> tuple[str, str] | None:
+        for field in ("id", "node_id", "sha", "name", "filename"):
+            value = item.get(field)
+            if (type(value) is int and value > 0) or (isinstance(value, str) and value):
+                return field, str(value)
+        return None
+
+    @staticmethod
+    def _next_link(response: Response) -> str | None:
+        match = _NEXT_RE.search(response.record.get("headers", {}).get("link", ""))
+        return match.group(1) if match else None
+
+    @classmethod
+    def _first_page_matches(cls, first: Response, first_items: list[dict],
+                            fresh: Response, fresh_items: list[dict]) -> bool:
+        if cls._next_link(first) != cls._next_link(fresh):
+            return False
+        if sha256(first.body) == sha256(fresh.body):
+            return True
+        original = [cls._item_identity(item) for item in first_items]
+        current = [cls._item_identity(item) for item in fresh_items]
+        # Unknown identities cannot establish stable membership/order. In that
+        # case only the exact original representation qualifies above.
+        return (bool(original) and all(value is not None for value in original + current) and
+                len(set(original)) == len(original) and original == current)
+
     def list_pages(self, path: str, purpose: str, *, params: dict | None = None,
                    updated_before: datetime | None = None) -> list[dict]:
-        """Follow Link headers; early stop ONLY on PR sort=updated desc boundary.
+        """Validate a non-atomic traversal, restarting an actually drifted list once.
 
-        Always retains original bytes even if a later page fails. Caller marks run incomplete.
+        Rechecks compare ordered entity identities and the next cursor. Mutable
+        representation fields do not themselves imply missing pagination items.
+        Every raw attempt and interval remains archived; this is no atomic snapshot.
         """
-        url = self.url(path, {**(params or {}), "per_page": 100})
-        first_page = url
-        first_route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url).path)
-        assert first_route is not None  # self.url validated the initial endpoint.
-        canonical_repository_id = first_route["id"] or self._repository_ids.get(first_route["repository"].lower())
-        first_digest = None
-        all_items: list[dict] = []
-        seen_urls: set[str] = set()
-        seen_ids: set[str] = set()
-        for page_no in range(1, self.config.max_pages + 1):
-            if url in seen_urls:
-                raise RuntimeError(f"Pagination loop in {purpose}")
-            seen_urls.add(url)
-            resp = self.get(url, purpose)
-            if page_no == 1:
-                first_digest = resp.record["body_sha256"]
-            obj = json.loads(resp.body)
-            if not isinstance(obj, list) or any(not isinstance(item, dict) for item in obj):
-                raise ValueError(f"Unexpected page JSON for {purpose}, page {page_no}")
-            for item in obj:
-                entity_id = item.get("id")
-                if entity_id is not None:
-                    unique = str(entity_id)
-                    if unique in seen_ids:
-                        raise RuntimeError(f"Pagination drift: repeated ID {unique} in {purpose}")
-                    seen_ids.add(unique)
-            all_items.extend(obj)
-
-            # Bound scanning of PR listing (which has no 'since' parameter).
-            if updated_before is not None and obj and all(
-                isinstance(x.get("updated_at"), str) and
-                parse_github_time(x["updated_at"]) < updated_before for x in obj
-            ):
-                break
-
-            link = resp.record["headers"].get("link", "")
-            match = _NEXT_RE.search(link)
-            if not match:
-                break
-            url = match.group(1)
-            self.validate_url(url)
-            route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url).path)
-            assert route is not None  # validate_url checked the opaque Link URL.
-            if route["endpoint"] != first_route["endpoint"]:
-                raise RuntimeError(f"Unexpected endpoint changed across pagination for {purpose}")
-            if route["id"] is not None:
-                # GitHub legitimately canonicalizes slug routes to stable numeric
-                # routes in Link. Bind that ID to known metadata, or to the first
-                # authenticated-origin Link if list_pages was used standalone.
-                if canonical_repository_id is not None and route["id"] != canonical_repository_id:
-                    raise RuntimeError(f"Unexpected repository changed across pagination for {purpose}")
-                canonical_repository_id = route["id"]
-            elif route["repository"].lower() != first_route["repository"].lower():
-                raise RuntimeError(f"Unexpected repository changed across pagination for {purpose}")
-        else:
-            raise RuntimeError(f"Max pages exceeded for {purpose} (NOT complete)")
-
-        # A second first-page read helps detect moving-window pagination drift.
-        if len(seen_urls) > 1:
-            check = self.get(first_page, purpose + "_first_page_recheck")
-            if check.record["body_sha256"] != first_digest:
-                raise RuntimeError(f"Pagination non-atomic: first page changed for {purpose}; retry later")
-        return all_items
+        initial_url = self.url(path, {**(params or {}), "per_page": 100})
+        first_route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(initial_url).path)
+        assert first_route is not None
+        for traversal in range(1, 3):
+            attempt_started_at = utc_iso()
+            canonical_id = first_route["id"] or self._repository_ids.get(first_route["repository"].lower())
+            url = initial_url
+            first_response = None
+            first_items: list[dict] = []
+            items: list[dict] = []
+            seen_urls: set[str] = set()
+            seen_ids: set[tuple[str, str]] = set()
+            try:
+                for page_no in range(1, self.config.max_pages + 1):
+                    if url in seen_urls:
+                        raise _PaginationDrift(f"Pagination loop in {purpose}")
+                    seen_urls.add(url)
+                    response, page = self._request_json(url, purpose, "list")
+                    if first_response is None:
+                        first_response, first_items = response, page
+                    for item in page:
+                        identity = self._item_identity(item)
+                        if identity is not None:
+                            if identity in seen_ids:
+                                raise _PaginationDrift(f"Pagination drift: repeated ID {identity[1]} in {purpose}")
+                            seen_ids.add(identity)
+                    items.extend(page)
+                    if updated_before is not None and page and all(
+                            isinstance(item.get("updated_at"), str) and
+                            parse_github_time(item["updated_at"]) < updated_before for item in page):
+                        break
+                    next_url = self._next_link(response)
+                    if next_url is None:
+                        break
+                    self.validate_url(next_url)
+                    route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(next_url).path)
+                    assert route is not None
+                    if route["endpoint"] != first_route["endpoint"]:
+                        raise RuntimeError(f"Unexpected endpoint changed across pagination for {purpose}")
+                    if route["id"] is not None:
+                        if canonical_id is not None and route["id"] != canonical_id:
+                            raise RuntimeError(f"Unexpected repository changed across pagination for {purpose}")
+                        canonical_id = route["id"]
+                    elif route["repository"].lower() != first_route["repository"].lower():
+                        raise RuntimeError(f"Unexpected repository changed across pagination for {purpose}")
+                    url = next_url
+                else:
+                    raise _ScopeCapped(f"Max pages exceeded for {purpose} (NOT complete)")
+                representation_changed = False
+                if len(seen_urls) > 1:
+                    fresh, fresh_items = self._request_json(initial_url, purpose + "_first_page_recheck", "list")
+                    assert first_response is not None
+                    if not self._first_page_matches(first_response, first_items, fresh, fresh_items):
+                        raise _PaginationDrift(f"Pagination non-atomic: first page changed for {purpose}")
+                    representation_changed = fresh.body != first_response.body
+                self._scope_observations[purpose] = {
+                    "pagination_attempts": traversal,
+                    "query_started_at": attempt_started_at,
+                    "pagination_validation": "ordered_identity_and_next_cursor",
+                    "representation_changed_during_validation": representation_changed,
+                    "claim_scope": "non_atomic_response_intervals",
+                }
+                return items
+            except _PaginationDrift as exc:
+                self._scope_observations[purpose] = {"pagination_attempts": traversal,
+                    "query_started_at": attempt_started_at,
+                    "claim_scope": "non_atomic_response_intervals", "last_drift": str(exc)}
+                if traversal == 2:
+                    raise _PaginationDrift(f"Pagination drift restart budget exhausted for {purpose}: {exc}") from exc
+        raise AssertionError("unreachable")
 
     def _checkpoint_get(self, url: str, purpose: str) -> Response:
         response = self.get(url, purpose)
@@ -486,7 +545,7 @@ class GitHubAPI:
         pages: list[Response] = []
         values: Any = {} if query["kind"] == "object" else []
         next_url = query["initial_url"]
-        seen_ids: set[str] = set()
+        seen_ids: set[tuple[str, str]] = set()
         seen_urls: set[str] = set()
         for expected, page in enumerate(state["pages"], 1):
             if (page["page_no"] != expected or expected > self.config.max_pages or
@@ -510,11 +569,11 @@ class GitHubAPI:
                 values, next_url = value, None
             else:
                 for item in value:
-                    if item.get("id") is not None:
-                        entity_id = str(item["id"])
-                        if entity_id in seen_ids:
+                    identity = self._item_identity(item)
+                    if identity is not None:
+                        if identity in seen_ids:
                             raise CheckpointError("Repeated entity ID in checkpoint pages")
-                        seen_ids.add(entity_id)
+                        seen_ids.add(identity)
                 values.extend(value)
                 next_url = self._page_next(query, response, value)
                 if page["next_url"] != next_url:
@@ -537,7 +596,7 @@ class GitHubAPI:
     def _abandon_scope(self, state: dict, reason: str) -> None:
         assert self.checkpoint_store is not None
         if state["restarts"] >= 1:
-            raise RuntimeError(f"Pagination drift restart budget exhausted for {state['scope']}: {reason}")
+            raise _PaginationDrift(f"Pagination drift restart budget exhausted for {state['scope']}: {reason}")
         self.checkpoint_store.append("scope_abandoned", {
             "scope": state["scope"], "attempt_id": state["attempt_id"], "reason": reason,
             "status": "partial_drift", "abandoned_at": utc_iso(),
@@ -552,8 +611,6 @@ class GitHubAPI:
         if state is not None and (state["fingerprint"] != sha256(canonical_json(query)) or state["query"] != query):
             raise CheckpointError(f"Scope query/options changed for {scope}; use a new capture_id")
         if state is not None and state.get("abandoned"):
-            # A process may stop after recording drift but before starting its
-            # replacement attempt. Do not reuse the abandoned pages in that gap.
             state = self._begin_scope(scope, query)
         if state is not None:
             values, pages = self._load_scope_pages(state, query)
@@ -562,7 +619,8 @@ class GitHubAPI:
                     raise CheckpointError("Complete checkpoint scope has unfinished pagination")
                 if validate is not None:
                     validate(values)
-                return values, {**state["outcome"], "reused_from_checkpoint": True}
+                return values, {**state["outcome"], "reused_from_checkpoint": True,
+                                "claim_scope": "non_atomic_response_intervals"}
             outcome = state["outcome"] or {}
             if outcome.get("status") == "deferred" and outcome["retry_not_before"] > time.time():
                 raise APIRequestDeferred(outcome["retry_not_before"], outcome.get("reason", outcome["error"]), scope=scope,
@@ -572,65 +630,88 @@ class GitHubAPI:
         resumed = state is not None and bool(state["pages"])
         if state is None:
             state = self._begin_scope(scope, query)
+        representation_changed = False
         while True:
             self._checkpoint_context = {"scope": scope, "attempt_id": state["attempt_id"]}
             values, pages = self._load_scope_pages(state, query)
+            first_items = (self._decode_scope_body(pages[0].body, query["kind"], scope) if pages else None)
             if resumed:
-                fresh = self._checkpoint_get(query["initial_url"], scope + "_resume_first_page_validation")
-                matches = (fresh.record["body_sha256"] == pages[0].record["body_sha256"] and
-                           fresh.record.get("headers", {}).get("link") == pages[0].record.get("headers", {}).get("link"))
+                fresh, fresh_items = self._request_json(query["initial_url"], scope + "_resume_first_page_validation",
+                                                         query["kind"], checkpointed=True)
+                matches = (self._first_page_matches(pages[0], first_items, fresh, fresh_items)
+                           if query["kind"] == "list" else fresh.body == pages[0].body)
+                changed = fresh.body != pages[0].body
+                representation_changed |= changed
                 self.checkpoint_store.append("scope_validation", {
                     **self._checkpoint_context, "response_sequence": fresh.record["checkpoint_provenance"]["event_sequence"],
-                    "matches_first_page": matches,
+                    "matches_first_page": matches, "representation_changed": changed,
+                    "validation": "ordered_identity_and_next_cursor" if query["kind"] == "list" else "exact_object",
                 })
                 resumed = False
                 if not matches:
-                    self._abandon_scope(state, "First page changed before continuation")
-                    state = self._begin_scope(scope, query, query_started_at=fresh.record["request_started_at"])
-                    # The fresh validation envelope belongs to the old attempt.
-                    # Start with a new request instead of relabeling its lineage.
+                    self._abandon_scope(state, "First page membership/order/cursor changed before continuation")
+                    state = self._begin_scope(scope, query)
+                    representation_changed = False
                     continue
             next_url = state["pages"][-1]["next_url"] if pages else query["initial_url"]
             seen_urls = {page["url"] for page in state["pages"]}
-            seen_ids = {str(item["id"]) for item in values if isinstance(item, dict) and item.get("id") is not None} if query["kind"] == "list" else set()
-            while next_url is not None:
-                if next_url in seen_urls:
-                    raise RuntimeError(f"Pagination loop in {scope}")
-                if len(pages) >= self.config.max_pages:
-                    raise _ScopeCapped(f"Max pages exceeded for {scope} (NOT complete)")
-                response = self._checkpoint_get(next_url, scope)
-                value = self._decode_scope_body(response.body, query["kind"], scope)
-                if query["kind"] == "object":
-                    values, following = value, None
-                else:
-                    for item in value:
-                        if item.get("id") is not None:
-                            entity_id = str(item["id"])
-                            if entity_id in seen_ids:
-                                raise RuntimeError(f"Pagination drift: repeated ID {entity_id} in {scope}")
-                            seen_ids.add(entity_id)
-                    values.extend(value)
-                    following = self._page_next(query, response, value)
-                self.checkpoint_store.append("scope_page", {
-                    **self._checkpoint_context, "page_no": len(pages) + 1,
-                    "url": next_url, "next_url": following,
-                    "response_sequence": response.record["checkpoint_provenance"]["event_sequence"],
-                })
-                pages.append(response)
-                seen_urls.add(next_url)
-                next_url = following
-            if query["kind"] == "list" and len(pages) > 1:
-                fresh = self._checkpoint_get(query["initial_url"], scope + "_first_page_recheck")
-                if (fresh.record["body_sha256"] != pages[0].record["body_sha256"] or
-                        fresh.record.get("headers", {}).get("link") != pages[0].record.get("headers", {}).get("link")):
-                    self._abandon_scope(state, "First page changed after pagination")
-                    state = self._begin_scope(scope, query, query_started_at=fresh.record["request_started_at"])
-                    continue
+            seen_ids = {identity for item in values if (identity := self._item_identity(item)) is not None} if query["kind"] == "list" else set()
+            try:
+                while next_url is not None:
+                    if next_url in seen_urls:
+                        raise _PaginationDrift(f"Pagination loop in {scope}")
+                    if len(pages) >= self.config.max_pages:
+                        raise _ScopeCapped(f"Max pages exceeded for {scope} (NOT complete)")
+                    response, value = self._request_json(next_url, scope, query["kind"], checkpointed=True)
+                    if first_items is None:
+                        first_items = value
+                    if query["kind"] == "object":
+                        values, following = value, None
+                    else:
+                        for item in value:
+                            identity = self._item_identity(item)
+                            if identity is not None:
+                                if identity in seen_ids:
+                                    raise _PaginationDrift(f"Pagination drift: repeated ID {identity[1]} in {scope}")
+                                seen_ids.add(identity)
+                        values.extend(value)
+                        following = self._page_next(query, response, value)
+                    self.checkpoint_store.append("scope_page", {
+                        **self._checkpoint_context, "page_no": len(pages) + 1,
+                        "url": next_url, "next_url": following,
+                        "response_sequence": response.record["checkpoint_provenance"]["event_sequence"],
+                    })
+                    pages.append(response)
+                    seen_urls.add(next_url)
+                    next_url = following
+                if query["kind"] == "list" and len(pages) > 1:
+                    fresh, fresh_items = self._request_json(query["initial_url"], scope + "_first_page_recheck",
+                                                             "list", checkpointed=True)
+                    matches = self._first_page_matches(pages[0], first_items, fresh, fresh_items)
+                    changed = fresh.body != pages[0].body
+                    representation_changed |= changed
+                    self.checkpoint_store.append("scope_validation", {
+                        **self._checkpoint_context, "response_sequence": fresh.record["checkpoint_provenance"]["event_sequence"],
+                        "matches_first_page": matches, "representation_changed": changed,
+                        "validation": "ordered_identity_and_next_cursor",
+                    })
+                    if not matches:
+                        raise _PaginationDrift("First page membership/order/cursor changed after pagination")
+            except _PaginationDrift as exc:
+                self._abandon_scope(state, str(exc))
+                state = self._begin_scope(scope, query)
+                representation_changed = False
+                continue
             if validate is not None:
                 validate(values)
             outcome = {**self._checkpoint_context, "status": "complete_for_query",
                        "count": 1 if query["kind"] == "object" else len(values), "pages": len(pages),
-                       "query_started_at": state["query_started_at"], "completed_at": utc_iso()}
+                       "query_started_at": state["query_started_at"], "completed_at": utc_iso(),
+                       "claim_scope": "non_atomic_response_intervals"}
+            if query["kind"] == "list":
+                outcome.update(pagination_attempts=state["restarts"] + 1,
+                               pagination_validation="ordered_identity_and_next_cursor",
+                               representation_changed_during_validation=representation_changed)
             self.checkpoint_store.append("scope_finished", outcome)
             return values, outcome
 
@@ -648,30 +729,38 @@ class GitHubAPI:
         """
         if self.checkpoint_store is None:
             raise ValueError("collect_resumable requires a bound CheckpointStore")
+        return self._collect_scopes(slug, mode, since, deep_full, scope_since=scope_since, checkpointed=True)
+
+    def _collect_scopes(self, slug: str, mode: str, since: str | None, deep_full: bool, *,
+                        scope_since: dict[str, str | None] | None = None, checkpointed: bool = False) -> dict:
+        """Shared scope policy; preserve good scopes when another one fails."""
+        checkpoint = self.checkpoint_store if checkpointed else None
         if mode not in ("full", "delta", "events"):
             raise ValueError("Unknown collection mode")
         self._deferred = None
-        for event in reversed(self.checkpoint_store.events):
+        for event in reversed(checkpoint.events if checkpoint else []):
             if event["kind"] == "rate_deferral":
                 data = event["data"]
                 if data["retry_not_before"] > time.time():
                     self._deferred = APIRequestDeferred(data["retry_not_before"], data["reason"],
-                        scope=data.get("scope"), capture_id=self.checkpoint_store.capture_id)
+                        scope=data.get("scope"), capture_id=checkpoint.capture_id)
                 break
         scope_since = dict(scope_since or {})
         for boundary in [since, *scope_since.values()]:
             if boundary is not None:
                 parse_github_time(boundary)
-        self.checkpoint_store.bind_options({
-            "slug": slug, "mode": mode, "since": since, "scope_since": scope_since,
-            "deep_full": deep_full, "api_version": self.config.api_version,
-            "max_pages": self.config.max_pages, "max_response_bytes": self.config.max_response_bytes,
-            "auth": "token_present" if self.token else "anonymous",
-        })
+        if checkpoint is not None:
+            checkpoint.bind_options({
+                "slug": slug, "mode": mode, "since": since, "scope_since": scope_since,
+                "deep_full": deep_full, "api_version": self.config.api_version,
+                "max_pages": self.config.max_pages, "max_response_bytes": self.config.max_response_bytes,
+                "auth": "token_present" if self.token else "anonymous",
+            })
         result: dict[str, Any] = {"mode": mode, "since": since, "scopes": {}, "warnings": [],
                                   "scope_statuses": {}, "failures": [], "watermark_candidates": {},
-                                  "repository_id": self.checkpoint_store.repository_id,
-                                  "capture_id": self.checkpoint_store.capture_id}
+                                  "repository_id": checkpoint.repository_id if checkpoint else None,
+                                  "capture_id": checkpoint.capture_id if checkpoint else None,
+                                  "decode_errors": self._json_decode_errors, "unavailable_scopes": {}}
         prefix = f"/repos/{slug}"
 
         def run(scope, route, params=None, *, kind="list", boundary=None, validate=None):
@@ -681,20 +770,35 @@ class GitHubAPI:
                      "max_pages": self.config.max_pages, "max_response_bytes": self.config.max_response_bytes,
                      "mode": mode, "deep_full": deep_full}
             previous_context = self._checkpoint_context
-            record_start = len(self.records)
+            record_start, query_started_at = len(self.records), utc_iso()
             try:
-                value, outcome = self._run_checkpoint_scope(scope, query, validate=validate)
+                if checkpoint is not None:
+                    value, outcome = self._run_checkpoint_scope(scope, query, validate=validate)
+                else:
+                    if self._deferred is not None:
+                        raise self._deferred
+                    value = (self.get_json(prefix + route, scope) if kind == "object" else
+                             self.list_pages(prefix + route, scope, params=params,
+                                             updated_before=parse_github_time(boundary) if boundary else None))
+                    if validate is not None:
+                        validate(value)
+                    outcome = {"scope": scope, "status": "complete_for_query",
+                               "count": 1 if kind == "object" else len(value),
+                               "query_started_at": query_started_at, "completed_at": utc_iso(),
+                               "claim_scope": "non_atomic_response_intervals", **self._scope_observations.get(scope, {})}
                 result["watermark_candidates"][scope] = outcome["query_started_at"]
             except Exception as exc:
-                state = self.checkpoint_store.scope_state(scope)
+                state = checkpoint.scope_state(scope) if checkpoint else None
                 context = {"scope": scope, "attempt_id": state["attempt_id"] if state else None,
-                           "query_started_at": state["query_started_at"] if state else None}
+                           "query_started_at": state["query_started_at"] if state else query_started_at}
                 status = "failed"
                 if isinstance(exc, APIRequestDeferred):
                     self._deferred = exc
                     status = "deferred"
                 elif isinstance(exc, _ScopeCapped):
                     status = "capped"
+                elif isinstance(exc, _PaginationDrift):
+                    status = "partial_drift"
                 elif isinstance(exc, (CheckpointError, FileNotFoundError)):
                     status = "checkpoint_invalid"
                 elif len(self.records) > record_start and self.records[-1].get("status") in (404, 410):
@@ -704,10 +808,8 @@ class GitHubAPI:
                     outcome.update(retry_not_before=exc.retry_not_before, lane_wide=exc.lane_wide, reason=exc.reason)
                     result["deferred"] = {"retry_not_before": exc.retry_not_before,
                                           "reason": exc.reason, "lane_wide": exc.lane_wide}
-                if state is not None:
-                    self.checkpoint_store.append("scope_failed", outcome)
-                else:
-                    self.checkpoint_store.append("scope_not_started", outcome)
+                if checkpoint is not None:
+                    checkpoint.append("scope_failed" if state is not None else "scope_not_started", outcome)
                 result["failures"].append(f"{scope}: {outcome['error']}")
                 value = None
             finally:
@@ -717,8 +819,8 @@ class GitHubAPI:
             return value
 
         def public_metadata(metadata):
-            if (metadata.get("private") is not False or type(metadata.get("id")) is not int or
-                    metadata["id"] != self.checkpoint_store.repository_id):
+            if (metadata.get("private") is not False or type(metadata.get("id")) is not int or metadata["id"] <= 0 or
+                    (checkpoint is not None and metadata["id"] != checkpoint.repository_id)):
                 raise RuntimeError("Repository visibility/identity does not match bound public repository")
 
         metadata = run("repository_metadata", "", kind="object", validate=public_metadata)
@@ -732,11 +834,36 @@ class GitHubAPI:
                 if self._deferred is not None:
                     outcome.update(status="deferred", retry_not_before=self._deferred.retry_not_before,
                                    lane_wide=True)
-                self.checkpoint_store.append("scope_not_started", outcome)
+                if checkpoint is not None:
+                    checkpoint.append("scope_not_started", outcome)
                 result["scopes"][name] = result["scope_statuses"][name] = outcome
             return result
+        result["repository_id"] = metadata["id"]
         result["repository_full_name"] = metadata.get("full_name")
         self._repository_ids[prefix.lower()] = str(metadata["id"])
+        pr_disabled = metadata.get("has_pull_requests") is False
+        issue_comments_disabled = metadata.get("has_issues") is False and pr_disabled
+        metadata_records = [record for record in self.records if record.get("purpose") == "repository_metadata"]
+        metadata_record = metadata_records[-1] if metadata_records else {}
+        if checkpoint is not None:
+            metadata_state = checkpoint.scope_state("repository_metadata")
+            metadata_record = checkpoint.response(metadata_state["pages"][0]["response_sequence"])
+        metadata_evidence = {key: metadata_record[key] for key in (
+            "body_sha256", "request_started_at", "request_completed_at", "checkpoint_provenance") if key in metadata_record}
+        metadata_evidence["scope"] = "repository_metadata"
+        result["repository_capabilities"] = {"has_issues": metadata.get("has_issues"),
+                                               "has_pull_requests": metadata.get("has_pull_requests"),
+                                               "metadata_evidence": metadata_evidence}
+
+        def unavailable(scope, *, reason="repository_pull_requests_disabled", capabilities=None):
+            outcome = {"scope": scope, "status": "unavailable", "reason": reason,
+                       "capability": {**(capabilities or {"has_pull_requests": False}), "metadata_evidence": metadata_evidence},
+                       "claim_scope": "API surface unavailable; no inference of historical absence"}
+            if checkpoint is not None:
+                checkpoint.append("scope_unavailable", outcome)
+            result["scopes"][scope] = result["scope_statuses"][scope] = outcome
+            result["unavailable_scopes"][scope] = outcome
+            return None
         ordered = {"state": "all", "sort": "updated", "direction": "desc"}
         comments = {"sort": "updated", "direction": "desc"}
         definitions = [("events", "/events", {})] if mode == "events" else [
@@ -757,8 +884,14 @@ class GitHubAPI:
             def public_release(items):
                 if any(item.get("draft") is True for item in items):
                     raise RuntimeError("Nonpublic draft release; refuse collection result")
-            items = run(name, route, params, boundary=boundary if name == "pulls" else None,
-                        validate=public_release if name == "releases" else None)
+            if pr_disabled and name in ("pulls", "review_comments"):
+                items = unavailable(name)
+            elif issue_comments_disabled and name == "issue_comments":
+                items = unavailable(name, reason="repository_issues_and_pull_requests_disabled",
+                                    capabilities={"has_issues": False, "has_pull_requests": False})
+            else:
+                items = run(name, route, params, boundary=boundary if name == "pulls" else None,
+                            validate=public_release if name == "releases" else None)
             if name in parent_issues:
                 deep_requested = deep_full or (mode == "delta" and boundary is not None)
                 if deep_requested:
@@ -767,9 +900,9 @@ class GitHubAPI:
                 parent_outcome.update(
                     query_mode="delta" if boundary is not None else ("full_shallow_repair" if mode == "delta" else "full"),
                     deep_selection="explicit_deep_full" if deep_full else (
-                        "bounded_delta_items" if deep_requested else "not_requested_for_full_listing"),
-                    selected_deep_item_count=0, skipped_historical_deep_count=0)
+                        "bounded_delta_items" if deep_requested else "not_requested_for_full_listing"))
                 if items is not None:
+                    parent_outcome.update(selected_deep_item_count=0, skipped_historical_deep_count=0)
                     for item in items:
                         number = item.get("number")
                         if type(number) is not int:
@@ -798,11 +931,15 @@ class GitHubAPI:
             for number in sorted(changed_issues):
                 name = f"issue_timeline:{number}"
                 timeline_scopes.append(name)
-                run(name, f"/issues/{number}/timeline")
+                if pr_disabled and number in changed_pulls:
+                    unavailable(name)
+                else:
+                    run(name, f"/issues/{number}/timeline")
             for number in sorted(changed_pulls):
                 detail_name = f"pull_detail:{number}"
                 pull_scopes.append(detail_name)
-                detail = run(detail_name, f"/pulls/{number}", kind="object")
+                detail = (unavailable(detail_name) if pr_disabled else
+                          run(detail_name, f"/pulls/{number}", kind="object"))
                 for endpoint in ("reviews", "commits", "files"):
                     name = f"pull_{endpoint}:{number}"
                     pull_scopes.append(name)
@@ -813,7 +950,10 @@ class GitHubAPI:
                                 raise RuntimeError("PR detail unavailable; cannot establish endpoint cap")
                             if detail.get(key, len(items)) > cap:
                                 raise _ScopeCapped(f"PR {number}: {endpoint} endpoint limited to {cap}")
-                    run(name, f"/pulls/{number}/{endpoint}", validate=endpoint_cap)
+                    if pr_disabled:
+                        unavailable(name)
+                    else:
+                        run(name, f"/pulls/{number}/{endpoint}", validate=endpoint_cap)
             # A parent cursor also selects its deep repair work. Advancing it
             # past an incomplete child could make that unchanged item disappear
             # from all later delta queries once the overlap window expires.
@@ -846,86 +986,15 @@ class GitHubAPI:
             for name in ("deep_issue_timeline", "deep_pull_details"):
                 result["scopes"][name] = {"count": 0, "status": "NOT_COLLECTED"}
             result["warnings"].append("Full scan did not include per-item timelines/reviews; use --deep-full")
+        if pr_disabled and mode != "events":
+            unavailable("deep_pull_details")
         return result
 
     def collect(self, slug: str, mode: str, since: str | None = None,
                 deep_full: bool = False) -> dict:
-        """Report collections by scope. Metadata and per-request times are always archived."""
-        prefix = f"/repos/{slug}"
-        result: dict[str, Any] = {"mode": mode, "since": since, "scopes": {}, "warnings": []}
-        metadata = self.get_json(prefix, "repository_metadata")
-        if metadata.get("private") is not False:
-            raise RuntimeError("Refusing any non-public repository (or unknown visibility)")
-        if not isinstance(metadata.get("id"), int):
-            raise RuntimeError("No stable GitHub numeric repository ID")
-        result["repository_id"] = metadata["id"]
-        result["repository_full_name"] = metadata.get("full_name")
-        if mode == "events":
-            scopes = [("events", "/events", {})]
-        else:
-            p = {"state": "all", "sort": "updated", "direction": "desc"}
-            if mode == "delta" and since is not None:
-                issue_params = {**p, "since": since}
-                comment_params = {"sort": "updated", "direction": "desc", "since": since}
-            else:
-                issue_params = p
-                comment_params = {"sort": "updated", "direction": "desc"}
-            scopes = [
-                ("issues", "/issues", issue_params),
-                ("pulls", "/pulls", p),
-                ("issue_comments", "/issues/comments", comment_params),
-                ("review_comments", "/pulls/comments", comment_params),
-                ("releases", "/releases", {}),
-                ("tags", "/tags", {}),
-                ("events", "/events", {}),
-            ]
-        changed_issue_nums: set[int] = set()
-        changed_pull_nums: set[int] = set()
-        for name, route, params in scopes:
-            stop_at = parse_github_time(since) if name == "pulls" and mode == "delta" and since else None
-            items = self.list_pages(prefix + route, name, params=params, updated_before=stop_at)
-            result["scopes"][name] = {"count": len(items), "status": "complete_for_query"}
-            if name == "issues":
-                for item in items:
-                    if isinstance(item.get("number"), int):
-                        changed_issue_nums.add(item["number"])
-                        if "pull_request" in item:
-                            changed_pull_nums.add(item["number"])
-            if name == "pulls":
-                for item in items:
-                    if isinstance(item.get("number"), int):
-                        # PR API has no since parameter; the boundary page may contain older items.
-                        if mode == "delta" and since is not None and (
-                            not isinstance(item.get("updated_at"), str) or
-                            parse_github_time(item["updated_at"]) < parse_github_time(since)
-                        ):
-                            continue
-                        changed_pull_nums.add(item["number"])
-                        changed_issue_nums.add(item["number"])
-            if name == "releases" and any(item.get("draft") is True for item in items):
-                raise RuntimeError("Nonpublic draft release in authenticated response; refuse publication/collection result")
-            if name == "events":
-                result["scopes"][name]["interpretation"] = "OPPORTUNISTIC_NOT_COMPLETE"
-                if len(items) >= 300:
-                    result["warnings"].append("Events API reached its 300-item observation window")
-        if mode != "events" and (mode == "delta" or deep_full):
-            # In full mode, deep coverage is explicit and can be expensive.
-            for n in sorted(changed_issue_nums):
-                self.list_pages(f"{prefix}/issues/{n}/timeline", f"issue_timeline:{n}")
-            for n in sorted(changed_pull_nums):
-                detail = self.get_json(f"{prefix}/pulls/{n}", f"pull_detail:{n}")
-                self.list_pages(f"{prefix}/pulls/{n}/reviews", f"pull_reviews:{n}")
-                commits = self.list_pages(f"{prefix}/pulls/{n}/commits", f"pull_commits:{n}")
-                files = self.list_pages(f"{prefix}/pulls/{n}/files", f"pull_files:{n}")
-                # Documented GitHub endpoint caps; never mark a capped list complete.
-                if detail.get("commits", len(commits)) > 250:
-                    raise RuntimeError(f"PR {n}: commits endpoint limited to 250; full commit graph required")
-                if detail.get("changed_files", len(files)) > 3000:
-                    raise RuntimeError(f"PR {n}: files endpoint limited to 3000; alternate evidence required")
-            result["scopes"]["deep_issue_timeline"] = {"count": len(changed_issue_nums), "status": "complete_for_enumerated_issues"}
-            result["scopes"]["deep_pull_details"] = {"count": len(changed_pull_nums), "status": "complete_for_enumerated_pulls"}
-        elif mode == "full":
-            result["scopes"]["deep_issue_timeline"] = {"count": 0, "status": "NOT_COLLECTED"}
-            result["scopes"]["deep_pull_details"] = {"count": 0, "status": "NOT_COLLECTED"}
-            result["warnings"].append("Full scan did not include per-item timelines/reviews; use --deep-full in a rate-budgeted backfill")
-        return result
+        """Collect independent scopes; callers must propagate returned failures.
+
+        Successful scopes remain reviewable when a later endpoint fails. A
+        declared disabled PR API is capability-unavailable, never an empty list.
+        """
+        return self._collect_scopes(slug, mode, since, deep_full, checkpointed=False)

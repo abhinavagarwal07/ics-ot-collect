@@ -6,15 +6,17 @@
 
 The first four completed captures took 63–183 seconds. These small early targets do not establish an ETA for large repositories. The CSV's approximately 30.88 GiB is a declared GitHub repository-size metric, not a measured archive or peak-disk bound.
 
+Future baseline dispatches expose validated integer `max_parallel` from 1 through 16, defaulting to 8. The plan records it and the matrix consumes that output. The currently pinned run `40275429320` remains at 4; changing workflow source does not alter running jobs. Eight workers share the configured public-read token's 5,000-request hourly allowance, rather than receiving 5,000 requests each. Destination Release writes keep their separate workflow-token allowance. Concurrency does not enforce budget admission: the initial baseline has its one-time 100-GB allowance; future recurring collection retains the separate 50-GB UTC-month policy.
+
 ## Limits that matter
 
 | Limit | Consequence |
 | --- | --- |
 | Included minutes/spend and account concurrency | These belong to the repository owner's user/organization account and are shared across its repositories. The triggering actor and the 185 public targets do not supply separate allowances. |
 | Six hours per hosted job; 35 days per workflow | A multi-job baseline may exceed six hours overall. Each configured job remains below the hosted ceiling. |
-| 256 jobs per matrix | 185 capture jobs fit. Four-way parallelism shares account capacity with other workflows. |
+| 256 jobs per matrix | 185 capture jobs fit. Configured parallelism shares account capacity with other workflows. |
 | Private standard Ubuntu: 2 CPUs, 8 GB RAM, 14 GB SSD | Process one repository per runner. Mirrors, temporary bundles, CAS objects, restore scratch space and XZ parts can coexist. |
-| `GITHUB_TOKEN`: 1,000 REST calls/hour per source workflow repository | Four jobs share this allowance; adding workers does not multiply it. Release operations also need capacity. |
+| Configured public-read token: 5,000 REST calls/hour; fallback `GITHUB_TOKEN`: 1,000/hour per execution repository | All workers share the applicable allowance; adding workers does not multiply it. Release operations retain their separate workflow-token capacity. |
 | Secondary limits, including content-generating requests | Bound upload concurrency and obey server deferrals; primary capacity remaining does not exclude secondary throttling. |
 | Release: 1,000 assets, each under 2 GiB | Use at most 1 GiB per archive part and count indexes/inventory as assets too. |
 

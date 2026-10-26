@@ -25,6 +25,7 @@ A research paper must not misrepresent this starter as a complete, unattended re
 
 **P0 — implement before making strong scientific completeness/timing claims**
 
+- [ ] Atomic storage admission/accounting for the one-time 100,000,000,000-byte initial baseline allowance (all retained attempts, partials, retries and metadata) and the separate future recurring 50,000,000,000-byte UTC-month policy. These limits are policy, not runtime enforcement. No automatic increase or evidence deletion is authorized.
 - [x] Persistent SQLite repository/lane queue and individual API page/item-scope checkpoints. Deep scopes resume within their durable capture; a separate research metadata database remains future work.
 - [ ] Full rate-limit controller: primary/secondary budget, `Retry-After` (seconds AND HTTP-date), `X-RateLimit-Reset`, `X-Poll-Interval`, adaptive polling, separate concurrency caps. Current client has bounded retries, but not a full policy controller.
 - [x] Explicit resumable endpoint outcomes, including complete, failed, capped, non-atomic, not attempted and deferred results, with scope-specific watermarks and no false deletion inferences.

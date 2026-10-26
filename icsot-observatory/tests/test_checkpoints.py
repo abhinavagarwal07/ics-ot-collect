@@ -139,7 +139,7 @@ def test_repeated_first_page_drift_has_bounded_restart_budget(tmp_path):
     api, cp, _ = client(tmp_path, moving)
     result = api.collect_resumable("test/repo", "events")
     assert reads == 4
-    assert result["scopes"]["events"]["status"] == "failed"
+    assert result["scopes"]["events"]["status"] == "partial_drift"
     assert "restart budget exhausted" in result["failures"][0]
     assert "events" not in result["watermark_candidates"]
     assert len([event for event in cp.events if event["kind"] == "scope_abandoned"]) == 1
@@ -600,3 +600,75 @@ def test_primary_reserve_deferral_honors_announced_distant_reset(tmp_path, monke
     assert calls == [METADATA]
     assert result["deferred"]["retry_not_before"] == 4001
     assert cp.events[-2]["kind"] == "rate_deferral"
+
+
+def test_resume_accepts_representation_change_without_relabeling_original_page(tmp_path):
+    old_body = b'[{"id":1,"nested":{"count":10}}]'
+    fresh_body = b'[{"id":1,"nested":{"count":11}}]'
+    def interrupted(url):
+        if url == METADATA:
+            return Reply(PUBLIC)
+        if url == EVENTS:
+            return Reply(old_body, LINK)
+        raise Crash()
+    api, cp, _ = client(tmp_path, interrupted)
+    with pytest.raises(Crash):
+        api.collect_resumable("test/repo", "events")
+    original_query_start = cp.scope_state("events")["query_started_at"]
+    original_record = next(record for record in api.records if record["url"] == EVENTS)
+    def repaired(url):
+        return Reply(fresh_body, LINK) if url == EVENTS else Reply(b'[{"id":2}]')
+    retry, cp, calls = client(tmp_path, repaired)
+    result = retry.collect_resumable("test/repo", "events")
+    assert calls == [EVENTS, SECOND, EVENTS]
+    assert result["watermark_candidates"]["events"] == original_query_start
+    assert result["scopes"]["events"]["representation_changed_during_validation"] is True
+    assert not any(event["kind"] == "scope_abandoned" for event in cp.events)
+    original_page = cp.response(cp.scope_state("events")["pages"][0]["response_sequence"])
+    assert original_page["body_sha256"] == original_record["body_sha256"]
+    assert original_page["request_started_at"] == original_record["request_started_at"]
+    assert original_page["request_completed_at"] == original_record["request_completed_at"]
+    assert retry.store.get(original_page["body_sha256"]) == old_body
+    assert retry.store.get(sha256(fresh_body)) == fresh_body
+
+
+def test_malformed_json_diagnostic_is_durable_before_retry_and_survives_crash(tmp_path):
+    reads = 0
+    bad = b'[{"id":'
+    def interrupted(url):
+        nonlocal reads
+        if url == METADATA:
+            return Reply(PUBLIC)
+        reads += 1
+        if reads == 1:
+            return Reply(bad)
+        disk = CheckpointStore(tmp_path, 42, "capture-1")
+        event = disk.events[-1]
+        assert event["kind"] == "response_decode_error"
+        original = disk.response(event["data"]["response_sequence"])
+        assert original["status"] == 200
+        assert ObjectStore(tmp_path).get(original["body_sha256"]) == bad
+        raise Crash()
+    api, _, _ = client(tmp_path, interrupted)
+    with pytest.raises(Crash):
+        api.collect_resumable("test/repo", "events")
+    retry, cp, calls = client(tmp_path, lambda url: Reply(b'[{"id":1}]'))
+    result = retry.collect_resumable("test/repo", "events")
+    assert calls == [EVENTS]
+    assert result["failures"] == []
+    assert len(result["decode_errors"]) == 1
+    assert retry.store.get(result["decode_errors"][0]["body_sha256"]) == bad
+    assert len(cp.scope_state("events")["pages"]) == 1
+
+
+def test_bound_identity_get_json_persists_decode_annotation_even_outside_scope(tmp_path):
+    reads = 0
+    def handler(url):
+        nonlocal reads
+        reads += 1
+        return Reply(b"{") if reads == 1 else Reply(PUBLIC)
+    api, cp, _ = client(tmp_path, handler)
+    assert api.get_json("/repos/test/repo", "repository_identity")["id"] == 42
+    errors = [event for event in cp.events if event["kind"] == "response_decode_error"]
+    assert len(errors) == 1
+    assert cp.response(errors[0]["data"]["response_sequence"])["purpose"] == "repository_identity"

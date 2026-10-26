@@ -85,3 +85,27 @@ def test_reused_slug_does_not_silently_swap_repo_id(tmp_path):
     with patch("icsot_observer.pipeline.GitHubAPI.get_json", fake_new_identity):
         assert collect_one(cfg, "test/repo", "full", stamp=False)["status"] == "identity_error"
     assert len(list((tmp_path / "runs" / "17").glob("*.manifest.json"))) == 1
+
+
+def test_legacy_delta_rechecks_full_after_capability_unavailable_then_advances_only_qualified_cursor(tmp_path):
+    cfg, calls = make_config(tmp_path), []
+
+    def availability(api, slug, mode, since=None, deep_full=False):
+        calls.append((mode, since))
+        scopes = {name: {"status": "complete_for_query", "count": 0}
+                  for name in ("issues", "pulls", "issue_comments", "review_comments", "releases", "tags", "events")}
+        if len(calls) == 1:
+            for name in ("pulls", "review_comments"):
+                scopes[name] = {"status": "unavailable", "reason": "repository_pull_requests_disabled"}
+        return {"repository_id": 17, "scopes": scopes, "scope_statuses": scopes, "failures": []}
+
+    with patch("icsot_observer.pipeline.GitHubAPI.get_json", fake_identity), \
+         patch("icsot_observer.pipeline.GitHubAPI.collect", availability), \
+         patch("icsot_observer.pipeline.collect_git", return_value=None):
+        first = collect_one(cfg, "test/repo", "full", stamp=False)
+        second = collect_one(cfg, "test/repo", "delta", stamp=False)
+        third = collect_one(cfg, "test/repo", "delta", stamp=False)
+    assert all(info["status"] == "complete" for info in (first, second, third))
+    assert calls[0] == calls[1] == ("full", None)
+    assert calls[2][0] == "delta" and calls[2][1] is not None
+    assert json.loads(Path(second["manifest"]).read_bytes())["mode"] == "full"

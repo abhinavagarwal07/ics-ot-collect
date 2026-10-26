@@ -6,6 +6,8 @@ The [original baseline](https://github.com/abhinavagarwal07/ics-ot-collect/actio
 
 This choice starts capture without a new provider account. Releases have no automatic expiry configured by this project. Owner deletion remains possible, and an independent backup is still an open requirement.
 
+The initial 185-repository baseline has an explicitly approved one-time allowance of **100,000,000,000 stored bytes**, covering all retained attempts, partial outcomes, retries and metadata across its releases. The 2026-10-26 audit observed approximately **48.93 GB of Release assets across three baseline releases**; that measurement excludes other working copies and Git storage. GitHub documents no additional total-size limit for Releases, alongside its 1,000-assets-per-release and under-2-GiB-per-asset limits. This does not authorize automatic growth beyond the baseline allowance. Future recurring collection retains its separate 50,000,000,000-byte UTC-month policy. Runtime admission enforcement is not implemented; indefinite retention and no automatic deletion remain unchanged. [GitHub Release storage quotas](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)
+
 ## Alternatives reviewed
 
 | Storage | Decision |
@@ -18,13 +20,13 @@ This choice starts capture without a new provider account. Releases have no auto
 | Backblaze B2 | Approximately $4.10/month for 600 GB after the storage allowance; free downloads up to three times average monthly storage, then charges apply. |
 | S3 Standard, us-east-1 | Approximately $13.80/month for 600 GB; internet egress can dominate. Attractive if the collection host is EC2 in the same region. |
 
-Prices checked 2026-10-25, for storage only; operation charges, transfer limits, taxes and later growth may change the comparison. At 50 GB of actual new stored bytes per month, 600 GB is the approximate footprint after twelve months, rather than the average first-year footprint. The baseline is counted within the monthly evidence allowance.
+Prices checked 2026-10-25, for storage only; operation charges, transfer limits, taxes and later growth may change the comparison. Future recurring growth of 50 GB per month would add approximately 600 GB after twelve months; the initial baseline has its separate one-time 100-GB allowance. Additional copies and operational state need separate accounting.
 
 Sources: [repository limits](https://docs.github.com/en/repositories/creating-and-managing-repositories/repository-limits), [large files](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github), [release limits](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases), [LFS billing](https://docs.github.com/en/billing/concepts/product-billing/git-lfs), [Actions artifacts](https://docs.github.com/en/actions/tutorials/store-and-share-data), [R2 pricing](https://developers.cloudflare.com/r2/pricing/), [B2 pricing](https://www.backblaze.com/cloud-storage/pricing), [S3 pricing](https://aws.amazon.com/s3/pricing/).
 
 ## Baseline workflow
 
-The manual `Corpus baseline (one time)` workflow plans all 185 repositories in CSV order and captures at most four simultaneously. Each target attempts shallow full REST collection, advertised branch/tag/PR-head Git history, a portable full bundle, integrity verification and pending OpenTimestamps receipts. The workflow preserves partial outcomes and marks missing transfers explicitly.
+The manual `Corpus baseline (one time)` workflow plans all 185 repositories in CSV order. Future dispatches validate integer `max_parallel` from 1 through 16, defaulting to 8; the matrix consumes that validated value. Run `40275429320` keeps its pinned limit of 4. Each target attempts shallow full REST collection, advertised branch/tag/PR-head Git history, a portable full bundle, integrity verification and pending OpenTimestamps receipts. Shared API/upload quotas and the applicable storage allowance still apply; concurrency does not multiply capacity or enforce budget admission.
 
 Each archive contains source/configuration hashes, request and outcome reports, raw evidence, manifests, receipts and the portable bundle. Verified bundles replace the disposable mirror in the retained package. Archive parts carry individual SHA-256 digests; a per-repository index is uploaded after its parts. The aggregate inventory lists all 185 dispositions. A draft release is published after all capture jobs terminate, including when some captures are incomplete.
 

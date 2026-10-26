@@ -12,6 +12,7 @@ def make_observations(root: Path, destination: Path) -> dict:
     store = ObjectStore(root)
     destination.parent.mkdir(parents=True, exist_ok=True)
     records = 0
+    skipped_invalid_responses = []
     with destination.open("w", newline="", encoding="utf-8") as fd:
         writer = csv.DictWriter(fd, fieldnames=[
             "repository_id", "run_id", "run_status", "mode", "scope", "entity_id", "entity_number",
@@ -30,7 +31,14 @@ def make_observations(root: Path, destination: Path) -> dict:
                 raw = store.get(response["body_sha256"])
                 try:
                     obj = json.loads(raw)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    skipped_invalid_responses.append({
+                        "repository_id": man["repository_id"], "run_id": man["run_id"],
+                        "manifest": path.relative_to(root).as_posix(), "scope": purpose,
+                        "raw_response_sha256": response["body_sha256"],
+                        "reason": "invalid_text_encoding" if isinstance(error, UnicodeDecodeError) else "invalid_json",
+                        "encoding": getattr(error, "encoding", None),
+                    })
                     continue
                 objects = obj if isinstance(obj, list) else [obj] if isinstance(obj, dict) else []
                 for entry in objects:
@@ -51,4 +59,6 @@ def make_observations(root: Path, destination: Path) -> dict:
                         "raw_status": response["status"],
                     })
                     records += 1
-    return {"records": records, "destination": str(destination)}
+    return {"records": records, "destination": str(destination),
+            "skipped_invalid_response_count": len(skipped_invalid_responses),
+            "skipped_invalid_responses": skipped_invalid_responses}

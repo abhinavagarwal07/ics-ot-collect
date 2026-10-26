@@ -18,6 +18,8 @@ See [the first live libfuse validation](docs/LIBFUSE_VALIDATION.md) for measured
 
 The manual `Corpus baseline (one time)` workflow preserves full bundles, raw evidence and partial outcomes in **encrypted Release assets**. It verifies up to 16 explicit parents in priority order, freezes that ordered set for finalization, and reuses accepted captures with their original code, index and encrypted transport references. New captures publish their UTC interval, immutable `.ots` receipt and canonical attestation sidecar; one finalizer catalog registers them for proof maintenance. Older reused indexes without public proof sidecars remain valid with an explicit backfill gap. The retained-evidence RSA private key stays local; resumable working state uses a separate operational key. See [encryption and restoration](docs/ENCRYPTION.md). Repository collection has no recurring schedule.
 
+Future baseline dispatches accept integer `max_parallel` from 1 through 16, defaulting to 8; only the validated plan output controls the matrix. Existing runs keep their pinned limit. Workers share API/upload quotas. The initial baseline's one-time 100-GB allowance and future recurring 50-GB UTC-month policy are separate, and runtime budget admission is not implemented. See [storage policy](docs/STORAGE.md) and [Actions operations](docs/ACTIONS_OPERATIONS.md).
+
 ## Quickstart
 
 Requirements: Linux/macOS, Python >=3.11, Git, OpenTimestamps CLI (`ots`) from [official client](https://github.com/opentimestamps/opentimestamps-client). For local development tests `ots` can be omitted using `--no-stamp`. Prefer a narrowly scoped **read-only** GitHub App/token restricted to public repositories; `GITHUB_TOKEN` is read from your environment, never stored in run manifests.

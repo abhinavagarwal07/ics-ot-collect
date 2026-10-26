@@ -38,6 +38,8 @@ CAPTURE_TIMEOUT_SECONDS = 120 * 60
 VERIFICATION_TIMEOUT_SECONDS = 20 * 60
 RESULTS_PUBLIC_KEY = Path(__file__).resolve().parents[1] / "keys/results-rsa-public.pem"
 MAX_PARENT_RELEASES = 16
+DEFAULT_MAX_PARALLEL = 8
+MAX_PARALLEL_LIMIT = 16
 SCOPE = (
     "One initial public GitHub observation: shallow full REST listings, advertised "
     "branch/tag/pull-head Git refs and reachable Git objects. Per-item historical "
@@ -595,6 +597,9 @@ def parent_capture_outcomes_many(config: Config, sources: dict, repository: str,
 
 
 def plan(args) -> int:
+    max_parallel = getattr(args, "max_parallel", DEFAULT_MAX_PARALLEL)
+    if type(max_parallel) is not int or not 1 <= max_parallel <= MAX_PARALLEL_LIMIT:
+        raise ValueError(f"max_parallel must be an integer between 1 and {MAX_PARALLEL_LIMIT}")
     config, sources = load_sources(args.config, args.csv)
     parent_tags = requested_parent_tags(args)
     inherited = parent_capture_outcomes_many(config, sources, args.release_repository, parent_tags) if parent_tags else {}
@@ -602,6 +607,7 @@ def plan(args) -> int:
     outputs = {"matrix": json.dumps({"include": [{"slug": slug, "key": repository_key(slug)} for slug in remaining]},
                                     separators=(",", ":")),
                "remaining_count": len(remaining), "inherited_complete_count": len(config.repositories) - len(remaining),
+               "max_parallel": max_parallel,
                "parent_release_tags": json.dumps(parent_tags, separators=(",", ":")),
                **sources}
     if args.github_output:
@@ -612,6 +618,7 @@ def plan(args) -> int:
         write_once(args.plan_output, canonical_json({
             "schema_version": 1, "planned_at": utc_iso(), "release_repository": getattr(args, "release_repository", None),
             "parent_release_tags": parent_tags, **sources,
+            "max_parallel": max_parallel,
             "reused_repository_count": outputs["inherited_complete_count"],
             "remaining_count": len(remaining), "remaining_repositories": remaining,
             "reused_captures": [inherited[slug] for slug in config.repositories if inherited.get(slug, {}).get("complete")],
@@ -916,6 +923,8 @@ def main(argv=None) -> int:
             child.add_argument("--github-output", type=Path)
             child.add_argument("--release-repository")
             child.add_argument("--plan-output", type=Path, help="Create-only local audit of all reused references and remaining targets")
+            child.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL,
+                               help=f"Capture worker limit, integer 1..{MAX_PARALLEL_LIMIT} (default {DEFAULT_MAX_PARALLEL})")
         else:
             child.add_argument("--release-tag", required=True)
             child.add_argument("--release-repository", required=True)

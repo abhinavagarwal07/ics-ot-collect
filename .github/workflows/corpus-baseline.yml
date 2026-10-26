@@ -4,6 +4,11 @@ name: Corpus baseline (one time)
 on:
   workflow_dispatch:
     inputs:
+      max_parallel:
+        description: 'Concurrent captures: integer 1–16; shares API/upload quotas'
+        required: false
+        default: 8
+        type: number
       parent_release_tag:
         description: 'Optional prior baseline release; reuse only verified complete captures'
         required: false
@@ -35,6 +40,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       remaining_count: ${{ steps.plan.outputs.remaining_count }}
       parent_release_tags: ${{ steps.plan.outputs.parent_release_tags }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
       release_tag: ${{ steps.release.outputs.release_tag }}
     steps:
       - name: Check out collector
@@ -59,6 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PARENT_RELEASE_TAG: ${{ inputs.parent_release_tag }}
           ADDITIONAL_PARENT_RELEASE_TAGS: ${{ inputs.additional_parent_release_tags }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
         run: |
           python - <<'PY'
           import os, subprocess, sys
@@ -66,7 +73,8 @@ jobs:
               *os.environ.get("ADDITIONAL_PARENT_RELEASE_TAGS", "").split(",")] if tag.strip()]
           command = [sys.executable, "scripts/capture_baseline.py", "plan", "--config", "config.corpus.toml",
               "--csv", "../public_patch_corpus_185.csv", "--github-output", os.environ["GITHUB_OUTPUT"],
-              "--plan-output", "analysis/baseline-plan/resume-plan.json"]
+              "--plan-output", "analysis/baseline-plan/resume-plan.json",
+              "--max-parallel", os.environ.get("MAX_PARALLEL", "8")]
           if parents:
               command += ["--release-repository", os.environ["GITHUB_REPOSITORY"]]
           for position, tag in enumerate(parents):
@@ -83,6 +91,7 @@ jobs:
           PARENT_RELEASE_TAGS_JSON: ${{ steps.plan.outputs.parent_release_tags }}
           INHERITED_COMPLETE_COUNT: ${{ steps.plan.outputs.inherited_complete_count }}
           REMAINING_COUNT: ${{ steps.plan.outputs.remaining_count }}
+          MAX_PARALLEL: ${{ steps.plan.outputs.max_parallel }}
         run: |
           set -euo pipefail
           release_tag="corpus-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -98,6 +107,7 @@ jobs:
           Ordered verified parent release set: $PARENT_RELEASE_TAGS_JSON
           Verified complete parent captures referenced: $INHERITED_COMPLETE_COUNT
           Targets selected for this run: $REMAINING_COUNT
+          Validated concurrent capture limit: $MAX_PARALLEL
 
           Accepted parent captures remain in the parent release and are referenced by the final inventory with their original collector commit and index hash. Incomplete parent outcomes are retried.
 
@@ -117,7 +127,7 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: Capture ${{ matrix.slug }}
     steps:

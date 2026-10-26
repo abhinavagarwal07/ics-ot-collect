@@ -51,6 +51,16 @@ def prior_manifest(root: Path, repo_id: int, *, successful_only: bool = False) -
     return None
 
 
+def _legacy_api_cursor_qualified(manifest: dict[str, Any]) -> bool:
+    """A global delta boundary requires every base listing, not just run success."""
+    api = manifest.get("api") or {}
+    if api.get("failures") or api.get("watermark_withheld") or api.get("unavailable_scopes"):
+        return False
+    scopes = api.get("scope_statuses") or api.get("scopes") or {}
+    required = ("issues", "pulls", "issue_comments", "review_comments", "releases", "tags", "events")
+    return all(scopes.get(name, {}).get("status") == "complete_for_query" for name in required)
+
+
 @contextmanager
 def manifest_append_lock(root: Path, repo_id: int):
     """Serialize only immutable manifest allocation, never network or stamping."""
@@ -869,7 +879,7 @@ def collect_one(config: Config, slug: str, mode: str, *, deep_full: bool = False
     previous = prior_manifest(config.root, repo_id)
     previous_success = prior_manifest(config.root, repo_id, successful_only=True)
     since = None
-    if mode == "delta" and previous_success:
+    if mode == "delta" and previous_success and _legacy_api_cursor_qualified(previous_success[0]):
         last = parse_github_time(previous_success[0]["started_at"])
         since = (last - timedelta(hours=config.overlap_hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
     effective_mode = "full" if mode == "delta" and since is None else mode
@@ -879,6 +889,7 @@ def collect_one(config: Config, slug: str, mode: str, *, deep_full: bool = False
                              deep_full=deep_full if effective_mode == "full" else True)
         if result["repository_id"] != repo_id:
             raise RuntimeError("Repository identity changed during collection")
+        failures.extend(result.get("failures", []))
     except Exception as e:
         failures.append(f"api: {type(e).__name__}: {e}")
     if effective_mode != "events":

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from icsot_observer.core import Config, ObjectStore, parse_github_time
+from icsot_observer.core import Config, ObjectStore, parse_github_time, sha256
 from icsot_observer.github import GitHubAPI, NoRedirect, Response
 
 
@@ -32,7 +32,7 @@ def test_pages_and_stop_at_older_updated_date(tmp_path):
     assert [x["id"] for x in items] == [1, 2]
 
 
-def test_detects_first_page_drift(tmp_path):
+def test_first_page_membership_drift_restarts_once_without_stitching(tmp_path):
     client = api(tmp_path)
     first = "https://api.github.com/repos/test/repo/issues?per_page=100"
     second = first + "&page=2"
@@ -46,8 +46,9 @@ def test_detects_first_page_drift(tmp_path):
             body, headers = b'[{"id":4}]', {}
         return Response(body, {"headers": headers, "body_sha256": client.store.put(body)})
     client.get = fake_get
-    with pytest.raises(RuntimeError, match="non-atomic"):
-        client.list_pages("/repos/test/repo/issues", "issues")
+    assert [item["id"] for item in client.list_pages("/repos/test/repo/issues", "issues")] == [9, 4]
+    assert seen["first"] == 4
+    assert client.store.get(sha256(b'[{"id":3}]')) == b'[{"id":3}]'
 
 
 def test_numeric_repository_pagination_follows_opaque_link_and_rechecks_first_page(tmp_path):

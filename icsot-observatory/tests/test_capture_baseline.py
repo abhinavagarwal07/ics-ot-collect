@@ -49,6 +49,11 @@ def args_for(tmp_path, config, csv):
     )
 
 
+@pytest.fixture
+def ots_dependency():
+    pytest.importorskip("opentimestamps.core.timestamp", reason="real public OTS fixture requires the pinned optional client")
+
+
 def test_draft_release_lookup_falls_back_to_authenticated_listing(monkeypatch):
     expected = {"id": 123, "tag_name": "corpus-baseline-1-1", "draft": True}
     def fake_gh(*args, **kwargs):
@@ -187,6 +192,19 @@ def test_encryption_failure_never_uploads_plaintext(tmp_path, monkeypatch):
     assert any("Encryption:" in message for message in index["errors"])
 
 
+def pending_ots_receipt(digest):
+    pytest.importorskip("opentimestamps.core.timestamp")
+    from opentimestamps.core.notary import PendingAttestation
+    from opentimestamps.core.op import OpSHA256
+    from opentimestamps.core.serialize import StreamSerializationContext
+    from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
+    stamp = Timestamp(bytes.fromhex(digest))
+    stamp.attestations.add(PendingAttestation("https://calendar.example.invalid"))
+    serialized = io.BytesIO()
+    DetachedTimestampFile(OpSHA256(), stamp).serialize(StreamSerializationContext(serialized))
+    return serialized.getvalue()
+
+
 def make_portable_capture(config, slug, mode, **kwargs):
     """No network: a real Git graph/bundle and canonical collector manifest."""
     source = config.root.parent / "synthetic-origin"
@@ -223,16 +241,7 @@ def make_portable_capture(config, slug, mode, **kwargs):
     path.parent.mkdir(parents=True)
     path.write_bytes(canonical_json(manifest))
     proof = Path(str(path) + ".ots")
-    pytest.importorskip("opentimestamps.core.timestamp")
-    from opentimestamps.core.notary import PendingAttestation
-    from opentimestamps.core.op import OpSHA256
-    from opentimestamps.core.serialize import StreamSerializationContext
-    from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
-    stamp = Timestamp(bytes.fromhex(hashlib.sha256(path.read_bytes()).hexdigest()))
-    stamp.attestations.add(PendingAttestation("https://calendar.example.invalid"))
-    serialized = io.BytesIO()
-    DetachedTimestampFile(OpSHA256(), stamp).serialize(StreamSerializationContext(serialized))
-    proof.write_bytes(serialized.getvalue())
+    proof.write_bytes(pending_ots_receipt(hashlib.sha256(path.read_bytes()).hexdigest()))
     initial = config.root / "proofs/initial/initial.ots"
     initial.parent.mkdir(parents=True)
     initial.write_bytes(proof.read_bytes())
@@ -241,7 +250,7 @@ def make_portable_capture(config, slug, mode, **kwargs):
             "repository_id": 17, "run_id": "synthetic", "proof": str(proof), "immutable_initial_proof": str(initial)}
 
 
-def test_complete_capture_omits_verified_mirror_and_restores_offline(tmp_path, monkeypatch):
+def test_complete_capture_omits_verified_mirror_and_restores_offline(tmp_path, monkeypatch, ots_dependency):
     config, csv, config_obj, identities = sources(tmp_path)
     args = args_for(tmp_path, config, csv)
     monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config_obj, identities))
@@ -513,6 +522,8 @@ def test_phase_deadline_restores_elapsed_previous_timer(monkeypatch):
 
 @pytest.mark.parametrize("phase", ["collection", "verification"])
 def test_deadline_transfers_partial_outcome_and_index(tmp_path, monkeypatch, phase):
+    if phase == "verification":
+        pytest.importorskip("opentimestamps.core.timestamp")
     config, csv, config_obj, identities = sources(tmp_path)
     args = args_for(tmp_path, config, csv)
     monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config_obj, identities))
@@ -569,6 +580,7 @@ def test_resume_plan_keeps_full_cohort_but_skips_only_verified_parent(tmp_path, 
     outputs = dict(line.split("=", 1) for line in args.github_output.read_text().splitlines())
     assert outputs["cohort_count"] == "2" and outputs["inherited_complete_count"] == "1"
     assert outputs["remaining_count"] == "1"
+    assert outputs["max_parallel"] == "8"
     assert [row["slug"] for row in json.loads(outputs["matrix"])["include"]] == ["example/two"]
 
 
@@ -850,7 +862,102 @@ def test_multi_parent_tampered_index_is_not_accepted_and_never_downloads_payload
     assert plan["reused_captures"][0]["source_release_tag"] == tags[1]
 
 
-def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and_idempotent(tmp_path, monkeypatch):
+@pytest.mark.parametrize("value", [1, 8, 16])
+def test_plan_records_validated_concurrency_in_job_output_and_frozen_artifact(tmp_path, monkeypatch, value):
+    args, _, _, _, _, _, _, _, _, _ = multi_parent_fixture(tmp_path, monkeypatch)
+    args.max_parallel, args.github_output = value, tmp_path / "github-output"
+    assert baseline.plan(args) == 0
+    outputs = dict(line.split("=", 1) for line in args.github_output.read_text().splitlines())
+    artifact = json.loads(args.plan_output.read_bytes())
+    assert outputs["max_parallel"] == str(value) and artifact["max_parallel"] == value
+    assert artifact["reused_repository_count"] == 2
+    assert artifact["remaining_repositories"] == ["example/three"]
+
+
+@pytest.mark.parametrize("value", [0, -1, 17, True, 8.5, "8", None])
+def test_invalid_concurrency_is_rejected_before_source_or_network_reads(monkeypatch, value):
+    monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: pytest.fail("Invalid dispatch input reached source reads"))
+    with pytest.raises(ValueError, match="max_parallel must be an integer"):
+        baseline.plan(argparse.Namespace(max_parallel=value))
+
+
+def test_cli_rejects_fractional_concurrency_before_planning(monkeypatch):
+    monkeypatch.setattr(baseline, "plan", lambda *a: pytest.fail("Fractional concurrency reached plan"))
+    with pytest.raises(SystemExit) as error:
+        baseline.main(["plan", "--config", "unused", "--csv", "unused", "--max-parallel", "8.5"])
+    assert error.value.code == 2
+
+
+def test_scope_failure_preserves_later_api_bytes_and_verified_git_but_baseline_stays_partial(tmp_path, monkeypatch, ots_dependency):
+    from icsot_observer import gitstore, pipeline
+    _, _, config, identities = sources(tmp_path, ("example/one",))
+    args = args_for(tmp_path, tmp_path / "config.toml", tmp_path / "cohort.csv")
+    monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config, identities))
+    origin = tmp_path / "origin"
+    run_git(["init", "-b", "main", str(origin)])
+    run_git(["-C", str(origin), "config", "user.email", "test@example.invalid"])
+    run_git(["-C", str(origin), "config", "user.name", "Test"])
+    (origin / "retained.txt").write_text("verified reachable Git bytes\n")
+    run_git(["-C", str(origin), "add", "."])
+    run_git(["-C", str(origin), "commit", "-m", "baseline"])
+
+    def local_git(arguments, **kwargs):
+        arguments = list(arguments)
+        if arguments[0] == "ls-remote":
+            arguments[1] = str(origin)
+        elif len(arguments) > 2 and arguments[2] == "fetch" and "origin" in arguments:
+            arguments[arguments.index("origin")] = str(origin)
+        return run_git(arguments, **kwargs)
+
+    monkeypatch.setattr(gitstore, "run_git", local_git)
+
+    def record(api, purpose, body, status):
+        api.records.append({"purpose": purpose, "status": status, "body_sha256": api.store.put(body), "body_bytes": len(body),
+                            "request_started_at": "2026-10-20T00:00:00Z", "request_completed_at": "2026-10-20T00:00:01Z"})
+
+    def identity(api, path, purpose):
+        body = b'{"id":17,"private":false,"full_name":"example/one"}'
+        record(api, purpose, body, 200)
+        return json.loads(body)
+
+    def partial_api(api, slug, mode, since=None, deep_full=False):
+        record(api, "issues", b'{"message":"temporary failure"}', 500)
+        record(api, "releases", b'[{"id":42,"name":"later metadata survived"}]', 200)
+        scopes = {"issues": {"status": "failed"}, "releases": {"status": "complete_for_query", "count": 1}}
+        return {"repository_id": 17, "scopes": scopes, "scope_statuses": scopes, "failures": ["issues: HTTP 500"]}
+
+    monkeypatch.setattr(pipeline.GitHubAPI, "get_json", identity)
+    monkeypatch.setattr(pipeline.GitHubAPI, "collect", partial_api)
+    original_run = subprocess.run
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "/test/ots")
+
+    def synthetic_calendar(arguments, **kwargs):
+        if arguments[0] != "/test/ots":
+            return original_run(arguments, **kwargs)
+        manifest = Path(arguments[-1])
+        Path(str(manifest) + ".ots").write_bytes(pending_ots_receipt(hashlib.sha256(manifest.read_bytes()).hexdigest()))
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(pipeline.subprocess, "run", synthetic_calendar)
+    uploads = []
+    monkeypatch.setattr(baseline, "upload_asset", lambda tag, path, repository: uploads.append(path))
+    assert baseline.capture(args) == 2
+    index = json.loads(uploads[-1].read_bytes())
+    assert index["status"] == "incomplete" and index["capture_accepted"] is False
+    assert index["collector_result"]["status"] == "partial"
+    assert index["collector_result"]["failures"] == ["issues: HTTP 500"]
+    assert index["verification"]["ok"] is True
+    assert index["verification"]["partial_runs"] == 1
+    assert index["verification"]["portable_git_bundles_verified"] == index["verification"]["git_repositories_verified"] == 1
+    assert index["verification"]["raw_observations"] == 3
+    work = args.work_root / baseline.repository_key(args.slug) / "evidence"
+    manifest = json.loads(Path(index["collector_result"]["manifest"]).read_bytes())
+    assert manifest["api"]["scopes"]["releases"]["count"] == 1
+    assert any(b"later metadata survived" in ObjectStore(work).get(item["body_sha256"]) for item in manifest["responses"])
+    assert any(item["status"] == 500 for item in manifest["responses"])
+
+
+def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and_idempotent(tmp_path, monkeypatch, ots_dependency):
     from icsot_observer.attestations import inspect_ots_receipt
     from icsot_observer.proof_maintenance import empty_state
     _, _, config, identities = sources(tmp_path, ("example/one",))
