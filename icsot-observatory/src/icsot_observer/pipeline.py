@@ -1081,7 +1081,8 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                           max_restored_state_plaintext_bytes: int | None = None,
                           history_policy: dict | None = None,
                           logical_root: Path | None = None, rfc3161_url: str | None = None,
-                          rfc3161_ca: Path | None = None, rfc3161_chain: Path | None = None) -> dict[str, Any]:
+                          rfc3161_ca: Path | None = None, rfc3161_chain: Path | None = None,
+                          publication_controller: Any = None) -> dict[str, Any]:
     """Selected-repository hosted run: restore, collect, publish evidence, CAS state.
 
     The operational state recipient differs from the owner-only evidence recipient.
@@ -1142,6 +1143,8 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                 catalog.get("slug") != slug or catalog.get("evidence_recipient_spki_sha256") != evidence_recipient):
             raise RuntimeError("Authenticated evidence catalog does not match selected repository/recipient")
         exports = Path(temporary) / "exports"
+        if publication_controller is not None:
+            publication_controller.before_capture(root=root)
         collection = run_persistent(config, once=True, deep_full=deep_full, stamp=stamp,
                                     export_directory=exports, public_key=evidence_public_key,
                                     verified_prior_indexes=[entry["index"] for entry in catalog["exports"]],
@@ -1152,6 +1155,18 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                                     history_policy=history_policy,
                                     rfc3161_url=rfc3161_url, rfc3161_ca=rfc3161_ca, rfc3161_chain=rfc3161_chain)
         release_tag = f"collector-observations-r{repository_id}-g{uuid.uuid4().hex}"
+        if publication_controller is not None:
+            publication_controller.capture_completed(collection=collection, release_tag=release_tag, exports=exports)
+        def publish_call(operation, *args, **kwargs):
+            if publication_controller is None:
+                return operation(*args, **kwargs)
+            return publication_controller.perform(operation, *args, **kwargs)
+
+        def upload_asset(name, source):
+            if publication_controller is None:
+                return transport.upload_asset(release_tag, name, source)
+            return publication_controller.upload(transport, release_tag, name, source)
+
         dependencies, uploaded_evidence_bytes = [], 0
         proof_registration = None
         uploaded_assets: dict[str, dict] = {}
@@ -1161,7 +1176,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
             index = json.loads(index_path.read_bytes())
             if index["manifest_sha256"] in known:
                 continue
-            transport.ensure_release(release_tag)
+            publish_call(transport.ensure_release, release_tag)
             assets = []
             # Immutable encrypted payloads precede their public index, and every
             # dependency is remotely verified by backend.publish before pointer CAS.
@@ -1175,7 +1190,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                     if uploaded_assets[asset["name"]] != ref:
                         raise RuntimeError("Conflicting immutable asset name within evidence generation")
                 else:
-                    transport.upload_asset(release_tag, asset["name"], source)
+                    upload_asset(asset["name"], source)
                     uploaded_assets[asset["name"]] = ref
                     dependencies.append(ref)
                     uploaded_evidence_bytes += asset["bytes"]
@@ -1202,21 +1217,21 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                       "indexes": [entry["index"] for entry in publication_observations]}
             marker_path = exports / "metadata-catalog.json"
             write_once(marker_path, canonical_json(marker))
-            transport.upload_asset(release_tag, marker_path.name, marker_path)
+            upload_asset(marker_path.name, marker_path)
             marker_ref = {"release_tag": release_tag, "name": marker_path.name,
                           "ciphertext_sha256": _file_sha256(marker_path), "ciphertext_bytes": marker_path.stat().st_size}
             dependencies.append(marker_ref)
             uploaded_evidence_bytes += marker_ref["ciphertext_bytes"]
             catalog.setdefault("publication_markers", []).append(marker_ref)
             verified_marker = Path(temporary) / "verified-public-marker.json"
-            transport.download_asset(release_tag, marker_path.name, verified_marker)
+            publish_call(transport.download_asset, release_tag, marker_path.name, verified_marker)
             if (_file_sha256(verified_marker) != marker_ref["ciphertext_sha256"] or
                     verified_marker.stat().st_size != marker_ref["ciphertext_bytes"]):
                 raise RuntimeError("Public metadata catalog differs from the uploaded completion marker")
             # Import only after all immutable public evidence is remotely
             # available. Failure keeps the previous working-state pointer.
             from .proof_maintenance import register_catalog
-            proof_registration = register_catalog(transport, _public_asset_ref(marker_ref))
+            proof_registration = publish_call(register_catalog, transport, _public_asset_ref(marker_ref))
         raw_catalog = canonical_json(catalog)
         temporary_catalog = root / (".transfer-catalog-" + uuid.uuid4().hex + ".tmp")
         try:
@@ -1244,7 +1259,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
         source_dir = Path(__file__).parent
         code_hashes = {path.name: _file_sha256(path) for path in source_dir.glob("*.py")}
         code_hashes["collector_commit"] = code_sha
-        publication = backend.publish(selection, dependencies=dependencies, quiescent=True,
+        publication_options = dict(dependencies=dependencies, quiescent=True,
                                       code_hashes=code_hashes,
                                       config_hashes={"source_sha256": config_source_sha256,
                                                      "selected_public_config_sha256": sha256(canonical_json(_public_config(config))),
@@ -1254,6 +1269,10 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                                       evidence_heads={"catalog_sha256": sha256(raw_catalog),
                                                       "export_manifest_sha256": sorted(known),
                                                       "proof_registration": proof_registration})
+        if publication_controller is None:
+            publication = backend.publish(selection, **publication_options)
+        else:
+            publication = publication_controller.publish_state(backend, selection, publication_options)
     publication_summary = {key: value for key, value in publication.items() if key != "pointer"}
     for field in ("snapshot_started_at", "snapshot_sealed_at", "clock_source"):
         publication_summary[field] = publication["pointer"][field]

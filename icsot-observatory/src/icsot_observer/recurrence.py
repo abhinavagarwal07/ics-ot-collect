@@ -68,7 +68,8 @@ def load_cohort(config_path: Path, csv_path: Path, *, expected_count: int = 185)
 
 def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
                pointer_loader, cold_bootstraps: int = 0, now: float | None = None,
-               history_settings: dict | None = None, resource_limits: dict | None = None) -> dict:
+               history_settings: dict | None = None, resource_limits: dict | None = None,
+               migration_pending_slugs: set[str] | None = None) -> dict:
     if type(cold_bootstraps) is not int or not 0 <= cold_bootstraps <= MAX_COLD_BOOTSTRAPS:
         raise ValueError("cold_bootstraps must be an integer from 0 through 8")
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", code_sha):
@@ -114,7 +115,7 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
         try:
             raw = pointer_loader(repo_id)
             if raw is None:
-                row["plan_status"] = "bootstrap_pending"
+                row["plan_status"] = "migration_pending" if slug in (migration_pending_slugs or set()) else "bootstrap_pending"
             else:
                 pointer = json.loads(raw)
                 if (not isinstance(pointer, dict) or canonical_json(pointer) != raw or
@@ -257,6 +258,9 @@ def main(argv=None) -> int:
     if args.command == "plan":
         transport = GhCliStateTransport(args.destination_repository)
         head = transport.branch_head()
+        from .legacy_bootstrap import GitHubMigrationLedger
+        active_migration = GitHubMigrationLedger(transport).active_plan()
+        covered_by_migration = set((active_migration or {}).get("covered_slugs", []))
         with tempfile.TemporaryDirectory(prefix="icsot-plan-identity-") as temporary:
             identity_config = replace(config, root=Path(temporary))
             api = GitHubAPI(identity_config, ObjectStore(identity_config.root), [], defer_on_rate=True)
@@ -264,7 +268,7 @@ def main(argv=None) -> int:
                               identity_loader=lambda slug: api.get_json(f"/repos/{slug}", "recurring_plan_identity"),
                               pointer_loader=lambda repo_id: transport.read_pointer(head, repo_id) if head else None,
                               cold_bootstraps=args.cold_bootstraps, history_settings=history_settings,
-                              resource_limits=resource_limits)
+                              resource_limits=resource_limits, migration_pending_slugs=covered_by_migration)
         raw = canonical_json(plan)
         if len(raw) > MAX_PLAN_BYTES:
             raise ValueError("Recurring metadata plan exceeds its 1-MiB bound")

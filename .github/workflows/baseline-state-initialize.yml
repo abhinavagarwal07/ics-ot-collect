@@ -1,0 +1,165 @@
+name: Initialize operational state from retained baselines
+
+on:
+  schedule:
+    - cron: '47 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      catalog_ref:
+        description: 'Published immutable capsule-catalog AssetRef JSON; blank retries the active full migration plan'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: persistent-collection
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      planned_count: ${{ steps.plan.outputs.planned_count }}
+      plan_ref: ${{ steps.plan.outputs.plan_ref }}
+      plan_sha256: ${{ steps.plan.outputs.plan_sha256 }}
+      code_sha: ${{ steps.plan.outputs.code_sha }}
+    steps:
+      - name: Check out reviewed migration planner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Freeze all 185 dispositions or resume every unfinished eligible source
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          CATALOG_REF: ${{ inputs.catalog_ref }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          command = [sys.executable, "-m", "icsot_observer.legacy_bootstrap", "plan",
+              "--config", "config.corpus.toml", "--csv", "../public_patch_corpus_185.csv",
+              "--code-sha", os.environ["GITHUB_SHA"],
+              "--destination-repository", os.environ["GITHUB_REPOSITORY"],
+              "--output", "analysis/legacy-state-plan/migration-plan.json",
+              "--github-output", os.environ["GITHUB_OUTPUT"]]
+          if os.environ.get("CATALOG_REF", "").strip():
+              command += ["--catalog-ref", os.environ["CATALOG_REF"], "--activate"]
+          raise SystemExit(subprocess.call(command))
+          PY
+
+  initialize:
+    needs: plan
+    if: ${{ needs.plan.outputs.planned_count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    name: Initialize ${{ matrix.slug }}
+    concurrency:
+      group: persistent-selected-id-${{ matrix.repository_id }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out the immutable plan's importer revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.code_sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector and pinned timestamp client for the three explicit fresh repairs
+        run: python -m pip install --disable-pip-version-check -e . opentimestamps-client==0.7.2
+      - name: Fetch only the immutable public migration plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          PLAN_REF: ${{ needs.plan.outputs.plan_ref }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from icsot_observer.core import write_once
+          from icsot_observer.legacy_bootstrap import GitHubSourceReader
+          raw = GitHubSourceReader().metadata(json.loads(os.environ["PLAN_REF"]))
+          write_once(Path(os.environ["RUNNER_TEMP"]) / "legacy-migration-plan.json", raw)
+          PY
+      - name: Materialize only the existing operational private key
+        env:
+          COLLECTOR_STATE_PRIVATE_KEY: ${{ secrets.COLLECTOR_STATE_PRIVATE_KEY }}
+        run: |
+          set +x
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          key = os.environ.get("COLLECTOR_STATE_PRIVATE_KEY", "")
+          if not key.strip():
+              raise SystemExit("Operational state key is required; owner evidence private keys stay local")
+          path = Path(os.environ["RUNNER_TEMP"]) / "legacy-operational-private.pem"
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w") as output:
+              output.write(key)
+              output.flush()
+              os.fsync(output.fileno())
+          PY
+      - name: Authenticate the selected legacy archive, seed fresh operational state and publish one prepared generation
+        id: initialize
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          CAPTURE_SLUG: ${{ matrix.slug }}
+          REPOSITORY_ID: ${{ matrix.repository_id }}
+          IMPORTER_CODE_SHA: ${{ needs.plan.outputs.code_sha }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+        run: |
+          set +x
+          trap 'rm -f "$RUNNER_TEMP/legacy-operational-private.pem"' EXIT
+          python -m icsot_observer.legacy_bootstrap run \
+            --config config.corpus.toml --csv ../public_patch_corpus_185.csv \
+            --destination-repository "$GITHUB_REPOSITORY" \
+            --plan "$RUNNER_TEMP/legacy-migration-plan.json" --plan-sha256 "$PLAN_SHA256" \
+            --slug "$CAPTURE_SLUG" --code-sha "$IMPORTER_CODE_SHA" \
+            --state-private-key "$RUNNER_TEMP/legacy-operational-private.pem" \
+            --state-public-key keys/working-state-rsa-public.pem \
+            --evidence-public-key keys/results-rsa-public.pem \
+            --rfc3161-url http://timestamp.digicert.com \
+            --rfc3161-ca keys/digicert-trusted-root-g4.pem \
+            --rfc3161-chain keys/digicert-timestamp-2025-intermediate.pem \
+            --max-runtime-seconds 19800 \
+            --output "analysis/legacy-state-outcomes/r${REPOSITORY_ID}-run${GITHUB_RUN_ID}-attempt${GITHUB_RUN_ATTEMPT}.json"
+      - name: Preserve bounded migration outcome metadata
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legacy-state-outcome-${{ matrix.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: icsot-observatory/analysis/legacy-state-outcomes/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove runner operational key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/legacy-operational-private.pem"
+      - name: Expose deferred and repair outcomes in the job conclusion
+        if: ${{ always() && steps.initialize.outcome != 'success' }}
+        run: exit 2
