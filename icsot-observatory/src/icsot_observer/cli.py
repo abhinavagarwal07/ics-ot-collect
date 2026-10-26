@@ -100,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             return 130
         print(json.dumps(result, indent=2))
-        return 0 if not result["partial_captures"] and not any(
+        return 0 if result.get("current_observation", {}).get("status", "complete") == "complete" and not result["partial_captures"] and not any(
             count for state, count in result["queue"]["states"].items() if state != "complete") else 2
     if args.command == "github-run":
         from .github_state import StateDeferredError
@@ -128,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
             return 75
         print(json.dumps(result, indent=2))
         collection = result["collection"]
-        return 0 if not collection["partial_captures"] and not any(
+        return 0 if collection.get("current_observation", {}).get("status", "complete") == "complete" and not collection["partial_captures"] and not any(
             count for state, count in collection["queue"]["states"].items() if state != "complete") else 2
     if args.command == "verify":
         result = verify_all(Path(args.root), check_git=not args.skip_git, check_ots=args.check_ots)

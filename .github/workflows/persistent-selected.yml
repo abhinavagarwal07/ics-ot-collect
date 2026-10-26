@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: persistent-selected-${{ inputs.repository }}
+  group: persistent-collection
   cancel-in-progress: false
 
 defaults:

@@ -76,6 +76,9 @@ class Config:
     primary_rate_wait_seconds: int = 0
     primary_rate_reserve: int = 0
     secondary_rate_wait_seconds: int = 900
+    history_profile: str = "full_history"
+    history_window_days: int = 730
+    history_cutoff_utc: str | None = None
 
     @classmethod
     def load(cls, filename: str | Path) -> "Config":
@@ -103,6 +106,19 @@ class Config:
         secondary_rate_wait_seconds = int(c.get("secondary_rate_wait_seconds", 900))
         if secondary_rate_wait_seconds < 0:
             raise ValueError("secondary_rate_wait_seconds must be nonnegative")
+        history_profile = c.get("history_profile", "full_history")
+        history_window_days = int(c.get("history_window_days", 730))
+        history_cutoff_utc = c.get("history_cutoff_utc")
+        if history_profile not in ("full_history", "recent_history_shallow_v1") or history_window_days != 730:
+            raise ValueError("Unknown history profile or unreviewed recent-history window")
+        if history_profile != "full_history" and not history_cutoff_utc:
+            raise ValueError("Recent history requires an explicit frozen UTC cutoff")
+        if history_cutoff_utc is not None:
+            cutoff = datetime.fromisoformat(history_cutoff_utc.replace("Z", "+00:00"))
+            if cutoff.tzinfo is None or cutoff.utcoffset().total_seconds() != 0:
+                raise ValueError("Recent-history cutoff must be explicitly UTC")
+            if history_profile == "full_history":
+                raise ValueError("Full history does not accept a recent-history cutoff")
         return cls(root=root, repositories=repos, api_version=version,
                    user_agent=c["user_agent"], token_env=c["token_env"],
                    http_timeout_seconds=int(c.get("http_timeout_seconds", 35)),
@@ -111,7 +127,9 @@ class Config:
                    max_pages=int(c.get("max_pages", 10000)),
                    primary_rate_wait_seconds=primary_rate_wait_seconds,
                    primary_rate_reserve=primary_rate_reserve,
-                   secondary_rate_wait_seconds=secondary_rate_wait_seconds)
+                   secondary_rate_wait_seconds=secondary_rate_wait_seconds,
+                   history_profile=history_profile, history_window_days=history_window_days,
+                   history_cutoff_utc=history_cutoff_utc)
 
 
 class ObjectStore:

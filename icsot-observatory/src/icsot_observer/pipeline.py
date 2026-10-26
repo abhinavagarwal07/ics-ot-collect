@@ -169,6 +169,8 @@ def append_capture_manifest(config: Config, capture: dict[str, Any]) -> dict[str
             "capture_payload_sha256": capture_digest,
             "repository_input_slug": capture["slug"], "repository_id": repo_id,
             "expected_repository_id": capture.get("expected_repository_id"),
+            "working_state_origin": capture.get("working_state_origin"),
+            "history_policy": capture.get("history_policy"),
             "mode": capture["mode"], "requested_mode": capture["requested_mode"],
             "status": "partial" if capture["failures"] else "complete",
             "started_at": capture["started_at"], "finished_at": capture["finished_at"],
@@ -318,6 +320,8 @@ def capture_lane(config: Config, job: Any, queue: Any) -> dict[str, Any]:
         "lane": job.lane, "requested_mode": job.mode, "mode": job.mode,
         "collector_version": __version__,
         "expected_repository_id": job.payload.get("expected_repository_id"),
+        "working_state_origin": job.payload.get("working_state_origin"),
+        "history_policy": job.payload.get("history_policy"),
         "started_at": started, "responses": records, "failures": [],
         "public_config": _public_config(config),
         "rfc3161_policy": job.payload.get("rfc3161_policy"),
@@ -769,6 +773,8 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                    verified_prior_indexes: list[dict[str, Any]] | None = None,
                    expected_repository_ids: dict[str, int] | None = None,
                    observation_key: str | None = None, controller_locked: bool = False,
+                   working_state_origin: str | None = None,
+                   history_policy: dict | None = None,
                    rfc3161_url: str | None = None, rfc3161_ca: Path | None = None,
                    rfc3161_chain: Path | None = None) -> dict[str, Any]:
     """Run durable independent lanes on an existing trusted persistent root.
@@ -800,6 +806,8 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                                 git_interval_seconds=git_interval_seconds,
                                 poll_interval_seconds=poll_interval_seconds, deep_full=deep_full, stamp=stamp,
                                 expected_repository_ids=expected_repository_ids or {}, observation_key=observation_key,
+                                working_state_origin=working_state_origin,
+                                history_policy=history_policy,
                                 timestamp_policy=timestamp_policy)
 
 
@@ -807,7 +815,8 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
                      api_workers: int, git_workers: int, api_interval_seconds: int,
                      git_interval_seconds: int, poll_interval_seconds: float,
                      deep_full: bool, stamp: bool, expected_repository_ids: dict[str, int],
-                     observation_key: str | None, timestamp_policy: dict | None) -> dict[str, Any]:
+                     observation_key: str | None, timestamp_policy: dict | None,
+                     working_state_origin: str | None = None, history_policy: dict | None = None) -> dict[str, Any]:
     frozen = _public_config(config)
     input_hash = sha256(canonical_json({"config": frozen, "deep_full": deep_full,
                                      "expected_repository_ids": expected_repository_ids,
@@ -833,6 +842,10 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
                 if (slug, lane, capture_id) in known:
                     continue
                 extra = {"schedule_slot": slot}
+                if working_state_origin:
+                    extra["working_state_origin"] = working_state_origin
+                if history_policy:
+                    extra["history_policy"] = history_policy
                 if observation_key:
                     extra["observation_key"] = observation_key
                 if slug in expected_repository_ids:
@@ -847,11 +860,39 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
                                                                       exporter=exporter),
                                    api_workers=api_workers, git_workers=git_workers, controller_locked=True)
         completed_ids = {item["job_id"] for item in result["results"]}
+        attempted_ids = completed_ids | {item["job_id"] for item in result["errors"]}
+        current_jobs, older_attempts = [], []
+        for job in queue.jobs():
+            expected_slot = int(now // (api_interval_seconds if job.lane == "api" else git_interval_seconds))
+            current = (job.input_hash == input_hash and (
+                job.payload.get("observation_key") == observation_key if observation_key else
+                job.payload.get("schedule_slot") == expected_slot))
+            if current:
+                current_jobs.append(job)
+            elif job.id in attempted_ids:
+                older_attempts.append(job)
+
+        def outcome(job):
+            captured = job.result if isinstance(job.result, dict) else {}
+            return {"capture_id": job.capture_id, "slug": job.slug, "lane": job.lane, "state": job.state,
+                    "observation_key": job.payload.get("observation_key"),
+                    "schedule_slot": job.payload.get("schedule_slot"),
+                    "status": "partial" if captured.get("failures") else job.state,
+                    "failure_count": len(captured.get("failures", [])),
+                    "started_at": captured.get("started_at"), "finished_at": captured.get("finished_at")}
+
         partial = [{"capture_id": job.capture_id, "slug": job.slug, "lane": job.lane,
-                    "failures": job.result["failures"]} for job in queue.jobs()
-                   if job.id in completed_ids and isinstance(job.result, dict) and job.result.get("failures")]
+                    "failures": job.result["failures"]} for job in current_jobs
+                   if job.state == "complete" and isinstance(job.result, dict) and job.result.get("failures")]
+        observed_lanes = {(job.slug, job.lane) for job in current_jobs}
+        missing = [{"slug": slug, "lane": lane} for slug in config.repositories for lane in ("api", "git")
+                   if (slug, lane) not in observed_lanes]
+        current_complete = not missing and not partial and all(job.state == "complete" for job in current_jobs)
+        current_observation = {"observation_key": observation_key, "status": "complete" if current_complete else "partial",
+                               "lane_outcomes": [outcome(job) for job in current_jobs], "missing_lanes": missing}
         report = {"runtime": result, "queue": queue.status(), "root": str(config.root),
-                  "partial_captures": partial}
+                  "partial_captures": partial, "current_observation": current_observation,
+                  "resumed_older_captures": [outcome(job) for job in older_attempts]}
         if once:
             return report
         print(json.dumps({"persistent_cycle": report}, sort_keys=True), flush=True)
@@ -1007,16 +1048,21 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                           code_sha: str, config_source_sha256: str,
                           observation_key: str | None = None, deep_full: bool = False,
                           stamp: bool = True, transport: Any = None,
+                          allow_bootstrap: bool = True, require_planned_state: bool = False,
+                          expected_state_pointer_sha256: str | None = None,
+                          max_restored_state_plaintext_bytes: int | None = None,
+                          history_policy: dict | None = None,
                           logical_root: Path | None = None, rfc3161_url: str | None = None,
                           rfc3161_ca: Path | None = None, rfc3161_chain: Path | None = None) -> dict[str, Any]:
     """Selected-repository hosted run: restore, collect, publish evidence, CAS state.
 
-    This intentionally has no cohort dispatch, cron, or storage-cap claim. The
-    operational state recipient differs from the owner-only evidence recipient.
+    The operational state recipient differs from the owner-only evidence recipient.
+    Recurring callers additionally bind the planned pointer and explicitly allow
+    a fresh public bootstrap; selected manual callers retain their existing path.
     """
     from .core import REPO_RE
     from .encryption import _fingerprint, _load_private_key, public_key_fingerprint
-    from .github_state import GhCliStateTransport, GitHubStateStore
+    from .github_state import GhCliStateTransport, GitHubStateStore, StateConflictError, StateError
     from .runtime import ControllerLock
     if slug not in config.repositories or type(repository_id) is not int or repository_id <= 0:
         raise ValueError("Select one declared repository and its positive numeric ID")
@@ -1034,11 +1080,30 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
         raise ValueError("Operational private key does not match the working-state recipient")
     root = Path(logical_root or f"/tmp/icsot-persistent-state/{repository_id}").resolve()
     config = replace(config, root=root, repositories=(slug,))
+    if history_policy:
+        # Large profiles remain excluded by the recurring planner until the Git
+        # and API implementations pass their independent validation.
+        if history_policy.get("profile") != "full_history":
+            raise ValueError("Recent-history capture profile is not enabled yet")
+        config = replace(config, history_profile=history_policy["profile"],
+                         history_cutoff_utc=history_policy.get("cutoff_utc"))
     transport = transport or GhCliStateTransport(destination_repository)
     backend = GitHubStateStore(transport, repository_id=repository_id, slug=slug,
                                public_key=state_public_key, private_key=state_private_key, logical_root=root)
     with ControllerLock(root), tempfile.TemporaryDirectory(prefix=f"icsot-transfers-{repository_id}-") as temporary:
         selection = backend.read()
+        pointer_digest = sha256(canonical_json(selection.pointer)) if selection.pointer else None
+        if require_planned_state and pointer_digest != expected_state_pointer_sha256:
+            raise StateConflictError("Selected state changed after immutable recurring planning")
+        if selection.pointer is None and not allow_bootstrap:
+            raise StateError("bootstrap_pending: fresh public bootstrap was not explicitly selected")
+        if max_restored_state_plaintext_bytes is not None:
+            if type(max_restored_state_plaintext_bytes) is not int or max_restored_state_plaintext_bytes < 1:
+                raise ValueError("Positive selected-state restore limit required")
+            state_bytes = sum(item["bytes"] for item in (selection.index or {}).get("files", []))
+            if state_bytes > max_restored_state_plaintext_bytes:
+                raise StateError("Selected state exceeds the per-job restore limit")
+        working_state_origin = "resumed_authenticated_state" if selection.pointer else "fresh_public_bootstrap"
         restore_report = backend.restore(selection)
         catalog_path = root / "transfer-catalog.json"
         catalog = json.loads(catalog_path.read_bytes()) if catalog_path.exists() else {
@@ -1054,6 +1119,8 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                                     verified_prior_indexes=[entry["index"] for entry in catalog["exports"]],
                                     expected_repository_ids={slug: repository_id},
                                     observation_key=observation_key or run_id(), controller_locked=True,
+                                    working_state_origin=working_state_origin,
+                                    history_policy=history_policy,
                                     rfc3161_url=rfc3161_url, rfc3161_ca=rfc3161_ca, rfc3161_chain=rfc3161_chain)
         release_tag = f"collector-observations-r{repository_id}-g{uuid.uuid4().hex}"
         dependencies, uploaded_evidence_bytes = [], 0
@@ -1162,11 +1229,12 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
     for field in ("snapshot_started_at", "snapshot_sealed_at", "clock_source"):
         publication_summary[field] = publication["pointer"][field]
     return {"repository_id": repository_id, "slug": slug, "collection": collection,
+            "working_state_origin": working_state_origin,
             "restore": restore_report, "publication": publication_summary,
             "new_evidence_upload_bytes": uploaded_evidence_bytes,
             "proof_maintenance_registration": proof_registration or {"status": "no_new_catalog"},
             "monthly_cap_enforced": False,
-            "deployment_scope": "one manually selected repository; no recurring schedule"}
+            "deployment_scope": "one selected repository; scheduling is controlled by the caller"}
 
 
 def _public_asset_ref(ref: dict) -> dict:

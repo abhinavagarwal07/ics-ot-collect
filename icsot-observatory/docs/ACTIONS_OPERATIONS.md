@@ -2,7 +2,7 @@
 
 ## Active baseline
 
-[Run 40249527444](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40249527444) started at 2026-10-26 00:28 UTC from collector commit `796c6b4764f6eac27bd444f3fc06bca114a4dc00` and was canceled. Retained payloads are migrated into encrypted replacements before public exposure. The resumed workflow skips verified complete parent captures and encrypts new payloads before upload. Captures have a 180-minute job timeout; finalization has 90 minutes. **No recurring interval is enabled.** A code fix pushed afterward does not change an already-running checkout.
+[Run 40249527444](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40249527444) started at 2026-10-26 00:28 UTC from collector commit `796c6b4764f6eac27bd444f3fc06bca114a4dc00` and was canceled. Retained payloads are migrated into encrypted replacements before public exposure. The resumed workflow skips verified complete parent captures and encrypts new payloads before upload. Captures have a 180-minute job timeout; finalization has 90 minutes. That baseline had no recurring interval. A code fix pushed afterward does not change an already-running checkout.
 
 The first four completed captures took 63–183 seconds. These small early targets do not establish an ETA for large repositories. The CSV's approximately 30.88 GiB is a declared GitHub repository-size metric, not a measured archive or peak-disk bound.
 
@@ -61,7 +61,7 @@ Standard Ubuntu runners in a **public execution repository** have free compute u
 | Deadline, disk full, OOM, cancellation or runner loss | A process can be killed before cleanup/upload. Missing indexes remain missing/incomplete; `finally` is not a durability guarantee. |
 | Finalizer failure after inventory upload or publication | Recover by reconciling the existing inventory and source identities, reusing its bytes and completing publication idempotently. Never replace evidence with a freshly generated conflicting inventory. |
 
-Durable per-scope pagination, resumable large metadata backfills, a shared API controller and recovery from arbitrary runner loss remain implementation work. A six-hour cron would not resolve these gaps. Keep persistent Git state and use incremental archive dependencies before enabling recurrence.
+The [six-hour cohort workflow](PERSISTENT.md#six-hour-cohort-workflow) now uses durable scope checkpoints, authenticated per-repository encrypted working state and incremental archive dependencies. Its immutable plan includes all 185 entries, while only existing-state repositories and up to eight explicit cold bootstraps run that cycle. API/Git jobs remain independent inside one per-repository publisher. Eight matrix slots share the source PAT and destination repository quotas; monthly admission is not enforced. Public partial/paused outcomes and bootstrap-pending entries preserve the distinction between scheduled eligibility and completed coverage.
 
 The hardened helper limits collection to 120 minutes and verification to 20 minutes, leaving approximately 40 minutes within the 180-minute job for packaging and transfer. Disk capacity and tool versions are recorded. This improves orderly timeout handling; all compressed parts still stage locally, and additional transfer waits or forced termination can exceed that remaining window. These changes apply to later captures, not the already-running original checkout.
 

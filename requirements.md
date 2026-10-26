@@ -6,20 +6,25 @@ Create local, incremental, independently verifiable records of public GitHub obs
 
 ## Collection scope
 
-- Public commits and complete reachable history across advertised branches, tags, and PR heads, including ancestors.
+- Standard profile: public commits and complete reachable history across advertised branches, tags, and PR heads, including ancestors. The separate LARGE recent-history policy below is not active.
 - Public issues, PRs, comments, reviews, GitHub Discussions/replies, and release metadata, using GitHub APIs alongside Git fetching.
 - Large binaries, external LFS/submodule contents, and additional fork repositories are optional extensions.
 
 ## Operating targets
 
 - **185 repositories**, selected from all rows of [public_patch_corpus_185.csv](public_patch_corpus_185.csv) and configured in [config.corpus.toml](icsot-observatory/config.corpus.toml). Preserve repository roles and measurement caveats; observation at a mirror does not establish availability at its upstream origin.
-- Execute on a trusted persistent host or **GitHub Actions** with authenticated durable working-state recovery. Repository observations remain manual. A separate daily/manual workflow refreshes public timestamp proofs without repository recapture. `libfuse/libfuse` remains the validated single-repository smoke target.
-- Target **1–6 hours between observations**, according to measured feasibility; report actual gaps.
-- **One-time initial 185-repository baseline allowance: 100 GB (100,000,000,000 stored bytes).** Count every retained attempt, partial result, retry and metadata asset across its releases. Do not increase beyond 100 GB automatically or delete evidence to make room. This explicit baseline amendment is separate from the **50 GB (50,000,000,000 bytes) per UTC calendar month** policy for future recurring collection. Runtime budget admission is not implemented.
+- Execute on a trusted persistent host or **GitHub Actions** with authenticated durable working-state recovery. The six-hour repository adapter is implemented and reviewed; activation and the first actual dispatch remain pending verification. A separate daily/manual workflow refreshes public timestamp proofs without repository recapture. `libfuse/libfuse` remains the validated single-repository smoke target.
+- Target **1–6 hours between observations**, according to measured feasibility. The initial schedule is **`17 */6 * * *` UTC**, best effort: GitHub may delay or drop runs. Report actual gaps; planning all 185 targets does not establish six-hour coverage of every repository.
+- **One-time initial 185-repository baseline allowance: 100 GB (100,000,000,000 stored bytes).** Count every retained attempt, partial result, retry and metadata asset across its releases. Do not increase beyond 100 GB automatically or delete evidence to make room. This explicit baseline amendment is separate from the **50 GB (50,000,000,000 bytes) per UTC calendar month** recurring-evidence policy. Runtime monthly budget admission/enforcement is intentionally omitted at the user's direction.
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.
-- The source repository is **public**. The one-time baseline uses standard hosted runners and encrypted XZ Release assets; metadata and the RSA public key may remain public. Incremental collection is implemented, but recurring execution still requires durable working state and operational budget enforcement. Six hours is the initial configurable cadence, not a measured guarantee.
+- The source repository is **public**. The one-time baseline uses standard hosted runners and encrypted XZ Release assets; metadata and the RSA public key may remain public. Recurring collection restores authenticated encrypted working state; state storage and evidence-transfer bytes are accounted separately.
 - Respect Actions runtime/disk/API limits; preserve explicit partial or missing outcomes and repair only affected targets/scopes. Avoid overwriting prior evidence or repeating the entire cohort to repair one failure.
 - **Local disk hard limit: 2,000,000,000 bytes at once**, counting this workspace, caches, temporary downloads, decrypted/expanded data and visualization/spot-check files together. Use one shared admission ledger and stream one archive part at a time; defer any check that cannot fit. Do not use Docker locally.
+
+## LARGE policy and measured sizes
+
+- Automatically classify `LARGE_REPO` only when GitHub's **raw reported size is strictly greater than 5,000,000 KB**; keep manual overrides separate. The LARGE policy uses a **frozen 730-day recent-history window**. That implementation remains inactive pending review; standard recurring collection does not activate it.
+- The [2026-10-26 size review](analysis/repo-size-review/20261026T163604Z-size-threshold-review.md) records **167 accepted and 18 incomplete** baseline targets, with maximum reported size **1,914,819 KB**. Five of eight targets reporting at least 1,000,000 KB were accepted. No current target crosses the LARGE threshold, and the observations establish **no size-only failure boundary**. Reported size does not measure complete mirror, bundle, API archive or restore-space requirements.
 
 ## Functional requirements
 
@@ -44,7 +49,7 @@ GitHub-backed resumption uses a separately generated operational RSA recipient a
 - **Proposed study Git history:** one commit per interval containing manifests, refs, coverage/gaps, and evidence hashes; externally timestamp its checkpoint. Keep large payloads and SQLite outside this repository.
 - Self-contained baseline plus incremental Git archives, explicit prerequisites, and tested restoration.
 - Append-only manifests/attempt records; independent Git and metadata scheduling with durable retries.
-- Reserve space within the applicable allowance for manifests, proofs and pause records; log budget-induced gaps. Concurrent admission enforcement remains implementation work.
+- Report evidence growth against the separate baseline/monthly policies and retain explicit pause/gap records. Runtime monthly budget enforcement is intentionally omitted.
 
 ## Decisions still open
 
@@ -56,4 +61,6 @@ GitHub-backed resumption uses a separately generated operational RSA recipient a
 
 `icsot-observe persistent` provides independent API/Git worker pools, durable leases and attempt telemetry, resumable raw-response/page checkpoints, frozen per-scope query boundaries, and watermark commits gated by immutable manifest/digest verification. Git storage uses a self-contained initial archive plus incremental or refs-only descriptors with explicit CAS prerequisites. Finalized manifests from both lanes share one append-locked hash chain; original observation times survive namespace clock clamping.
 
-Optional encrypted per-capture exports include only newly required CAS objects and record dependencies on previous packages. A manual selected-repository adapter restores encrypted working state, uploads evidence, registers the verified public proof catalog, then publishes its final state pointer. The full-bundle baseline supports verified ordered multi-parent reuse, preserving original accepted capture/transport references; new baseline captures publish UTC and OTS sidecars, while older inherited sidecar gaps remain explicit. Daily proof maintenance uses public sidecars and a bounded queue; cohort-wide daily throughput is unmeasured. It does not schedule repository observations. Runtime budget admission, recurring repository collection and Discussions remain open. See [operation and deployment template](icsot-observatory/docs/PERSISTENT.md).
+Optional encrypted per-capture exports include only newly required CAS objects and record dependencies on previous packages. The GitHub-backed adapter restores encrypted working state, uploads evidence, registers the verified public proof catalog, then publishes its final state pointer. The reviewed six-hour adapter plans all 185 targets, resumes authenticated state, and admits a rotating **default two cold bootstraps per cycle** (manual range **0–8**), with **at most eight concurrent workers**. Remaining cold targets stay bootstrap-pending; rollout and completed-cohort throughput are distinct from the requested cadence. Activation and the first actual dispatch remain pending verification.
+
+The full-bundle baseline supports verified ordered multi-parent reuse, preserving original accepted capture/transport references; new baseline captures publish UTC and OTS sidecars, while older inherited sidecar gaps remain explicit. Daily proof maintenance uses public sidecars and a bounded queue; cohort-wide daily throughput is unmeasured. Discussions and the LARGE recent-history implementation remain open. See [operation and deployment template](icsot-observatory/docs/PERSISTENT.md).
