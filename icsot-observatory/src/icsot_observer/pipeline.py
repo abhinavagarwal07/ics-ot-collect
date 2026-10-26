@@ -22,6 +22,7 @@ from typing import Any
 
 from . import __version__
 from .core import Config, ObjectStore, canonical_json, parse_github_time, run_id, sha256, utc_iso, utc_now, write_once
+from .diagnostics import emit, exception_fields, failure_category
 from .github import GitHubAPI
 from .gitstore import collect_git
 
@@ -200,24 +201,43 @@ def attest_manifest(root: Path, info: dict[str, Any], *, stamp: bool = True) -> 
     proof = Path(str(path) + ".ots")
     initial = root / "proofs" / "initial" / (digest + ".ots")
     if proof.is_file() and initial.is_file():
-        return _timestamp_receipt_info(root, info, proof, initial)
+        receipt = _timestamp_receipt_info(root, info, proof, initial)
+        emit("stage_end", stage="timestamp_receipt", status="reused_pending_bitcoin_completion"
+             if receipt["attestation"] == "pending_bitcoin_completion" else "invalid_receipt")
+        return receipt
     ots = shutil.which("ots")
     if not ots:
+        emit("stage_end", stage="timestamp_receipt", status="client_unavailable", failure_category="proof_failed")
         return {**info, "attestation": "error: ots CLI not found"}
     requested_at = received_at = None
     if not proof.exists():
+        stage_started = time.monotonic()
+        emit("stage_start", stage="timestamp_request")
         requested_at = utc_iso()
-        result = subprocess.run([ots, "stamp", str(path)], capture_output=True, text=True, timeout=180)
+        try:
+            result = subprocess.run([ots, "stamp", str(path)], capture_output=True, text=True, timeout=180)
+        except BaseException as error:
+            emit("stage_end", stage="timestamp_request", status="failed",
+                 elapsed_seconds=round(time.monotonic() - stage_started, 3), **exception_fields(error))
+            raise
         received_at = utc_iso()
+        emit("stage_end", stage="timestamp_request", status="returned" if result.returncode == 0 else "failed",
+             returncode=result.returncode, signal=-result.returncode if result.returncode < 0 else None,
+             elapsed_seconds=round(time.monotonic() - stage_started, 3),
+             **({"failure_category": "proof_failed"} if result.returncode else {}))
         if result.returncode:
             return {**info, "attestation": f"error: ots stamp exit {result.returncode}"}
     if not proof.is_file():
+        emit("stage_end", stage="timestamp_receipt", status="receipt_missing", failure_category="proof_failed")
         return {**info, "attestation": "error: ots returned success but receipt missing"}
     try:
         write_once(initial, proof.read_bytes())
     except FileExistsError:
         pass
-    return _timestamp_receipt_info(root, info, proof, initial, requested_at=requested_at, received_at=received_at)
+    receipt = _timestamp_receipt_info(root, info, proof, initial, requested_at=requested_at, received_at=received_at)
+    emit("stage_end", stage="timestamp_receipt", status="pending_bitcoin_completion"
+         if receipt["attestation"] == "pending_bitcoin_completion" else "invalid_receipt")
+    return receipt
 
 
 def _timestamp_receipt_info(root: Path, info: dict[str, Any], proof: Path, initial: Path, *,
@@ -893,10 +913,21 @@ def collect_one(config: Config, slug: str, mode: str, *, deep_full: bool = False
     except Exception as e:
         failures.append(f"api: {type(e).__name__}: {e}")
     if effective_mode != "events":
+        stage_started = time.monotonic()
+        stage_fields = {"status": "interrupted"}
+        emit("stage_start", stage="git_capture_and_bundle", repository_id=repo_id, capture_id=capture_id)
         try:
             git_result = collect_git(config.root, slug, repo_id, rid, bundle_full=bundle_full)
         except Exception as e:
             failures.append(f"git: {type(e).__name__}: {e}")
+            fields = exception_fields(e)
+            fields["failure_category"] = failure_category(failures[-1])
+            stage_fields.update(status="failed", **fields)
+        else:
+            stage_fields["status"] = "captured"
+        finally:
+            emit("stage_end", stage="git_capture_and_bundle",
+                 elapsed_seconds=round(time.monotonic() - stage_started, 3), **stage_fields)
     finished = utc_iso()
     config_for_manifest = {
         "repositories": list(config.repositories),

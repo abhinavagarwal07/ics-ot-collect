@@ -17,6 +17,7 @@ from typing import Any
 
 from .core import Config, ObjectStore, canonical_json, parse_github_time, sha256, utc_iso
 from .checkpoints import CheckpointError, CheckpointStore
+from .diagnostics import emit, exception_fields, failure_category, safe_fields, wait_heartbeat
 
 HEADERS_TO_KEEP = (
     "date", "etag", "last-modified", "link", "x-github-api-version-selected",
@@ -60,7 +61,10 @@ class _ScopeCapped(RuntimeError):
 
 
 class _PaginationDrift(RuntimeError):
-    pass
+    def __init__(self, message: str, category: str = "pagination_drift", page: int | None = None):
+        super().__init__(message)
+        self.diagnostic_category = category
+        self.diagnostic_page = page
 
 
 class GitHubAPI:
@@ -76,6 +80,7 @@ class GitHubAPI:
         self._checkpoint_integrity_errors: dict[str, list[str]] = {}
         self._json_decode_errors: list[dict] = []
         self._scope_observations: dict[str, dict] = {}
+        self._debug_context: dict[str, Any] = {}
         if checkpoint_store is not None:
             if (config.root.resolve() != checkpoint_store.root or
                     store.root.resolve() != checkpoint_store.root):
@@ -111,6 +116,60 @@ class GitHubAPI:
         self.secondary_rate_waited_seconds = 0.0
         self._last_rate_record: dict | None = None
         self._repository_ids: dict[str, str] = {}
+
+    def _request_fields(self, url: str | None, purpose: str) -> dict:
+        fields = {"scope": purpose, "method": "GET", "page": 1, "scope_attempt": 1,
+                  "scope_sha256": sha256(purpose.encode("utf-8", errors="replace"))[:16],
+                  **self._debug_context}
+        if url is None:
+            return fields
+        route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url).path)
+        fields["request_sha256"] = sha256(url.encode("utf-8", errors="replace"))[:16]
+        if route:
+            if route["id"]:
+                base = "/repositories/{repository_id}"
+                if len(route["id"]) <= 18:
+                    fields["repository_id"] = int(route["id"])
+            else:
+                base = "/repos/{owner}/{repo}"
+                fields["repo"] = route["repository"][len("/repos/"):]
+            allowed = {"issues", "pulls", "comments", "reviews", "commits", "files", "timeline", "releases", "tags", "events"}
+            parts = route["endpoint"].split("/")[1:]
+            # Unknown path components never become arbitrary diagnostic text.
+            if all(part in allowed or part.isdigit() for part in parts) and len(parts) <= 4:
+                fields["endpoint"] = base + "".join("/{number}" if part.isdigit() else "/" + part for part in parts)
+        return fields
+
+    def _rate_fields(self, headers: dict) -> dict:
+        fields = {"reserve": self.config.primary_rate_reserve,
+                  "primary_wait_used_seconds": self.primary_rate_waited_seconds,
+                  "primary_wait_allowance_seconds": self.config.primary_rate_wait_seconds,
+                  "secondary_wait_used_seconds": self.secondary_rate_waited_seconds,
+                  "secondary_wait_allowance_seconds": self.config.secondary_rate_wait_seconds}
+        for header, field in (("x-ratelimit-remaining", "remaining"), ("x-ratelimit-limit", "limit"),
+                              ("x-ratelimit-reset", "reset")):
+            try:
+                fields[field] = int(headers[header])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        if isinstance(headers.get("x-github-request-id"), str):
+            fields["request_id"] = headers["x-github-request-id"]
+        return fields
+
+    def _debug_wait(self, seconds: float, purpose: str, *, url: str | None, headers: dict, rate_kind: str) -> None:
+        fields = {**self._request_fields(url, purpose), **self._rate_fields(headers),
+                  "rate_kind": rate_kind, "wait_seconds": seconds}
+        started = time.monotonic()
+        emit("api_rate_wait_start", important=True, **fields)
+        try:
+            with wait_heartbeat(**fields):
+                time.sleep(seconds)
+        except BaseException as error:
+            emit("api_rate_wait_end", important=True, **fields, status="interrupted",
+                 elapsed_seconds=round(time.monotonic() - started, 3), **exception_fields(error))
+            raise
+        emit("api_rate_wait_end", important=True, **fields, status="finished",
+             elapsed_seconds=round(time.monotonic() - started, 3))
 
     def _validate_record_body(self, record: dict) -> bytes | None:
         if "body_sha256" not in record:
@@ -152,16 +211,24 @@ class GitHubAPI:
                     pass
         return max(value for value in deadlines if math.isfinite(value))
 
-    def _defer_request(self, headers: dict, reason: str, *, include_reset: bool = False) -> None:
+    def _defer_request(self, headers: dict, reason: str, *, include_reset: bool = False,
+                       purpose: str | None = None, url: str | None = None) -> None:
         context = self._checkpoint_context or {}
         retry_not_before = self._retry_time(headers, include_reset=include_reset)
         if self.checkpoint_store is not None:
             self.checkpoint_store.append("rate_deferral", {
                 **context, "retry_not_before": retry_not_before, "reason": reason, "lane_wide": True,
             })
-        raise APIRequestDeferred(retry_not_before, reason,
-                                 scope=context.get("scope"),
-                                 capture_id=self.checkpoint_store.capture_id if self.checkpoint_store else None)
+        category = ("primary_reserve_future_reset" if include_reset else
+                    "primary_rate_limit" if headers.get("x-ratelimit-remaining") == "0" else "secondary_rate_limit")
+        emit("api_rate_reserve" if include_reset else "api_request_retry", important=True,
+             **self._request_fields(url, purpose or context.get("scope", "repository_identity")),
+             **self._rate_fields(headers), retry_not_before=retry_not_before,
+             deferred=True, decision="defer", failure_category=category)
+        error = APIRequestDeferred(retry_not_before, reason, scope=context.get("scope"),
+                                   capture_id=self.checkpoint_store.capture_id if self.checkpoint_store else None)
+        error.diagnostic_category = category
+        raise error
 
     @staticmethod
     def validate_url(url: str) -> None:
@@ -180,7 +247,7 @@ class GitHubAPI:
         GitHubAPI.validate_url(url)
         return url
 
-    def _preserve_primary_reserve(self, purpose: str) -> None:
+    def _preserve_primary_reserve(self, purpose: str, *, url: str | None = None) -> None:
         record = self._last_rate_record
         if self.config.primary_rate_reserve == 0 or record is None:
             return
@@ -191,29 +258,45 @@ class GitHubAPI:
             return
         if remaining > self.config.primary_rate_reserve:
             return
+        try:
+            if time.time() >= float(headers["x-ratelimit-reset"]) + 1:
+                self._last_rate_record = None
+                emit("api_rate_reserve", important=True, **self._request_fields(url, purpose),
+                     **self._rate_fields(headers), decision="clear_expired", reason="expired_reset_cleared",
+                     wait_available_seconds=max(0, self.config.primary_rate_wait_seconds - self.primary_rate_waited_seconds))
+                return
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
         if self.defer_on_rate:
-            try:
-                if time.time() >= float(headers["x-ratelimit-reset"]) + 1:
-                    self._last_rate_record = None
-                    return
-            except (KeyError, TypeError, ValueError, OverflowError):
-                pass
-            self._defer_request(headers, f"Primary rate-limit reserve reached for {purpose}", include_reset=True)
+            self._defer_request(headers, f"Primary rate-limit reserve reached for {purpose}", include_reset=True,
+                                purpose=purpose, url=url)
         try:
             duration = max(1.0, int(headers["x-ratelimit-reset"]) - time.time() + 1.0)
         except (KeyError, TypeError, ValueError, OverflowError):
             duration = None
         available = self.config.primary_rate_wait_seconds - self.primary_rate_waited_seconds
         if duration is None or duration > available:
-            raise RuntimeError(f"Rate-limit reserve reached for {purpose}; preserve transfer capacity and retry later")
+            emit("api_rate_reserve", important=True, **self._request_fields(url, purpose),
+                 **self._rate_fields(headers), decision="refuse_wait_budget", wait_seconds=duration,
+                 wait_available_seconds=max(0, available), failure_category="primary_reserve_wait_budget")
+            error = RuntimeError(f"Rate-limit reserve reached for {purpose}; preserve transfer capacity and retry later")
+            error.diagnostic_category = "primary_reserve_wait_budget"
+            try:
+                reset = float(headers["x-ratelimit-reset"])
+                if math.isfinite(reset):
+                    error.retry_not_before = reset + 1
+                    error.rate_reset = reset
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+            raise error
         record["primary_rate_reserve_wait_seconds"] = duration
         self.primary_rate_waited_seconds += duration
-        time.sleep(duration)
+        self._debug_wait(duration, purpose, url=url, headers=headers, rate_kind="primary_reserve")
         self._last_rate_record = None  # reset elapsed; obtain current headers on the next request
 
     def get(self, url: str, purpose: str) -> Response:
         self.validate_url(url)
-        self._preserve_primary_reserve(purpose)
+        self._preserve_primary_reserve(purpose, url=url)
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": self.config.api_version,
@@ -225,6 +308,9 @@ class GitHubAPI:
         errors = (urllib.error.URLError, TimeoutError, OSError)
         for attempt in range(4):
             started = utc_iso()
+            request_started = time.monotonic()
+            request_fields = {**self._request_fields(url, purpose), "attempt": attempt + 1, "max_attempts": 4}
+            emit("api_request_start", sample=True, **request_fields)
             try:
                 req = urllib.request.Request(url, headers=headers, method="GET")
                 with self.opener.open(req, timeout=self.config.http_timeout_seconds) as r:
@@ -244,8 +330,14 @@ class GitHubAPI:
                     "request_completed_at": completed, "status": None,
                     "error": type(e).__name__, "attempt": attempt + 1,
                 })
+                emit("api_request_end", important=True, **request_fields, status="network_error",
+                     error_type=type(e).__name__, failure_category="request_failed",
+                     elapsed_seconds=round(time.monotonic() - request_started, 3))
                 if attempt < 3:
-                    time.sleep(min(8, (2 ** attempt) + random.random()))
+                    duration = min(8, (2 ** attempt) + random.random())
+                    emit("api_request_retry", important=True, **request_fields,
+                         reason="network_error", wait_seconds=duration, failure_category="request_failed")
+                    time.sleep(duration)
                     continue
                 raise RuntimeError(f"API request failed for {purpose}: {type(e).__name__}") from e
 
@@ -265,6 +357,13 @@ class GitHubAPI:
             self._append_record(rec)
             self._last_rate_record = rec
             self.requests += 1
+            category = ("response_cap" if failure == "RESPONSE_EXCEEDS_CAP" else
+                        "upstream_http_502" if status == 502 else "http_error")
+            emit("api_request_end", sample=failure is None and bool(_NEXT_RE.search(hdrs.get("link", ""))),
+                 important=failure is not None, **request_fields, **self._rate_fields(hdrs), status_code=status,
+                 status="success" if failure is None else "failed", body_bytes=len(body), body_sha256=digest[:16],
+                 elapsed_seconds=round(time.monotonic() - request_started, 3),
+                 **({"failure_category": category} if failure is not None else {}))
             if failure is None and status == 200:
                 return Response(body=body, record=rec)
 
@@ -272,7 +371,7 @@ class GitHubAPI:
                 hdrs.get("x-ratelimit-remaining") == "0" or "retry-after" in hdrs or
                 b"rate limit" in body[:4096].lower() or b"abuse" in body[:4096].lower()))
             if self.defer_on_rate and throttled:
-                self._defer_request(hdrs, f"Rate-limit deferral for {purpose}: HTTP {status}")
+                self._defer_request(hdrs, f"Rate-limit deferral for {purpose}: HTTP {status}", purpose=purpose, url=url)
             if self.checkpoint_store is not None and failure == "RESPONSE_EXCEEDS_CAP":
                 raise _ScopeCapped(f"Response exceeds byte cap for {purpose} (NOT complete)")
 
@@ -301,9 +400,17 @@ class GitHubAPI:
                 if attempt < 3 and duration is not None and duration <= available:
                     rec["primary_rate_wait_seconds"] = duration
                     self.primary_rate_waited_seconds += duration
-                    time.sleep(duration)
+                    emit("api_request_retry", important=True, **request_fields, **self._rate_fields(hdrs),
+                         status_code=status, reason="primary_rate_reset", wait_seconds=duration,
+                         wait_available_seconds=max(0, available), failure_category="primary_rate_limit")
+                    self._debug_wait(duration, purpose, url=url, headers=hdrs, rate_kind="primary")
                     continue
-                raise RuntimeError(f"Rate-limit budget exhausted for {purpose}; retry in next scheduled run")
+                error = RuntimeError(f"Rate-limit budget exhausted for {purpose}; retry in next scheduled run")
+                error.diagnostic_category = "primary_rate_limit"
+                emit("api_request_retry", important=True, **request_fields, **self._rate_fields(hdrs),
+                     status_code=status, decision="refuse_wait_budget", wait_seconds=duration,
+                     wait_available_seconds=max(0, available), failure_category="primary_rate_limit")
+                raise error
             throttled = status == 429 or (status == 403 and (
                 "retry-after" in hdrs or b"rate limit" in body[:4096].lower() or b"abuse" in body[:4096].lower()))
             if throttled and attempt < 3:
@@ -325,7 +432,10 @@ class GitHubAPI:
                 if duration <= available:
                     rec["secondary_rate_wait_seconds"] = duration
                     self.secondary_rate_waited_seconds += duration
-                    time.sleep(duration)
+                    emit("api_request_retry", important=True, **request_fields, **self._rate_fields(hdrs),
+                         status_code=status, reason="secondary_rate_limit", wait_seconds=duration,
+                         wait_available_seconds=max(0, available), failure_category="secondary_rate_limit")
+                    self._debug_wait(duration, purpose, url=url, headers=hdrs, rate_kind="secondary")
                     continue
             if status in (500, 502, 503, 504) and attempt < 3:
                 # Server errors keep a short bounded retry. Long announced
@@ -342,27 +452,42 @@ class GitHubAPI:
                             duration = 60
                 if 0 <= duration <= 30:
                     rec["server_retry_wait_seconds"] = duration
+                    emit("api_request_retry", important=True, **request_fields, **self._rate_fields(hdrs),
+                         status_code=status, reason="upstream_transient", wait_seconds=duration, failure_category=category)
                     time.sleep(duration)
                     continue
-            raise RuntimeError(f"API failure {purpose}: HTTP {status}, {failure or 'unexpected status'}")
+            error = RuntimeError(f"API failure {purpose}: HTTP {status}, {failure or 'unexpected status'}")
+            error.diagnostic_category = category
+            raise error
         raise AssertionError("unreachable")
 
-    def _request_json(self, url: str, purpose: str, kind: str, *, checkpointed: bool = False) -> tuple[Response, Any]:
+    def _request_json(self, url: str, purpose: str, kind: str, *, checkpointed: bool = False,
+                      page: int = 1, scope_attempt: int = 1) -> tuple[Response, Any]:
         """Retry malformed 2xx JSON at most twice; retain every original body."""
         for decode_attempt in range(1, 4):
-            response = self._checkpoint_get(url, purpose) if checkpointed else self.get(url, purpose)
+            previous = self._debug_context
+            self._debug_context = {"page": page, "scope_attempt": scope_attempt,
+                                   "decode_attempt": decode_attempt}
             try:
-                return response, self._decode_scope_body(response.body, kind, purpose)
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                failure = {"purpose": purpose, "url": url, "decode_attempt": decode_attempt,
-                           "body_sha256": response.record.get("body_sha256"),
-                           "response_sequence": response.record.get("checkpoint_provenance", {}).get("event_sequence"),
-                           "error": type(exc).__name__, "message": str(exc)}
-                self._json_decode_errors.append(failure)
-                if self.checkpoint_store is not None:
-                    self.checkpoint_store.append("response_decode_error", failure)
-                if decode_attempt == 3:
-                    raise
+                response = self._checkpoint_get(url, purpose) if checkpointed else self.get(url, purpose)
+                try:
+                    return response, self._decode_scope_body(response.body, kind, purpose)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    failure = {"purpose": purpose, "url": url, "decode_attempt": decode_attempt,
+                               "body_sha256": response.record.get("body_sha256"),
+                               "response_sequence": response.record.get("checkpoint_provenance", {}).get("event_sequence"),
+                               "error": type(exc).__name__, "message": str(exc)}
+                    self._json_decode_errors.append(failure)
+                    if self.checkpoint_store is not None:
+                        self.checkpoint_store.append("response_decode_error", failure)
+                    emit("api_decode_retry", important=True, **self._request_fields(url, purpose),
+                         status="retry" if decode_attempt < 3 else "exhausted", max_attempts=3,
+                         body_sha256=response.record.get("body_sha256", "")[:16],
+                         failure_category="invalid_json", error_type=type(exc).__name__)
+                    if decode_attempt == 3:
+                        raise
+            finally:
+                self._debug_context = previous
         raise AssertionError("unreachable")
 
     def get_json(self, path: str, purpose: str) -> dict:
@@ -385,19 +510,48 @@ class GitHubAPI:
         match = _NEXT_RE.search(response.record.get("headers", {}).get("link", ""))
         return match.group(1) if match else None
 
+    @staticmethod
+    def _identity_hash(value: Any) -> str:
+        # Debug hashing must also tolerate unusual decoded Unicode identities;
+        # it cannot introduce a new encoding failure into a valid traversal.
+        return sha256(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii"))[:16]
+
+    @classmethod
+    def _first_page_check(cls, first: Response, first_items: list[dict],
+                          fresh: Response, fresh_items: list[dict]) -> dict:
+        original = [cls._item_identity(item) for item in first_items]
+        current = [cls._item_identity(item) for item in fresh_items]
+        comparable = bool(original) and all(value is not None for value in original + current)
+        duplicate = (len(set(original)) != len(original) or len(set(current)) != len(current)) if comparable else False
+        cursor_changed = cls._next_link(first) != cls._next_link(fresh)
+        representation_changed = sha256(first.body) != sha256(fresh.body)
+        membership_changed = set(original) != set(current) if comparable else None
+        order_changed = (original != current and not membership_changed) if comparable else None
+        matches = (not cursor_changed and (
+            not representation_changed or (comparable and not duplicate and original == current)))
+        check = {"matches": matches, "first_count": len(original), "check_count": len(current),
+                 "identity_comparable": comparable, "duplicate_detected": duplicate,
+                 "cursor_changed": cursor_changed, "membership_changed": membership_changed,
+                 "order_changed": order_changed, "representation_changed": representation_changed,
+                 "first_ids_sha256": cls._identity_hash(original),
+                 "check_ids_sha256": cls._identity_hash(current),
+                 "first_cursor_sha256": sha256((cls._next_link(first) or "").encode("utf-8", errors="replace"))[:16],
+                 "check_cursor_sha256": sha256((cls._next_link(fresh) or "").encode("utf-8", errors="replace"))[:16]}
+        if not matches:
+            category = ("pagination_duplicate" if duplicate else
+                        "pagination_membership" if membership_changed else
+                        "pagination_order" if order_changed else
+                        "pagination_cursor" if cursor_changed else "pagination_unknown_identity")
+            check["failure_category"] = category
+            if comparable:
+                check["first_difference"] = next((index for index, pair in enumerate(zip(original, current))
+                    if pair[0] != pair[1]), min(len(original), len(current)))
+        return check
+
     @classmethod
     def _first_page_matches(cls, first: Response, first_items: list[dict],
                             fresh: Response, fresh_items: list[dict]) -> bool:
-        if cls._next_link(first) != cls._next_link(fresh):
-            return False
-        if sha256(first.body) == sha256(fresh.body):
-            return True
-        original = [cls._item_identity(item) for item in first_items]
-        current = [cls._item_identity(item) for item in fresh_items]
-        # Unknown identities cannot establish stable membership/order. In that
-        # case only the exact original representation qualifies above.
-        return (bool(original) and all(value is not None for value in original + current) and
-                len(set(original)) == len(original) and original == current)
+        return cls._first_page_check(first, first_items, fresh, fresh_items)["matches"]
 
     def list_pages(self, path: str, purpose: str, *, params: dict | None = None,
                    updated_before: datetime | None = None) -> list[dict]:
@@ -412,6 +566,8 @@ class GitHubAPI:
         assert first_route is not None
         for traversal in range(1, 3):
             attempt_started_at = utc_iso()
+            self._scope_observations[purpose] = {"pagination_attempts": traversal,
+                "query_started_at": attempt_started_at, "claim_scope": "non_atomic_response_intervals"}
             canonical_id = first_route["id"] or self._repository_ids.get(first_route["repository"].lower())
             url = initial_url
             first_response = None
@@ -422,23 +578,31 @@ class GitHubAPI:
             try:
                 for page_no in range(1, self.config.max_pages + 1):
                     if url in seen_urls:
-                        raise _PaginationDrift(f"Pagination loop in {purpose}")
+                        emit("api_pagination_check", important=True, scope=purpose, page=page_no,
+                             scope_attempt=traversal, reason="cursor_loop", failure_category="pagination_cursor")
+                        raise _PaginationDrift(f"Pagination loop in {purpose}", "pagination_cursor", page_no)
                     seen_urls.add(url)
-                    response, page = self._request_json(url, purpose, "list")
+                    response, page = self._request_json(url, purpose, "list", page=page_no, scope_attempt=traversal)
                     if first_response is None:
                         first_response, first_items = response, page
                     for item in page:
                         identity = self._item_identity(item)
                         if identity is not None:
                             if identity in seen_ids:
-                                raise _PaginationDrift(f"Pagination drift: repeated ID {identity[1]} in {purpose}")
+                                emit("api_pagination_check", important=True, scope=purpose, page=page_no,
+                                     scope_attempt=traversal, duplicate_detected=True,
+                                     duplicate_id_sha256=self._identity_hash(identity),
+                                     failure_category="pagination_duplicate", reason="duplicate_id")
+                                raise _PaginationDrift(f"Pagination drift: repeated ID {identity[1]} in {purpose}", "pagination_duplicate", page_no)
                             seen_ids.add(identity)
                     items.extend(page)
-                    if updated_before is not None and page and all(
+                    boundary_stop = updated_before is not None and page and all(
                             isinstance(item.get("updated_at"), str) and
-                            parse_github_time(item["updated_at"]) < updated_before for item in page):
-                        break
-                    next_url = self._next_link(response)
+                            parse_github_time(item["updated_at"]) < updated_before for item in page)
+                    next_url = None if boundary_stop else self._next_link(response)
+                    emit("api_pagination_page", sample=next_url is not None, scope=purpose, page=page_no,
+                         scope_attempt=traversal, count=len(page), body_sha256=response.record.get("body_sha256", "")[:16],
+                         reason="updated_boundary" if boundary_stop else "next_link" if next_url else "link_end")
                     if next_url is None:
                         break
                     self.validate_url(next_url)
@@ -457,10 +621,13 @@ class GitHubAPI:
                     raise _ScopeCapped(f"Max pages exceeded for {purpose} (NOT complete)")
                 representation_changed = False
                 if len(seen_urls) > 1:
-                    fresh, fresh_items = self._request_json(initial_url, purpose + "_first_page_recheck", "list")
+                    fresh, fresh_items = self._request_json(initial_url, purpose + "_first_page_recheck", "list", page=1, scope_attempt=traversal)
                     assert first_response is not None
-                    if not self._first_page_matches(first_response, first_items, fresh, fresh_items):
-                        raise _PaginationDrift(f"Pagination non-atomic: first page changed for {purpose}")
+                    check = self._first_page_check(first_response, first_items, fresh, fresh_items)
+                    emit("api_pagination_check", important=not check["matches"] or check["representation_changed"],
+                         scope=purpose, page=1, scope_attempt=traversal, **check)
+                    if not check["matches"]:
+                        raise _PaginationDrift(f"Pagination non-atomic: first page changed for {purpose}", check["failure_category"], 1)
                     representation_changed = fresh.body != first_response.body
                 self._scope_observations[purpose] = {
                     "pagination_attempts": traversal,
@@ -471,11 +638,15 @@ class GitHubAPI:
                 }
                 return items
             except _PaginationDrift as exc:
+                emit("api_pagination_restart", important=True, scope=purpose, scope_attempt=traversal,
+                     page=exc.diagnostic_page,
+                     max_attempts=2, decision="restart" if traversal == 1 else "exhausted",
+                     failure_category=failure_category(exc))
                 self._scope_observations[purpose] = {"pagination_attempts": traversal,
                     "query_started_at": attempt_started_at,
                     "claim_scope": "non_atomic_response_intervals", "last_drift": str(exc)}
                 if traversal == 2:
-                    raise _PaginationDrift(f"Pagination drift restart budget exhausted for {purpose}: {exc}") from exc
+                    raise _PaginationDrift(f"Pagination drift restart budget exhausted for {purpose}: {exc}", failure_category(exc), exc.diagnostic_page) from exc
         raise AssertionError("unreachable")
 
     def _checkpoint_get(self, url: str, purpose: str) -> Response:
@@ -591,12 +762,17 @@ class GitHubAPI:
         })
         state = self.checkpoint_store.scope_state(scope)
         assert state is not None
+        emit("api_scope_start", scope=scope, scope_attempt=state["restarts"] + 1,
+             attempt_id_sha256=sha256(state["attempt_id"].encode())[:16])
         return state
 
-    def _abandon_scope(self, state: dict, reason: str) -> None:
+    def _abandon_scope(self, state: dict, reason: str, *, category: str = "pagination_drift", page: int | None = None) -> None:
         assert self.checkpoint_store is not None
+        emit("api_pagination_restart", important=True, scope=state["scope"], scope_attempt=state["restarts"] + 1,
+             page=page, max_attempts=2, decision="restart" if state["restarts"] < 1 else "exhausted",
+             failure_category=category)
         if state["restarts"] >= 1:
-            raise _PaginationDrift(f"Pagination drift restart budget exhausted for {state['scope']}: {reason}")
+            raise _PaginationDrift(f"Pagination drift restart budget exhausted for {state['scope']}: {reason}", category, page)
         self.checkpoint_store.append("scope_abandoned", {
             "scope": state["scope"], "attempt_id": state["attempt_id"], "reason": reason,
             "status": "partial_drift", "abandoned_at": utc_iso(),
@@ -608,11 +784,15 @@ class GitHubAPI:
         if scope in self._checkpoint_integrity_errors:
             raise CheckpointError("; ".join(self._checkpoint_integrity_errors[scope]))
         state = self.checkpoint_store.scope_state(scope)
+        existing_attempt = state is not None and not state.get("abandoned")
         if state is not None and (state["fingerprint"] != sha256(canonical_json(query)) or state["query"] != query):
             raise CheckpointError(f"Scope query/options changed for {scope}; use a new capture_id")
         if state is not None and state.get("abandoned"):
             state = self._begin_scope(scope, query)
         if state is not None:
+            if existing_attempt:
+                emit("api_scope_start", scope=scope, scope_attempt=state["restarts"] + 1,
+                     attempt_id_sha256=sha256(state["attempt_id"].encode())[:16], reused_from_checkpoint=True)
             values, pages = self._load_scope_pages(state, query)
             if state["outcome"] and state["outcome"]["status"] == "complete_for_query":
                 if not pages or state["pages"][-1]["next_url"] is not None:
@@ -637,9 +817,15 @@ class GitHubAPI:
             first_items = (self._decode_scope_body(pages[0].body, query["kind"], scope) if pages else None)
             if resumed:
                 fresh, fresh_items = self._request_json(query["initial_url"], scope + "_resume_first_page_validation",
-                                                         query["kind"], checkpointed=True)
-                matches = (self._first_page_matches(pages[0], first_items, fresh, fresh_items)
-                           if query["kind"] == "list" else fresh.body == pages[0].body)
+                                                         query["kind"], checkpointed=True, page=1, scope_attempt=state["restarts"] + 1)
+                check = (self._first_page_check(pages[0], first_items, fresh, fresh_items)
+                         if query["kind"] == "list" else {"matches": fresh.body == pages[0].body,
+                         "failure_category": "pagination_drift"})
+                if check["matches"]:
+                    check.pop("failure_category", None)
+                matches = check["matches"]
+                emit("api_pagination_check", important=not matches or fresh.body != pages[0].body,
+                     scope=scope, page=1, scope_attempt=state["restarts"] + 1, **check)
                 changed = fresh.body != pages[0].body
                 representation_changed |= changed
                 self.checkpoint_store.append("scope_validation", {
@@ -649,7 +835,8 @@ class GitHubAPI:
                 })
                 resumed = False
                 if not matches:
-                    self._abandon_scope(state, "First page membership/order/cursor changed before continuation")
+                    self._abandon_scope(state, "First page membership/order/cursor changed before continuation",
+                                        category=check.get("failure_category", "pagination_drift"), page=1)
                     state = self._begin_scope(scope, query)
                     representation_changed = False
                     continue
@@ -659,10 +846,10 @@ class GitHubAPI:
             try:
                 while next_url is not None:
                     if next_url in seen_urls:
-                        raise _PaginationDrift(f"Pagination loop in {scope}")
+                        raise _PaginationDrift(f"Pagination loop in {scope}", "pagination_cursor", len(pages) + 1)
                     if len(pages) >= self.config.max_pages:
                         raise _ScopeCapped(f"Max pages exceeded for {scope} (NOT complete)")
-                    response, value = self._request_json(next_url, scope, query["kind"], checkpointed=True)
+                    response, value = self._request_json(next_url, scope, query["kind"], checkpointed=True, page=len(pages) + 1, scope_attempt=state["restarts"] + 1)
                     if first_items is None:
                         first_items = value
                     if query["kind"] == "object":
@@ -672,7 +859,12 @@ class GitHubAPI:
                             identity = self._item_identity(item)
                             if identity is not None:
                                 if identity in seen_ids:
-                                    raise _PaginationDrift(f"Pagination drift: repeated ID {identity[1]} in {scope}")
+                                    emit("api_pagination_check", important=True, scope=scope, page=len(pages) + 1,
+                                         scope_attempt=state["restarts"] + 1, duplicate_detected=True,
+                                         duplicate_id_sha256=self._identity_hash(identity),
+                                         failure_category="pagination_duplicate", reason="duplicate_id")
+                                    raise _PaginationDrift(f"Pagination drift: repeated ID {identity[1]} in {scope}",
+                                                           "pagination_duplicate", len(pages) + 1)
                                 seen_ids.add(identity)
                         values.extend(value)
                         following = self._page_next(query, response, value)
@@ -681,13 +873,21 @@ class GitHubAPI:
                         "url": next_url, "next_url": following,
                         "response_sequence": response.record["checkpoint_provenance"]["event_sequence"],
                     })
+                    emit("api_pagination_page", sample=following is not None, scope=scope,
+                         page=len(pages) + 1, scope_attempt=state["restarts"] + 1,
+                         count=1 if query["kind"] == "object" else len(value),
+                         body_sha256=response.record.get("body_sha256", "")[:16],
+                         reason="next_link" if following else "link_end")
                     pages.append(response)
                     seen_urls.add(next_url)
                     next_url = following
                 if query["kind"] == "list" and len(pages) > 1:
                     fresh, fresh_items = self._request_json(query["initial_url"], scope + "_first_page_recheck",
-                                                             "list", checkpointed=True)
-                    matches = self._first_page_matches(pages[0], first_items, fresh, fresh_items)
+                                                             "list", checkpointed=True, page=1, scope_attempt=state["restarts"] + 1)
+                    check = self._first_page_check(pages[0], first_items, fresh, fresh_items)
+                    matches = check["matches"]
+                    emit("api_pagination_check", important=not matches or check["representation_changed"],
+                         scope=scope, page=1, scope_attempt=state["restarts"] + 1, **check)
                     changed = fresh.body != pages[0].body
                     representation_changed |= changed
                     self.checkpoint_store.append("scope_validation", {
@@ -696,9 +896,10 @@ class GitHubAPI:
                         "validation": "ordered_identity_and_next_cursor",
                     })
                     if not matches:
-                        raise _PaginationDrift("First page membership/order/cursor changed after pagination")
+                        raise _PaginationDrift("First page membership/order/cursor changed after pagination",
+                                               check["failure_category"], 1)
             except _PaginationDrift as exc:
-                self._abandon_scope(state, str(exc))
+                self._abandon_scope(state, str(exc), category=failure_category(exc), page=exc.diagnostic_page)
                 state = self._begin_scope(scope, query)
                 representation_changed = False
                 continue
@@ -771,10 +972,12 @@ class GitHubAPI:
                      "mode": mode, "deep_full": deep_full}
             previous_context = self._checkpoint_context
             record_start, query_started_at = len(self.records), utc_iso()
+            scope_started = time.monotonic()
             try:
                 if checkpoint is not None:
                     value, outcome = self._run_checkpoint_scope(scope, query, validate=validate)
                 else:
+                    emit("api_scope_start", scope=scope, scope_attempt=1)
                     if self._deferred is not None:
                         raise self._deferred
                     value = (self.get_json(prefix + route, scope) if kind == "object" else
@@ -787,6 +990,10 @@ class GitHubAPI:
                                "query_started_at": query_started_at, "completed_at": utc_iso(),
                                "claim_scope": "non_atomic_response_intervals", **self._scope_observations.get(scope, {})}
                 result["watermark_candidates"][scope] = outcome["query_started_at"]
+                emit("api_scope_end", scope=scope, status=outcome["status"], count=outcome["count"],
+                     pages=outcome.get("pages"), scope_attempt=outcome.get("pagination_attempts", 1),
+                     reused_from_checkpoint=outcome.get("reused_from_checkpoint", False),
+                     elapsed_seconds=round(time.monotonic() - scope_started, 3))
             except Exception as exc:
                 state = checkpoint.scope_state(scope) if checkpoint else None
                 context = {"scope": scope, "attempt_id": state["attempt_id"] if state else None,
@@ -804,6 +1011,29 @@ class GitHubAPI:
                 elif len(self.records) > record_start and self.records[-1].get("status") in (404, 410):
                     status = "unavailable"
                 outcome = {**context, "status": status, "error": f"{type(exc).__name__}: {exc}"}
+                matching = [record for record in self.records[record_start:] if record.get("purpose") in (
+                    scope, scope + "_first_page_recheck", scope + "_resume_first_page_validation")]
+                last = matching[-1] if matching else {}
+                category = ("response_cap" if isinstance(exc, _ScopeCapped) else
+                            "checkpoint_invalid" if isinstance(exc, CheckpointError) else failure_category(exc))
+                if category == "collection_error" and type(last.get("status")) is int and last["status"] >= 400:
+                    category = "upstream_http_502" if last["status"] == 502 else "http_error"
+                outcome["failure_category"] = category
+                response_fields = safe_fields({"status_code": last.get("status"),
+                                               **self._rate_fields(last.get("headers", {}))})
+                response_fields.update(safe_fields({"reset": getattr(exc, "rate_reset", None)}))
+                retry_not_before = safe_fields({"retry_not_before": getattr(exc, "retry_not_before", None)})
+                outcome.update(retry_not_before)
+                if "status_code" in response_fields:
+                    outcome["status_code"] = response_fields["status_code"]
+                if "reset" in response_fields:
+                    outcome["reset"] = response_fields["reset"]
+                emit("api_scope_failure", important=True, scope=scope, status=status,
+                     failure_category=category, error_type=type(exc).__name__,
+                     scope_attempt=state["restarts"] + 1 if state else self._scope_observations.get(scope, {}).get("pagination_attempts", 1),
+                     request_count=len(matching),
+                     page=getattr(exc, "diagnostic_page", None), **response_fields, **retry_not_before,
+                     elapsed_seconds=round(time.monotonic() - scope_started, 3))
                 if isinstance(exc, APIRequestDeferred):
                     outcome.update(retry_not_before=exc.retry_not_before, lane_wide=exc.lane_wide, reason=exc.reason)
                     result["deferred"] = {"retry_not_before": exc.retry_not_before,
@@ -859,6 +1089,7 @@ class GitHubAPI:
             outcome = {"scope": scope, "status": "unavailable", "reason": reason,
                        "capability": {**(capabilities or {"has_pull_requests": False}), "metadata_evidence": metadata_evidence},
                        "claim_scope": "API surface unavailable; no inference of historical absence"}
+            emit("api_scope_unavailable", scope=scope, status="unavailable", reason=reason)
             if checkpoint is not None:
                 checkpoint.append("scope_unavailable", outcome)
             result["scopes"][scope] = result["scope_statuses"][scope] = outcome

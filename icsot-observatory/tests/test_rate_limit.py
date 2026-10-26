@@ -184,3 +184,54 @@ def test_429_without_secondary_message_still_waits(tmp_path, monkeypatch):
     api, sleeps = client(tmp_path, monkeypatch, [{}, None], error_status=429, error_body=b'{}')
     api.get(api.url("/repos/test/repo/issues"), "issues")
     assert sleeps == [60]
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_expired_reset_9ee_ast_case_clears_even_after_all_wait_allowance_spent(tmp_path, monkeypatch, defer):
+    api, sleeps = client(tmp_path, monkeypatch, [], allowance=3605)
+    api.config = replace(api.config, primary_rate_reserve=40)
+    api.defer_on_rate = defer
+    api.primary_rate_waited_seconds = 3605
+    api._last_rate_record = {"headers": {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000"}}
+    monkeypatch.setattr("icsot_observer.github.time.time", lambda: 1002)
+    api._preserve_primary_reserve("review_comments")
+    assert api._last_rate_record is None
+    assert api.primary_rate_waited_seconds == 3605
+    assert api.requests == 0 and api.records == [] and sleeps == []
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_future_reset_with_exhausted_wait_allowance_still_refuses(tmp_path, monkeypatch, defer):
+    from icsot_observer.github import APIRequestDeferred
+    api, sleeps = client(tmp_path, monkeypatch, [], allowance=3605)
+    api.config = replace(api.config, primary_rate_reserve=40)
+    api.defer_on_rate = defer
+    api.primary_rate_waited_seconds = 3605
+    record = {"headers": {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1100"}}
+    api._last_rate_record = record
+    monkeypatch.setattr("icsot_observer.github.time.time", lambda: 1002)
+    with pytest.raises(APIRequestDeferred if defer else RuntimeError) as caught:
+        api._preserve_primary_reserve("review_comments")
+    assert caught.value.retry_not_before == 1101
+    assert api._last_rate_record is record
+    assert api.requests == 0 and api.records == [] and sleeps == []
+
+
+def test_expired_reserve_diagnostic_exposes_reset_and_spent_budget_without_new_request(tmp_path, monkeypatch):
+    import json
+    from icsot_observer.diagnostics import diagnostic_context
+    api, sleeps = client(tmp_path, monkeypatch, [], allowance=3605)
+    api.config = replace(api.config, primary_rate_reserve=40)
+    api.primary_rate_waited_seconds = 3605
+    api._last_rate_record = {"headers": {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000"}}
+    monkeypatch.setattr("icsot_observer.github.time.time", lambda: 1002)
+    stream = io.StringIO()
+    with diagnostic_context(enabled=True, stream=stream):
+        api._preserve_primary_reserve("review_comments")
+    rows = [json.loads(line.removeprefix("ICSOT_DEBUG ")) for line in stream.getvalue().splitlines()]
+    decision = next(row for row in rows if row["event"] == "api_rate_reserve")
+    assert decision["decision"] == "clear_expired" and decision["reason"] == "expired_reset_cleared"
+    assert decision["reset"] == 1000 and decision["remaining"] == 0
+    assert decision["primary_wait_used_seconds"] == decision["primary_wait_allowance_seconds"] == 3605
+    assert decision["wait_available_seconds"] == 0 and decision["scope"] == "review_comments"
+    assert api.requests == 0 and api.records == [] and sleeps == []

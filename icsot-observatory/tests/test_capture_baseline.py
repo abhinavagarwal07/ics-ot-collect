@@ -7,6 +7,8 @@ import lzma
 import signal
 import subprocess
 import tarfile
+import urllib.error
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import pytest
@@ -170,11 +172,13 @@ def test_failed_capture_and_verifier_still_transfer_bytes_and_index_last(tmp_pat
     index = json.loads(uploads[-1].read_bytes())
     assert not index["complete"] and not index["capture_accepted"]
     assert index["collector_result"]["status"] == "unexpected_error"
-    assert "synthetic capture interruption" in index["collector_result"]["error"]
-    assert "synthetic verifier failure" in index["verification"]["errors"][0]
+    assert index["collector_result"]["error"].startswith("scientific:")
+    assert index["verification"]["errors"][0].startswith("verification:")
     assert index["archive"]["git_mirror_included"]
     names = unpack_archive(uploads[0].parent, index["archive"], tmp_path / "restored", args.test_private_key)
     assert "evidence/git/17.git/objects/partial.pack" in names
+    assert "synthetic capture interruption" in (tmp_path / "restored/reports/collector-result.json").read_text()
+    assert "synthetic verifier failure" in (tmp_path / "restored/reports/verification.json").read_text()
 
 
 def test_encryption_failure_never_uploads_plaintext(tmp_path, monkeypatch):
@@ -189,7 +193,7 @@ def test_encryption_failure_never_uploads_plaintext(tmp_path, monkeypatch):
     assert len(uploads) == 1 and uploads[0].name.endswith(".index.json")
     index = json.loads(uploads[0].read_bytes())
     assert not index["complete"] and index["archive"]["parts"] == []
-    assert any("Encryption:" in message for message in index["errors"])
+    assert any(message.startswith("encryption:encryption_failed:") for message in index["errors"])
 
 
 def pending_ots_receipt(digest):
@@ -268,6 +272,9 @@ def test_complete_capture_omits_verified_mirror_and_restores_offline(tmp_path, m
     assert not any(name.startswith("evidence/git") for name in names)
     manifest = restored / "evidence" / index["manifests"][0]["path"]
     assert hashlib.sha256(manifest.read_bytes()).hexdigest() == index["manifests"][0]["sha256"]
+    for key in ("manifest", "proof", "immutable_initial_proof"):
+        assert not Path(index["collector_result"][key]).is_absolute()
+        assert (restored / "evidence" / index["collector_result"][key]).is_file()
     restore_fetches = []
 
     def traced_git(arguments, **kwargs):
@@ -888,11 +895,16 @@ def test_cli_rejects_fractional_concurrency_before_planning(monkeypatch):
     assert error.value.code == 2
 
 
-def test_scope_failure_preserves_later_api_bytes_and_verified_git_but_baseline_stays_partial(tmp_path, monkeypatch, ots_dependency):
-    from icsot_observer import gitstore, pipeline
+def test_scope_failure_preserves_later_api_bytes_and_verified_git_but_baseline_stays_partial(tmp_path, monkeypatch, ots_dependency, capsys):
+    from icsot_observer import github, gitstore, pipeline
     _, _, config, identities = sources(tmp_path, ("example/one",))
     args = args_for(tmp_path, tmp_path / "config.toml", tmp_path / "cohort.csv")
     monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config, identities))
+    monkeypatch.setenv("ICSOT_DEBUG", "1")
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    summary_path = tmp_path / "step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
     origin = tmp_path / "origin"
     run_git(["init", "-b", "main", str(origin)])
     run_git(["-C", str(origin), "config", "user.email", "test@example.invalid"])
@@ -911,23 +923,25 @@ def test_scope_failure_preserves_later_api_bytes_and_verified_git_but_baseline_s
 
     monkeypatch.setattr(gitstore, "run_git", local_git)
 
-    def record(api, purpose, body, status):
-        api.records.append({"purpose": purpose, "status": status, "body_sha256": api.store.put(body), "body_bytes": len(body),
-                            "request_started_at": "2026-10-20T00:00:00Z", "request_completed_at": "2026-10-20T00:00:01Z"})
+    sentinel = "ghp_SECRET_BODY_PATH_SENTINEL"
 
-    def identity(api, path, purpose):
-        body = b'{"id":17,"private":false,"full_name":"example/one"}'
-        record(api, purpose, body, 200)
-        return json.loads(body)
+    class FakeResponse(io.BytesIO):
+        status = 200
+        headers = {"Authorization": sentinel, "X-RateLimit-Remaining": "4999"}
 
-    def partial_api(api, slug, mode, since=None, deep_full=False):
-        record(api, "issues", b'{"message":"temporary failure"}', 500)
-        record(api, "releases", b'[{"id":42,"name":"later metadata survived"}]', 200)
-        scopes = {"issues": {"status": "failed"}, "releases": {"status": "complete_for_query", "count": 1}}
-        return {"repository_id": 17, "scopes": scopes, "scope_statuses": scopes, "failures": ["issues: HTTP 500"]}
+    class PublicSource:
+        def open(self, request, **kwargs):
+            path = urlsplit(request.full_url).path
+            if path.endswith("/issues"):
+                raise urllib.error.HTTPError(request.full_url, 502, sentinel, {}, io.BytesIO(sentinel.encode()))
+            if path == "/repos/example/one":
+                return FakeResponse(b'{"id":17,"private":false,"full_name":"example/one","has_pull_requests":true}')
+            if path.endswith("/releases"):
+                return FakeResponse(json.dumps([{"id": 42, "name": "later metadata survived", "body": sentinel}]).encode())
+            return FakeResponse(b'[]')
 
-    monkeypatch.setattr(pipeline.GitHubAPI, "get_json", identity)
-    monkeypatch.setattr(pipeline.GitHubAPI, "collect", partial_api)
+    monkeypatch.setattr(github.urllib.request, "build_opener", lambda *a: PublicSource())
+    monkeypatch.setattr(github.time, "sleep", lambda *a: None)
     original_run = subprocess.run
     monkeypatch.setattr(pipeline.shutil, "which", lambda name: "/test/ots")
 
@@ -945,16 +959,27 @@ def test_scope_failure_preserves_later_api_bytes_and_verified_git_but_baseline_s
     index = json.loads(uploads[-1].read_bytes())
     assert index["status"] == "incomplete" and index["capture_accepted"] is False
     assert index["collector_result"]["status"] == "partial"
-    assert index["collector_result"]["failures"] == ["issues: HTTP 500"]
+    assert len(index["collector_result"]["failures"]) == 1
+    assert "upstream_http_502" in index["collector_result"]["failures"][0]
     assert index["verification"]["ok"] is True
     assert index["verification"]["partial_runs"] == 1
     assert index["verification"]["portable_git_bundles_verified"] == index["verification"]["git_repositories_verified"] == 1
-    assert index["verification"]["raw_observations"] == 3
     work = args.work_root / baseline.repository_key(args.slug) / "evidence"
-    manifest = json.loads(Path(index["collector_result"]["manifest"]).read_bytes())
+    manifest = json.loads((work / index["manifests"][0]["path"]).read_bytes())
     assert manifest["api"]["scopes"]["releases"]["count"] == 1
     assert any(b"later metadata survived" in ObjectStore(work).get(item["body_sha256"]) for item in manifest["responses"])
-    assert any(item["status"] == 500 for item in manifest["responses"])
+    assert any(item["status"] == 502 for item in manifest["responses"])
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out + captured.err + summary_path.read_text() + uploads[-1].read_text()
+    events = [json.loads(line.removeprefix("ICSOT_DEBUG ")) for line in captured.err.splitlines() if line.startswith("ICSOT_DEBUG ")]
+    api_events = [event for event in events if event["event"] == "api_scope_failure"]
+    assert any(event["scope"] == "issues" and event["failure_category"] == "upstream_http_502" for event in api_events)
+    assert all(event["config_source_sha256"] == identities["config_source_sha256"] for event in api_events)
+    assert all(event["github_run_id"] == 123 and event["github_run_attempt"] == 2 for event in api_events)
+    assert any(event["event"] == "capture_end" and event["returncode"] == 2 and
+               event["archive_status"] == "complete" and event["upload_status"] == "uploaded" and
+               event["git_status"] == "verified" for event in events)
+    assert "incomplete" in summary_path.read_text() and "Retained evidence index" in summary_path.read_text()
 
 
 def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and_idempotent(tmp_path, monkeypatch, ots_dependency):
@@ -1046,3 +1071,199 @@ def test_new_baseline_proof_sidecars_catalog_and_real_registration_are_bound_and
     assert len(registry.state["pending"]) == 1
     assert baseline.finalize(args) == 0
     assert len(uploads) == upload_count and registry.saves == 1
+
+
+@pytest.mark.parametrize("failed_stage", ["archive", "encryption", "archive_upload", "index_upload"])
+def test_stage_failures_are_redacted_and_always_leave_terminal_diagnostics(tmp_path, monkeypatch, capsys, failed_stage):
+    config, csv, config_obj, identities = sources(tmp_path)
+    args = args_for(tmp_path, config, csv)
+    sentinel = "ghp_PRIVATE_TOKEN /Users/private/key.pem RAW_HTTP_BODY_SENTINEL"
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("ICSOT_DEBUG", "1")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setattr(baseline, "load_sources", lambda *a, **kw: (config_obj, identities))
+
+    def partial(config, *a, **kw):
+        ObjectStore(config.root).put(b"retained bytes")
+        return {"repo": args.slug, "status": "partial", "failures": [sentinel]}
+
+    monkeypatch.setattr(baseline, "collect_one", partial)
+    monkeypatch.setattr(baseline, "verify_all", lambda *a: {"ok": False, "errors": [sentinel]})
+    if failed_stage == "archive":
+        def failed_package(work, assets, key, **kwargs):
+            (assets / f"{key}.tar.xz.part-0001").write_bytes(b"partial archive bytes")
+            raise RuntimeError(sentinel)
+        monkeypatch.setattr(baseline, "package_archive", failed_package)
+    if failed_stage == "encryption":
+        monkeypatch.setattr(baseline, "encrypt_archive_parts", lambda *a: (_ for _ in ()).throw(RuntimeError(sentinel)))
+    uploads = []
+
+    def upload(tag, path, repository):
+        if (failed_stage == "index_upload" and path.name.endswith(".index.json") or
+                failed_stage == "archive_upload" and path.name.endswith(".enc")):
+            raise RuntimeError(sentinel)
+        uploads.append(path)
+
+    monkeypatch.setattr(baseline, "upload_asset", upload)
+    if failed_stage == "index_upload":
+        with pytest.raises(RuntimeError):
+            baseline.capture(args)
+    else:
+        assert baseline.capture(args) == 2
+    output = capsys.readouterr()
+    index_path = args.work_root / (baseline.repository_key(args.slug) + "-assets") / (baseline.repository_key(args.slug) + ".index.json")
+    assert sentinel not in output.out + output.err + summary.read_text() + index_path.read_text()
+    events = [json.loads(line.removeprefix("ICSOT_DEBUG ")) for line in output.err.splitlines() if line.startswith("ICSOT_DEBUG ")]
+    assert any(event["event"] == "stage_end" and event.get("stage") == failed_stage and event["status"] == "failed" for event in events)
+    assert any(event["event"] == "capture_end" and event["returncode"] != 0 for event in events)
+    assert any(event["event"] == "diagnostic_summary" for event in events)
+    assert sentinel in (args.work_root / baseline.repository_key(args.slug) / "reports/collector-result.json").read_text()
+    if failed_stage == "index_upload":
+        assert "Retained evidence index" not in summary.read_text()
+    else:
+        assert uploads[-1] == index_path
+
+
+def test_collection_heartbeat_uses_explicit_logger_and_stops_after_stage(tmp_path, monkeypatch):
+    import threading
+    stream = io.StringIO()
+    args = argparse.Namespace(slug="example/one", code_sha="a" * 40)
+    diagnostic = baseline.CaptureDiagnostics(args)
+    emitted = threading.Event()
+    monkeypatch.setattr(baseline, "DIAGNOSTIC_HEARTBEAT_SECONDS", 0.005)
+    with baseline.diagnostics.diagnostic_context(enabled=True, stream=stream) as logger:
+        diagnostic.logger = logger
+        original_emit = logger.emit
+        def observed(event, **fields):
+            result = original_emit(event, **fields)
+            if event == "stage_heartbeat":
+                emitted.set()
+            return result
+        monkeypatch.setattr(logger, "emit", observed)
+        with diagnostic.stage("collection"):
+            assert emitted.wait(1)
+        count = stream.getvalue().count('"event":"stage_heartbeat"')
+        assert count >= 1
+        assert not any(thread.name == "capture-stage-heartbeat" for thread in threading.enumerate())
+    assert stream.getvalue().count('"event":"stage_heartbeat"') == count
+
+
+def test_uncaught_preflight_is_safely_reported_without_traceback_or_exception_text(tmp_path, monkeypatch, capsys):
+    sentinel = "ghp_NEVER_LOG_THIS /private/raw_http_payload"
+    monkeypatch.setenv("ICSOT_DEBUG", "1")
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setattr(baseline, "main", lambda *a: (_ for _ in ()).throw(RuntimeError(sentinel)))
+    assert baseline.entrypoint([]) == 1
+    output = capsys.readouterr()
+    assert sentinel not in output.out + output.err + summary.read_text()
+    assert "Traceback (most recent call last)" not in output.err
+    events = [json.loads(line.removeprefix("ICSOT_DEBUG ")) for line in output.err.splitlines() if line.startswith("ICSOT_DEBUG ")]
+    failure = next(event for event in events if event["event"] == "capture_failure")
+    assert failure["stage"] == "entrypoint" and failure["error_type"] == "RuntimeError"
+    assert all(set(frame) == {"file", "function", "line"} for frame in failure["traceback_frames"])
+
+
+def test_transfer_diagnostics_preserve_signal_and_ambiguous_upload_identity_without_extra_probes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ICSOT_DEBUG", "1")
+    monkeypatch.setattr(baseline.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, -15, b"", b"ghp_SECRET_STDERR"))
+    with baseline.diagnostics.diagnostic_context(enabled=True):
+        with pytest.raises(RuntimeError):
+            baseline.gh("release", "upload", "tag", "file", retry_rate_limit=False)
+    output = capsys.readouterr()
+    events = [json.loads(line.removeprefix("ICSOT_DEBUG ")) for line in output.err.splitlines() if line.startswith("ICSOT_DEBUG ")]
+    assert any(event.get("returncode") == -15 and event.get("signal") == 15 for event in events)
+    assert "ghp_SECRET_STDERR" not in output.err
+    asset = tmp_path / "retained.enc"
+    asset.write_bytes(b"ciphertext")
+    calls = []
+    monkeypatch.setattr(baseline, "gh", lambda *a, **kw: calls.append(a) or b"")
+    monkeypatch.setattr(baseline, "release_by_tag", lambda *a: pytest.fail("Diagnostic-only metadata probe"))
+    with baseline.diagnostics.diagnostic_context(enabled=True):
+        metadata = baseline.upload_asset("corpus-baseline-123-1", asset, "owner/private")
+    assert len(calls) == 1 and metadata["asset_id"] is None and metadata["asset_id_reason"] == "not_returned"
+
+
+def test_public_diagnostic_projection_filters_nested_metadata_and_untrusted_environment(tmp_path, monkeypatch):
+    sentinel = "ghp_SECRET_BODY_SENTINEL /Users/private/key.pem"
+    monkeypatch.setenv("GITHUB_RUN_ID", sentinel)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", sentinel)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    args = argparse.Namespace(slug="example/one", code_sha="a" * 40)
+    diagnostic = baseline.CaptureDiagnostics(args)
+    path = tmp_path / "capture.manifest.json"
+    path.write_text(json.dumps({"api": {"scope_statuses": {sentinel: {"status": sentinel, "failure_category": sentinel}}}}))
+    stream = io.StringIO()
+    with baseline.diagnostics.diagnostic_context(enabled=True, stream=stream, repo=args.slug,
+            collector_code_sha=args.code_sha, **baseline.actions_identity()) as logger:
+        diagnostic.logger = logger
+        diagnostic.scientific(tmp_path, {"status": sentinel}, [{"path": path.name}], {})
+        diagnostic.summary["status"] = sentinel
+        diagnostic.stages.append({"stage": sentinel, "status": sentinel})
+        diagnostic.finish(2)
+    metadata = diagnostic.metadata()
+    index = baseline.public_index_projection({"errors": [sentinel], "collector_result": {"status": sentinel, "failures": [sentinel]},
+                                              "verification": {"errors": [sentinel]}, "diagnostics": metadata})
+    assert sentinel not in json.dumps(index) + summary.read_text() + stream.getvalue()
+    assert len(index["errors"]) == len(index["collector_result"]["failures"]) == len(index["verification"]["errors"]) == 1
+    assert index["collector_result"]["status"] == "unknown"
+    assert metadata["scope_outcomes"] == [{"scope": "unknown", "status": "unknown", "failure_category": "collection_error"}]
+
+
+@pytest.mark.parametrize("fault", ["start", "join"])
+@pytest.mark.parametrize("body_raises", [False, True])
+def test_heartbeat_lifecycle_failures_cannot_replace_collection_result_or_exception(monkeypatch, fault, body_raises):
+    sentinel = "ghp_DIAGNOSTIC_THREAD_FAILURE"
+    class FailedThread:
+        def __init__(self, **kwargs):
+            pass
+        def start(self):
+            if fault == "start":
+                raise RuntimeError(sentinel)
+        def join(self, **kwargs):
+            if fault == "join":
+                raise RuntimeError(sentinel)
+    monkeypatch.setattr(baseline.threading, "Thread", FailedThread)
+    stream, ran = io.StringIO(), []
+    diagnostic = baseline.CaptureDiagnostics(argparse.Namespace(slug="example/one", code_sha="a" * 40))
+    with baseline.diagnostics.diagnostic_context(enabled=True, stream=stream) as logger:
+        diagnostic.logger = logger
+        def collect():
+            with diagnostic.stage("collection"):
+                ran.append(True)
+                if body_raises:
+                    raise ValueError("original collection error")
+            return "original result"
+        if body_raises:
+            with pytest.raises(ValueError, match="original collection error"):
+                collect()
+        else:
+            assert collect() == "original result"
+    assert ran == [True] and sentinel not in stream.getvalue()
+
+
+def test_capability_unavailable_is_not_a_diagnostic_failure_and_paths_stay_evidence_relative(tmp_path):
+    sentinel = "/Users/private/key.pem"
+    manifest = tmp_path / "runs/17/initial.manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"api": {"scope_statuses": {
+        "pulls": {"status": "unavailable", "reason": "repository_pull_requests_disabled"}}}}))
+    stream = io.StringIO()
+    diagnostic = baseline.CaptureDiagnostics(argparse.Namespace(slug="example/one", code_sha="a" * 40))
+    with baseline.diagnostics.diagnostic_context(enabled=True, stream=stream) as logger:
+        diagnostic.logger = logger
+        diagnostic.scientific(tmp_path, {"status": "complete"}, [{"path": manifest.relative_to(tmp_path).as_posix()}], {})
+    metadata = diagnostic.metadata()
+    assert metadata["scope_outcomes"] == [{"scope": "pulls", "status": "unavailable", "reason": "repository_pull_requests_disabled"}]
+    events = [json.loads(line.removeprefix("ICSOT_DEBUG ")) for line in stream.getvalue().splitlines()]
+    summary = next(event for event in events if event["event"] == "diagnostic_summary")
+    assert not summary.get("failure_categories")
+    public = baseline.public_index_projection({"errors": [], "collector_result": {
+        "status": "complete", "manifest": str(manifest), "proof": str(manifest) + ".ots",
+        "immutable_initial_proof": str(tmp_path / "proofs/initial/retained.ots"),
+        "timestamp_provenance_path": str(tmp_path / "../private/key.pem"), "quarantine": sentinel}}, tmp_path)
+    assert public["collector_result"]["manifest"] == "runs/17/initial.manifest.json"
+    assert public["collector_result"]["proof"] == "runs/17/initial.manifest.json.ots"
+    assert public["collector_result"]["immutable_initial_proof"] == "proofs/initial/retained.ots"
+    assert sentinel not in json.dumps(public) and "../" not in json.dumps(public)

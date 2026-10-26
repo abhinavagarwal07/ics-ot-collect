@@ -419,3 +419,35 @@ def test_issue_comment_feed_excluded_only_when_both_capabilities_explicitly_fals
         assert outcome.get("reason") != "repository_issues_and_pull_requests_disabled"
         assert any(failure.startswith("issue_comments:") for failure in result["failures"])
         assert any(record["status"] == 404 for record in api.records)
+
+
+def test_debug_duplicate_drift_logs_scope_page_attempt_hashes_without_payloads(collector):
+    from icsot_observer.diagnostics import diagnostic_context
+    api, _, _, configure, collect = collector
+    payload = "sensitive_body_marker"
+    cursor = EVENT_NEXT + "&after=sensitive_query_marker"
+    def handler(url):
+        if url == META_URL:
+            return Reply(PUBLIC)
+        if url == EVENT_URL:
+            return Reply([{"id": 1, "private_text": payload}], {"Link": f'<{cursor}>; rel="next"'})
+        if url == cursor:
+            return Reply([{"id": 1}])
+        return Reply([])
+    configure(handler)
+    stream = io.StringIO()
+    with diagnostic_context(enabled=True, stream=stream, repo="test/repo"):
+        result = collect()
+    text = stream.getvalue()
+    assert payload not in text and "sensitive_query_marker" not in text and "after=" not in text
+    rows = [json.loads(line.removeprefix("ICSOT_DEBUG ")) for line in text.splitlines()]
+    duplicate = next(row for row in rows if row["event"] == "api_pagination_check" and row.get("duplicate_detected"))
+    assert duplicate["scope"] == "events" and duplicate["page"] == 2
+    assert len(duplicate["duplicate_id_sha256"]) == 16
+    failed = next(row for row in rows if row["event"] == "api_scope_failure" and row["scope"] == "events")
+    assert failed["scope_attempt"] == 2 and failed["page"] == 2 and failed["status_code"] == 200
+    assert failed["failure_category"] == "pagination_duplicate"
+    assert result["scopes"]["events"]["status"] == "partial_drift"
+    assert result["scopes"]["tags"]["status"] == "complete_for_query"
+    assert "events" not in result["watermark_candidates"]
+    assert any(payload.encode() in api.store.get(record["body_sha256"]) for record in api.records)

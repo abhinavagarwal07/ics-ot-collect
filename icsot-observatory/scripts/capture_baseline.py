@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import hashlib
 import io
 import json
@@ -20,9 +21,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from dataclasses import replace
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -31,6 +34,7 @@ from icsot_observer.core import Config, ObjectStore, REPO_RE, canonical_json, sh
 from icsot_observer.gitstore import run_git
 from icsot_observer.encryption import encrypt_file, public_key_fingerprint
 from icsot_observer.pipeline import collect_one, restore_mirrors as restore_evidence_mirrors
+from icsot_observer import diagnostics
 
 PART_BYTES = 1024 ** 3
 EXPECTED_REPOSITORIES = 185
@@ -40,12 +44,222 @@ RESULTS_PUBLIC_KEY = Path(__file__).resolve().parents[1] / "keys/results-rsa-pub
 MAX_PARENT_RELEASES = 16
 DEFAULT_MAX_PARALLEL = 8
 MAX_PARALLEL_LIMIT = 16
+DIAGNOSTIC_HEARTBEAT_SECONDS = 60
 SCOPE = (
     "One initial public GitHub observation: shallow full REST listings, advertised "
     "branch/tag/pull-head Git refs and reachable Git objects. Per-item historical "
     "timelines/reviews, Discussions and first-publication times are not established. "
     "OTS receipts remain pending until separately upgraded and verified."
 )
+
+
+def actions_identity() -> dict:
+    identity = {}
+    for name, variable in (("github_run_id", "GITHUB_RUN_ID"), ("github_run_attempt", "GITHUB_RUN_ATTEMPT")):
+        value = os.getenv(variable, "")
+        if re.fullmatch(r"[0-9]{1,15}", value):
+            identity[name] = int(value)
+    return identity
+
+
+def retry_utc(value) -> str:
+    if type(value) not in (int, float):
+        return "not_recorded"
+    try:
+        return utc_iso(datetime.fromtimestamp(value, timezone.utc))
+    except (ValueError, OverflowError, OSError):
+        return "not_recorded"
+
+
+def failure_code(value, category: str) -> str:
+    """A public error code; original exception text stays in encrypted reports."""
+    text = value if isinstance(value, str) else ""
+    if category == "preservation":
+        for prefix, stage in (("Verification:", "verification"), ("Packaging:", "archive"),
+                              ("Encryption:", "encryption"), ("Upload ", "upload"),
+                              ("Timestamp sidecars:", "proof")):
+            if text.startswith(prefix):
+                category = stage
+                break
+    error_type = next((name for name in (
+        "PhaseDeadlineExceeded", "TimeoutExpired", "TimeoutError", "UnicodeDecodeError",
+        "JSONDecodeError", "HTTPError", "OSError", "ValueError", "RuntimeError",
+        "KeyboardInterrupt", "SystemExit") if name in text), "Error")
+    code = diagnostics.failure_category(value)
+    if code == "collection_error":
+        code = {"verification": "verification_failed", "archive": "stage_failed",
+                "encryption": "encryption_failed", "upload": "upload_failed", "proof": "proof_failed"}.get(category, code)
+    return f"{category}:{code}:{error_type}"
+
+
+def public_index_projection(index: dict, evidence_root: Path | None = None) -> dict:
+    """Keep acceptance metadata, replacing free-text failures in NEW indexes."""
+    public = copy.deepcopy(index)
+    public["errors"] = [failure_code(value, "preservation") for value in index["errors"]]
+    result = public.get("collector_result", {})
+    result["status"] = diagnostics.safe_fields({"status": result.get("status")}).get("status", "unknown")
+    if "error" in result:
+        result["error"] = failure_code(result["error"], "scientific")
+    if "failures" in result:
+        result["failures"] = [failure_code(value, "scientific") for value in result["failures"]]
+    if str(result.get("attestation", "")).startswith("error:"):
+        result["attestation"] = failure_code(result["attestation"], "proof")
+    # Paths in collector results are runner-local and may contain exception or
+    # credential-bearing input. Only deterministic evidence-relative names are public.
+    for key in ("manifest", "proof", "immutable_initial_proof", "quarantine", "timestamp_provenance_path"):
+        if key in result:
+            relative = None
+            if evidence_root is not None and isinstance(result[key], str):
+                try:
+                    candidate = Path(result[key]).relative_to(evidence_root)
+                    if candidate.parts and all(part not in (".", "..") and
+                            diagnostics.safe_fields({"asset_name": part}).get("asset_name") == part for part in candidate.parts):
+                        relative = candidate.as_posix()
+                except ValueError:
+                    pass
+            result[key] = relative or ("retained_in_encrypted_archive" + (".ots" if "proof" in key else ".json"))
+    verification = public.get("verification", {})
+    verification["errors"] = [failure_code(value, "verification") for value in verification.get("errors", [])]
+    for manifest in public.get("manifests", []):
+        if "error" in manifest:
+            manifest["error"] = failure_code(manifest["error"], "verification")
+    return public
+
+
+class CaptureDiagnostics:
+    """Bounded metadata summaries; no response bodies or exception messages."""
+
+    def __init__(self, args):
+        self.args = args
+        self.started = time.monotonic()
+        self.logger = None
+        self.current_stage = "preflight"
+        self.stages = []
+        self.scope_failures = []
+        self.summary = {"scientific_status": "not_run", "verification_status": "not_run",
+                        "git_status": "not_verified", "archive_status": "not_run",
+                        "encryption_status": "not_run", "upload_status": "not_run",
+                        "proof_status": "not_collected", "index_asset_url": None,
+                        "index_sha256": None, "status": "unexpected_error"}
+
+    @contextmanager
+    def stage(self, stage: str, **fields):
+        self.current_stage = stage
+        started = time.monotonic()
+        outcome = {"stage": stage, "status": "ok"}
+        stop = threading.Event()
+
+        def heartbeat():
+            while not stop.wait(DIAGNOSTIC_HEARTBEAT_SECONDS):
+                if self.logger is not None:
+                    self.logger.emit("stage_heartbeat", stage=stage,
+                                     elapsed_seconds=round(time.monotonic() - started, 3))
+
+        thread = None
+        diagnostics.emit("stage_start", stage=stage, **fields)
+        if self.logger is not None and self.logger.enabled:
+            try:
+                thread = threading.Thread(target=heartbeat, name="capture-stage-heartbeat", daemon=True)
+                thread.start()
+            except Exception as error:
+                thread = None
+                diagnostics.emit("exception", stage="diagnostic_heartbeat", **diagnostics.exception_fields(error))
+        try:
+            yield outcome
+        except BaseException as error:
+            detail = diagnostics.exception_fields(error, source_root=Path(__file__).resolve().parents[1])
+            if detail["failure_category"] == "collection_error":
+                detail["failure_category"] = {"verification": "verification_failed", "archive": "stage_failed",
+                    "encryption": "encryption_failed", "archive_upload": "upload_failed", "index_upload": "upload_failed",
+                    "proof_publication": "proof_failed"}.get(stage, "collection_error")
+            outcome.update(status="failed", **detail)
+            raise
+        finally:
+            stop.set()
+            if thread is not None:
+                try:
+                    thread.join(timeout=1)
+                except Exception as error:
+                    diagnostics.emit("exception", stage="diagnostic_heartbeat", **diagnostics.exception_fields(error))
+            outcome["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            if len(self.stages) < 32:
+                self.stages.append(dict(outcome))
+            diagnostics.emit("stage_end", **fields, **outcome)
+
+    def scientific(self, evidence: Path, result: dict, manifests: list[dict], verification: dict):
+        capture_id = None
+        self.summary.update(scientific_status=result.get("status", "unknown"),
+                            verification_status="passed" if verification.get("ok") else "failed",
+                            git_status=("verified" if verification.get("git_repositories_verified", 0) else "archive_verified_mirror_unverified")
+                                if verification.get("portable_git_bundles_verified", 0) else "not_verified",
+                            proof_status="pending_bitcoin_completion" if result.get("attestation") == "pending_bitcoin_completion" else "not_collected")
+        if str(result.get("attestation", "")).startswith("error:"):
+            self.summary["proof_status"] = "submission_failed"
+            diagnostics.emit("stage_end", stage="proof_receipt", status="failed", failure_category="proof_failed")
+        if len(manifests) == 1:
+            manifest = json.loads((evidence / manifests[0]["path"]).read_bytes())
+            capture_id = manifest.get("capture_id", manifest.get("run_id"))
+            scopes = (manifest.get("api") or {}).get("scope_statuses", {})
+            for scope, outcome in scopes.items():
+                if outcome.get("status") == "complete_for_query":
+                    continue
+                expected_unavailable = outcome.get("status") == "unavailable" and outcome.get("reason") in (
+                    "repository_pull_requests_disabled", "repository_issues_and_pull_requests_disabled")
+                detail = ({"reason": outcome["reason"]} if expected_unavailable else
+                          {"failure_category": outcome.get("failure_category") or diagnostics.failure_category(outcome.get("error", outcome.get("reason", "")))})
+                failure = diagnostics.safe_fields({"scope": scope, "status": outcome.get("status", "unknown"),
+                    "status_code": outcome.get("status_code"), "retry_not_before": outcome.get("retry_not_before"), **detail})
+                diagnostics.emit("scope_outcome", **failure)
+                if len(self.scope_failures) < 32:
+                    self.scope_failures.append(failure)
+            for value in manifest.get("failures", []):
+                diagnostics.emit("scientific_failure", failure_category=diagnostics.failure_category(value))
+        diagnostics.emit("scientific_outcome", **{key: self.summary[key] for key in ("scientific_status", "verification_status", "git_status")},
+                         repository_id=result.get("repository_id"), capture_id=capture_id, run_id=result.get("run_id"),
+                         **{key: verification.get(key, 0) for key in ("git_refs_verified", "git_repositories_verified",
+                             "portable_git_bundles_verified", "raw_observations", "partial_runs")})
+
+    def metadata(self):
+        return {"schema_version": 1, **diagnostics.safe_fields(self.summary),
+                "stages": [diagnostics.safe_fields(stage) for stage in self.stages],
+                "scope_outcomes": [diagnostics.safe_fields(scope) for scope in self.scope_failures]}
+
+    def finish(self, returncode: int):
+        safe = {key: "unknown" for key in ("status", "scientific_status", "verification_status", "git_status",
+                "archive_status", "encryption_status", "upload_status", "proof_status")}
+        safe.update(index_asset_url=None, index_sha256=None)
+        safe.update(diagnostics.safe_fields(self.summary))
+        diagnostics.emit("capture_end", **safe, returncode=returncode,
+                         elapsed_seconds=round(time.monotonic() - self.started, 3))
+        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            # All interpolated values are validated identities or fixed metadata
+            # codes; never render a traceback, body, header or exception message.
+            identity = self.logger.identity if self.logger is not None else {}
+            rows = [f"### Capture `{identity.get('repo', 'unknown')}`", "",
+                    f"Run `{identity.get('github_run_id', 'local')}` attempt `{identity.get('github_run_attempt', 'local')}`; code `{identity.get('collector_code_sha', 'unknown')}`.",
+                    f"Outcome: **{safe['status']}** (exit {returncode}).", "",
+                    "| Stage | Outcome |", "| --- | --- |"]
+            rows += [f"| {key.removesuffix('_status')} | {safe[key]} |" for key in (
+                "scientific_status", "verification_status", "git_status", "archive_status",
+                "encryption_status", "upload_status", "proof_status")]
+            rows += ["", f"Config SHA-256: `{identity.get('config_source_sha256', 'unknown')}`.",
+                     f"CSV SHA-256: `{identity.get('csv_sha256', 'unknown')}`."]
+            if returncode:
+                rows += [f"Terminal stage: `{diagnostics.safe_fields({'stage': self.current_stage}).get('stage', 'unknown')}`."]
+            if safe["index_asset_url"]:
+                rows += ["", f"[Retained evidence index]({safe['index_asset_url']})",
+                         f"SHA-256: `{safe['index_sha256']}`."]
+            rows += ["", "| Scope | Status | Category | HTTP | Recorded not-before UTC |", "| --- | --- | --- | --- | --- |"] if self.scope_failures else []
+            rows += [f"| {item.get('scope', 'unknown')} | {item.get('status', 'unknown')} | {item.get('failure_category', 'capability_unavailable' if item.get('status') == 'unavailable' else 'collection_error')} | {item.get('status_code', 'not_recorded')} | {retry_utc(item.get('retry_not_before'))} |"
+                     for scope in self.scope_failures for item in [diagnostics.safe_fields(scope)]]
+            rows += ["", "Next: retain this generation and repair only incomplete targets/scopes; respect any emitted retry deadline."
+                     if returncode else "Declared shallow baseline accepted; pending OTS is not verified Bitcoin evidence.", ""]
+            try:
+                with Path(summary_path).open("a") as stream:
+                    stream.write("\n".join(rows))
+            except OSError as error:
+                diagnostics.emit("summary_write_failed", **diagnostics.exception_fields(error))
 
 
 class PhaseDeadlineExceeded(BaseException):
@@ -124,6 +338,16 @@ def file_identity(path: Path) -> dict:
             digest.update(block)
             size += len(block)
     return {"name": path.name, "sha256": digest.hexdigest(), "bytes": size}
+
+
+def source_identities(args) -> dict:
+    identities = {}
+    for path, field in ((args.config, "config_source_sha256"), (args.csv, "csv_sha256")):
+        try:
+            identities[field] = file_identity(path)["sha256"]
+        except OSError:
+            pass  # The ordinary preflight records the actual failure.
+    return identities
 
 
 class SplitWriter(io.RawIOBase):
@@ -284,6 +508,8 @@ def wait_for_github_reset() -> bool:
             return False
     except (ValueError, KeyError, TypeError):
         return False
+    diagnostics.emit("transfer_retry", stage="github_cli", status="waiting_primary_reset", wait_seconds=round(delay, 3),
+                     retry_not_before=core["reset"])
     time.sleep(delay)
     return True
 
@@ -292,7 +518,18 @@ def gh(*args: str, timeout: int = 1800, retry_rate_limit: bool = True) -> bytes:
     # The runner supplies GH_TOKEN through the environment. Never print its value
     # or a command environment; gh performs authenticated HTTPS transfers.
     for attempt in range(2):
-        process = subprocess.run(["gh", *args], capture_output=True, timeout=timeout)
+        started = time.monotonic()
+        diagnostics.emit("stage_start", stage="github_cli", attempt=attempt + 1, max_attempts=2)
+        try:
+            process = subprocess.run(["gh", *args], capture_output=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostics.emit("exception", stage="github_cli", attempt=attempt + 1, max_attempts=2,
+                             **diagnostics.exception_fields(error))
+            raise
+        diagnostics.emit("stage_end", stage="github_cli", attempt=attempt + 1, max_attempts=2,
+                         status="ok" if process.returncode == 0 else "failed", returncode=process.returncode,
+                         signal=-process.returncode if process.returncode < 0 else None,
+                         elapsed_seconds=round(time.monotonic() - started, 3))
         if process.returncode == 0:
             return process.stdout
         if attempt == 0 and retry_rate_limit and wait_for_github_reset():
@@ -597,6 +834,8 @@ def parent_capture_outcomes_many(config: Config, sources: dict, repository: str,
 
 
 def plan(args) -> int:
+    started = time.monotonic()
+    diagnostics.emit("stage_start", stage="plan_selection")
     max_parallel = getattr(args, "max_parallel", DEFAULT_MAX_PARALLEL)
     if type(max_parallel) is not int or not 1 <= max_parallel <= MAX_PARALLEL_LIMIT:
         raise ValueError(f"max_parallel must be an integer between 1 and {MAX_PARALLEL_LIMIT}")
@@ -625,17 +864,39 @@ def plan(args) -> int:
             "remaining_parent_outcomes": [inherited[slug] for slug in remaining if slug in inherited],
             "claim": "Metadata-only accepted-capture reuse; no archive payload download or new observation. Live outcomes may change after planned_at.",
         }))
+    diagnostics.emit("stage_end", stage="plan_selection", status="planned", remaining_count=len(remaining),
+                     reused_count=outputs["inherited_complete_count"], max_parallel=max_parallel,
+                     elapsed_seconds=round(time.monotonic() - started, 3),
+                     config_source_sha256=sources["config_source_sha256"], csv_sha256=sources["csv_sha256"])
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with Path(summary_path).open("a") as stream:
+                stream.write(f"### Baseline plan\n\nVerified reused captures: **{outputs['inherited_complete_count']}**; selected targets: **{len(remaining)}**; validated concurrent workers: **{max_parallel}**.\n\nConfig SHA-256: `{sources['config_source_sha256']}`; CSV SHA-256: `{sources['csv_sha256']}`.\n")
+        except OSError as error:
+            diagnostics.emit("summary_write_failed", **diagnostics.exception_fields(error))
     print(json.dumps(outputs, indent=2))
     return 0
 
 
 def upload_asset(tag: str, path: Path, repository: str):
     try:
+        size = path.stat().st_size
+    except OSError:
+        size = None  # Diagnostic metadata must not replace normal upload handling.
+    diagnostics.emit("asset_upload_start", asset_name=path.name, bytes=size,
+                     asset_id=None, asset_id_reason="not_returned", attempt=1, max_attempts=2)
+    try:
         # A retry following an uncertain upload must first check the existing
         # asset. Never overwrite evidence with --clobber.
         gh("release", "upload", tag, str(path), "--repo", repository, retry_rate_limit=False)
-        return
-    except (RuntimeError, subprocess.TimeoutExpired):
+        diagnostics.emit("asset_uploaded", asset_name=path.name, bytes=size,
+                         asset_id=None, asset_id_reason="not_returned", attempt=1, max_attempts=2,
+                         asset_url=f"https://github.com/{repository}/releases/download/{tag}/{path.name}", status="uploaded")
+        return {"asset_id": None, "asset_id_reason": "not_returned", "attempts": 1}
+    except (RuntimeError, subprocess.TimeoutExpired) as error:
+        diagnostics.emit("transfer_retry", stage="asset_upload", asset_name=path.name, attempt=1, max_attempts=2,
+                         status="reconcile_before_retry", **diagnostics.exception_fields(error))
         wait_for_github_reset()
     release = release_by_tag(repository, tag)
     identity = file_identity(path)
@@ -643,10 +904,15 @@ def upload_asset(tag: str, path: Path, repository: str):
         if asset["name"] == path.name:
             try:
                 verify_remote_asset(repository, asset, identity)
-                return
+                diagnostics.emit("asset_uploaded", asset_name=path.name, bytes=identity["bytes"], sha256=identity["sha256"],
+                                 asset_id=asset.get("id"), attempt=1, max_attempts=2, status="reused_verified")
+                return {"asset_id": asset.get("id"), "attempts": 1, "reused_verified": True}
             except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
                 raise RuntimeError("Existing release asset cannot be confirmed identical; refusing overwrite") from error
     gh("release", "upload", tag, str(path), "--repo", repository, retry_rate_limit=False)
+    diagnostics.emit("asset_uploaded", asset_name=path.name, bytes=identity["bytes"], sha256=identity["sha256"],
+                     asset_id=None, asset_id_reason="not_returned", attempt=2, max_attempts=2, status="uploaded")
+    return {"asset_id": None, "asset_id_reason": "not_returned", "attempts": 2}
 
 
 def write_json(path: Path, value: dict):
@@ -655,6 +921,30 @@ def write_json(path: Path, value: dict):
 
 
 def capture(args) -> int:
+    diagnostic = CaptureDiagnostics(args)
+    returncode = 1
+    identities = source_identities(args)
+    with diagnostics.diagnostic_context(repo=args.slug, **actions_identity(), collector_code_sha=args.code_sha,
+            release_tag=args.release_tag, release_repository=args.release_repository,
+            source_root=Path(__file__).resolve().parents[1], **identities) as logger:
+        diagnostic.logger = logger
+        diagnostics.emit("capture_start", stage="preflight")
+        try:
+            returncode = _capture(args, diagnostic)
+            return returncode
+        except BaseException as error:
+            if isinstance(error, KeyboardInterrupt):
+                returncode = 130
+            elif isinstance(error, SystemExit):
+                returncode = error.code if type(error.code) is int else 1
+            diagnostic.summary["status"] = "failed_before_terminal_index" if diagnostic.summary["index_asset_url"] is None else "failed"
+            diagnostics.emit("capture_failure", stage=diagnostic.current_stage, **diagnostics.exception_fields(error))
+            raise
+        finally:
+            diagnostic.finish(returncode)
+
+
+def _capture(args, diagnostic: CaptureDiagnostics) -> int:
     config, sources = load_sources(args.config, args.csv)
     public_key = Path(getattr(args, "public_key", RESULTS_PUBLIC_KEY))
     recipient = public_key_fingerprint(public_key)  # fail before capture when no valid public key is configured
@@ -681,6 +971,7 @@ def capture(args) -> int:
         "results_encryption": {"format": "icsot-encrypted-v1", "recipient_spki_sha256": recipient},
         "errors": [],
     }
+    diagnostics.emit("capture_start", stage="collection", **sources)
     write_json(reports / "capture-request.json", index)
     write_json(reports / "environment.json", environment_report(work))
     result: dict = {"status": "unexpected_error"}
@@ -690,47 +981,67 @@ def capture(args) -> int:
         # the ordinary collector default or a monthly storage-budget layer.
         single = replace(config, root=evidence.resolve(), repositories=(args.slug,),
                          primary_rate_wait_seconds=3605, primary_rate_reserve=40)
-        with phase_deadline(CAPTURE_TIMEOUT_SECONDS, "Collection"):
-            result = collect_one(single, args.slug, "full", deep_full=False, bundle_full=True, stamp=True)
+        with diagnostic.stage("collection") as outcome:
+            with phase_deadline(CAPTURE_TIMEOUT_SECONDS, "Collection"):
+                result = collect_one(single, args.slug, "full", deep_full=False, bundle_full=True, stamp=True)
+            outcome["status"] = result.get("status", "unknown")
     except BaseException as error:
         result = {"repo": args.slug, "status": "unexpected_error", "error": f"{type(error).__name__}: {error}"}
         index["errors"].append(result["error"])
     finally:
+        diagnostic.current_stage = "collector_report"
         write_json(reports / "collector-result.json", result)
         try:
-            with phase_deadline(VERIFICATION_TIMEOUT_SECONDS, "Verification"):
-                verification = verify_all(evidence)
+            with diagnostic.stage("verification") as outcome:
+                with phase_deadline(VERIFICATION_TIMEOUT_SECONDS, "Verification"):
+                    verification = verify_all(evidence)
+                outcome["status"] = "passed" if verification.get("ok") else "failed"
         except BaseException as error:
             verification = {"ok": False, "errors": [f"{type(error).__name__}: {error}"]}
             index["errors"].append(f"Verification: {type(error).__name__}: {error}")
         write_json(reports / "verification.json", verification)
-        manifests = inspect_manifests(evidence)
+        with diagnostic.stage("evidence_inspection"):
+            manifests = inspect_manifests(evidence)
         index.update({"collector_result": result, "verification": verification, "manifests": manifests})
         index["capture_accepted"] = capture_accepted(result, verification, manifests)
+        try:
+            diagnostic.scientific(evidence, result, manifests, verification)
+        except Exception as error:
+            diagnostics.emit("exception", stage="scientific_diagnostics", **diagnostics.exception_fields(error))
         include_mirror = not can_omit_mirror(evidence, manifests, verification)
+        diagnostic.current_stage = "capture_outcome_report"
         write_json(reports / "capture-outcome.json", index)
         try:
-            archive = package_archive(work, assets, key, include_mirror=include_mirror)
+            with diagnostic.stage("archive"):
+                archive = package_archive(work, assets, key, include_mirror=include_mirror)
         except BaseException as error:
             index["errors"].append(f"Packaging: {type(error).__name__}: {error}")
             archive = {
                 "complete": False, "git_mirror_included": include_mirror,
                 "parts": [file_identity(path) for path in sorted(assets.glob(f"{key}.tar.xz.part-*"))],
             }
+        diagnostic.summary["archive_status"] = "complete" if archive.get("complete") else "incomplete"
         try:
-            archive = encrypt_archive_parts(archive, assets, public_key)
+            with diagnostic.stage("encryption"):
+                archive = encrypt_archive_parts(archive, assets, public_key)
         except BaseException as error:
             index["errors"].append(f"Encryption: {type(error).__name__}: {error}")
             # Preserve diagnostics without ever falling back to uploading plaintext.
             archive = {"complete": False, "encrypted": True, "parts": [], "recipient_spki_sha256": recipient}
         index["archive"] = archive
-        for part in archive["parts"]:
+        diagnostic.summary["encryption_status"] = "encrypted" if archive.get("encrypted") and archive["parts"] else "failed"
+        for ordinal, part in enumerate(archive["parts"], 1):
             try:
-                upload_asset(args.release_tag, assets / part["name"], args.release_repository)
+                with diagnostic.stage("archive_upload", part_ordinal=ordinal, part_count=len(archive["parts"]),
+                                      bytes=part["bytes"], sha256=part["sha256"], asset_name=part["name"]):
+                    uploaded = upload_asset(args.release_tag, assets / part["name"], args.release_repository)
+                if isinstance(uploaded, dict):
+                    part["upload_metadata"] = uploaded
                 part["uploaded"] = True
             except Exception as error:
                 part["uploaded"] = False
                 index["errors"].append(f"Upload {part['name']}: {type(error).__name__}: {error}")
+        diagnostic.summary["upload_status"] = "uploaded" if archive["parts"] and all(part["uploaded"] for part in archive["parts"]) else "incomplete"
         index["public_sidecars"] = []
         index["timestamp_evidence"] = {"opentimestamps": {"status": "not_collected"}}
         if len(manifests) == 1 and result.get("immutable_initial_proof"):
@@ -738,31 +1049,45 @@ def capture(args) -> int:
                 from icsot_observer.attestations import publish_ots_attestation
                 manifest = manifests[0]
                 timing = result.get("timestamp_provenance", {})
-                evidence = publish_ots_attestation(
-                    assets, manifest_sha256=manifest["sha256"], proof_path=Path(result["immutable_initial_proof"]),
-                    observation_started_at=manifest["started_at"], observation_finished_at=manifest["finished_at"],
-                    requested_at=timing.get("requested_at"), received_at=timing.get("received_at"),
-                    collected_at=timing.get("receipt_collected_at"))
-                for sidecar in (evidence["proof_asset"], evidence["metadata_asset"]):
-                    upload_asset(args.release_tag, assets / sidecar["name"], args.release_repository)
+                with diagnostic.stage("proof_publication"):
+                    timestamp_evidence = publish_ots_attestation(
+                        assets, manifest_sha256=manifest["sha256"], proof_path=Path(result["immutable_initial_proof"]),
+                        observation_started_at=manifest["started_at"], observation_finished_at=manifest["finished_at"],
+                        requested_at=timing.get("requested_at"), received_at=timing.get("received_at"),
+                        collected_at=timing.get("receipt_collected_at"))
+                    for sidecar in (timestamp_evidence["proof_asset"], timestamp_evidence["metadata_asset"]):
+                        upload_asset(args.release_tag, assets / sidecar["name"], args.release_repository)
                 index.update(observation_started_at=manifest["started_at"], observation_finished_at=manifest["finished_at"],
                              manifest_sha256=manifest["sha256"], repository_id=manifest["repository_id"],
-                             clock_source="runner_system_clock", public_sidecars=[evidence["proof_asset"], evidence["metadata_asset"]],
-                             timestamp_evidence={"opentimestamps": evidence})
+                             clock_source="runner_system_clock", public_sidecars=[timestamp_evidence["proof_asset"], timestamp_evidence["metadata_asset"]],
+                             timestamp_evidence={"opentimestamps": timestamp_evidence})
+                diagnostic.summary["proof_status"] = "pending_bitcoin_completion"
             except Exception as error:
                 index["timestamp_evidence"] = {"opentimestamps": {"status": "publication_failed"}}
                 index["errors"].append(f"Timestamp sidecars: {type(error).__name__}: {error}")
+                diagnostic.summary["proof_status"] = "publication_failed"
         index["finished_at"] = utc_iso()
         index["complete"] = bool(index["capture_accepted"] and archive["complete"] and archive["parts"] and
                                  all(part["uploaded"] for part in archive["parts"]) and not index["errors"])
         index["status"] = "complete_for_declared_shallow_baseline" if index["complete"] else "incomplete"
+        diagnostic.summary["status"] = index["status"]
+        index["diagnostics"] = diagnostic.metadata()
         index_path = assets / (key + ".index.json")
-        write_json(index_path, index)
+        diagnostic.current_stage = "index_write"
+        write_json(index_path, public_index_projection(index, evidence))
         # An index is uploaded only after every part has been attempted. It is
         # also emitted for failed captures and failed/partial archive uploads.
-        upload_asset(args.release_tag, index_path, args.release_repository)
+        with diagnostic.stage("index_upload"):
+            upload_asset(args.release_tag, index_path, args.release_repository)
+        try:
+            index_digest = file_identity(index_path)["sha256"]
+        except OSError as error:
+            index_digest = None
+            diagnostics.emit("exception", stage="index_digest_diagnostic", **diagnostics.exception_fields(error))
+        diagnostic.summary.update(index_asset_url=f"https://github.com/{args.release_repository}/releases/download/{args.release_tag}/{index_path.name}",
+                                  index_sha256=index_digest)
         print(json.dumps({"repository": args.slug, "status": index["status"], "index_asset": index_path.name,
-                          "parts": len(archive["parts"]), "errors": index["errors"]}, indent=2))
+                          "parts": len(archive["parts"]), "errors": public_index_projection(index, evidence)["errors"]}, indent=2))
     return 0 if index["complete"] else 2
 
 
@@ -814,6 +1139,50 @@ def publish_baseline_timestamp_catalog(args, summary: dict, current_rows: list[d
 
 
 def finalize(args) -> int:
+    started, returncode = time.monotonic(), 1
+    with diagnostics.diagnostic_context(**actions_identity(), collector_code_sha=args.code_sha,
+            release_tag=args.release_tag, release_repository=args.release_repository,
+            source_root=Path(__file__).resolve().parents[1], **source_identities(args)):
+        diagnostics.emit("finalize_start", stage="inventory")
+        try:
+            returncode = _finalize(args)
+            return returncode
+        except BaseException as error:
+            if isinstance(error, KeyboardInterrupt):
+                returncode = 130
+            diagnostics.emit("exception", stage="finalization", **diagnostics.exception_fields(error))
+            raise
+        finally:
+            diagnostics.emit("finalize_end", stage="finalization", returncode=returncode,
+                             status="complete" if returncode == 0 else "incomplete" if returncode == 2 else "failed",
+                             elapsed_seconds=round(time.monotonic() - started, 3))
+            summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+            if summary_path:
+                rows = ["### Baseline finalization", "", f"Exit: `{returncode}`."]
+                inventory = args.work_root / "baseline-inventory.json"
+                if inventory.is_file():
+                    try:
+                        record = json.loads(inventory.read_bytes())
+                        counts = {key: value if type(value) is int and 0 <= value <= EXPECTED_REPOSITORIES else "unknown"
+                                  for key, value in ((name, record[name]) for name in ("complete_repositories", "incomplete_repositories"))}
+                        rows += [f"Accepted: **{counts['complete_repositories']}**; incomplete/missing: **{counts['incomplete_repositories']}**."]
+                        url = diagnostics.safe_fields({"asset_url": f"https://github.com/{args.release_repository}/releases/download/{args.release_tag}/baseline-inventory.json"}).get("asset_url")
+                        if returncode in (0, 2) and url:
+                            rows += [f"[Retained inventory]({url})"]
+                        else:
+                            rows += ["Local inventory candidate exists; remote publication was not confirmed."]
+                        rows += [f"SHA-256: `{file_identity(inventory)['sha256']}`."]
+                    except (OSError, ValueError, KeyError):
+                        rows += ["Inventory unavailable or not confirmed; inspect safe diagnostic events."]
+                rows += ["A nonzero result preserves explicit gaps; retry only incomplete targets/scopes in a new generation.", ""]
+                try:
+                    with Path(summary_path).open("a") as stream:
+                        stream.write("\n".join(rows))
+                except OSError as error:
+                    diagnostics.emit("summary_write_failed", **diagnostics.exception_fields(error))
+
+
+def _finalize(args) -> int:
     config, sources = load_sources(args.config, args.csv)
     release = release_by_tag(args.release_repository, args.release_tag)
     target = release.get("target_commitish", "")
@@ -854,6 +1223,7 @@ def finalize(args) -> int:
         if not row["complete"] and inherited.get(slug, {}).get("complete"):
             row = inherited[slug]
         summary["repositories"].append(row)
+        diagnostics.emit("finalize_target", repo=slug, status="accepted" if row["complete"] else "incomplete")
     summary["complete_repositories"] = sum(row["complete"] for row in summary["repositories"])
     summary["incomplete_repositories"] = len(config.repositories) - summary["complete_repositories"]
     summary["complete"] = summary["incomplete_repositories"] == 0
@@ -945,10 +1315,19 @@ def main(argv=None) -> int:
     if args.command == "plan":
         if requested_parent_tags(args) and not args.release_repository:
             parser.error("--release-repository is required with --parent-release-tag")
-        return plan(args)
+        with diagnostics.diagnostic_context(**actions_identity(), collector_code_sha=os.getenv("GITHUB_SHA"),
+                release_repository=args.release_repository, source_root=Path(__file__).resolve().parents[1]):
+            diagnostics.emit("plan_start", stage="preflight")
+            started, returncode = time.monotonic(), 1
+            try:
+                returncode = plan(args)
+                return returncode
+            finally:
+                diagnostics.emit("plan_end", status="complete" if returncode == 0 else "failed",
+                                 returncode=returncode, elapsed_seconds=round(time.monotonic() - started, 3))
     if not REPO_RE.fullmatch(args.release_repository) or not re.fullmatch(r"corpus-baseline-[0-9]+-[0-9]+", args.release_tag):
         raise ValueError("Invalid release destination")
-    actual_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    actual_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.PIPE).strip()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.code_sha):
         raise ValueError("Expected a full capture code SHA")
     if args.command == "capture" and args.code_sha != actual_sha:
@@ -958,5 +1337,25 @@ def main(argv=None) -> int:
     return capture(args) if args.command == "capture" else finalize(args)
 
 
+def entrypoint(argv=None) -> int:
+    """No uncaught exception message or source excerpt reaches Actions logs."""
+    try:
+        return main(argv)
+    except (Exception, KeyboardInterrupt) as error:
+        returncode = 130 if isinstance(error, KeyboardInterrupt) else 1
+        with diagnostics.diagnostic_context(enabled=True, max_events=16, max_bytes=8192,
+                                            source_root=Path(__file__).resolve().parents[1]):
+            fields = diagnostics.exception_fields(error, source_root=Path(__file__).resolve().parents[1])
+            diagnostics.emit("capture_failure", stage="entrypoint", returncode=returncode, **fields)
+            summary = os.getenv("GITHUB_STEP_SUMMARY")
+            if summary:
+                try:
+                    with Path(summary).open("a") as stream:
+                        stream.write(f"\nCollector command failed: `{fields.get('failure_category', 'unknown')}` / `{fields.get('error_type', 'Error')}`; exit `{returncode}`. See safe diagnostic events.\n")
+                except OSError:
+                    pass
+        return returncode
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint())
