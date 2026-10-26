@@ -40,3 +40,7 @@ The CLI above handles the machine's unencrypted PEM RSA key. The Python decrypti
 The original baseline's JSON indexes remain unchanged. `encryption-migration-index.json` links their original part names, sizes and hashes to verified encrypted replacements. It also identifies preserved copies of older Actions artifacts. The migration runs while private, verifies decryption locally and the uploaded ciphertext identity, then removes the exact plaintext asset/artifact IDs only after the complete mapping verifies.
 
 A resumed baseline references verified complete parent captures through that migration map and captures the remaining targets. Historical partial evidence stays retained; a new attempt never overwrites it.
+
+## Recurring state
+
+An encryption-only runner cannot decrypt old archives to restore its working mirrors. Keep incremental collection state on a trusted persistent host, or explicitly design another approved decryption arrangement before enabling recurrence. Public hash/ref indexes alone do not replace the Git object history needed for efficient incremental fetches. This baseline does not put a private key in GitHub to solve that problem.
