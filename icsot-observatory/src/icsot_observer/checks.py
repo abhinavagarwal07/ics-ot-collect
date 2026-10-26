@@ -44,7 +44,8 @@ def _verify_portable_bundle(bundle_path: Path, git_info: dict[str, Any]) -> None
         # could misleadingly verify against the collector's populated mirror.
         bundle = str(bundle_path.resolve())
         run_git(["-C", str(restored), "bundle", "verify", bundle], timeout=1800)
-        run_git(["-C", str(restored), "fetch", "--no-tags", bundle, "+refs/*:refs/*"], timeout=1800)
+        run_git(["-C", str(restored), "fetch", "--no-tags", bundle, "+refs/*:refs/*",
+                 "--no-auto-maintenance"], timeout=1800)
         run_git(["-C", str(restored), "fsck", "--full", "--no-reflogs"], timeout=1800)
         restored_refs = {}
         for line in run_git(["-C", str(restored), "for-each-ref", "--format=%(refname) %(objectname)"]).splitlines():

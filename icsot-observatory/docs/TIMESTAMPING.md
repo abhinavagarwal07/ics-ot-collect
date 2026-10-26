@@ -23,6 +23,18 @@ Keep these outcomes distinct: pending calendar receipt; Bitcoin attestation pres
 
 Record proof hash, verification time, Bitcoin network, block height/hash, and verification method when available. A Bitcoin block supplies an existence bound; its header time is approximate. The CLI's success message prints a date in the local timezone, so do not parse it as an exact UTC anchoring time. Collector observation intervals remain separate from timestamp evidence, which does not authenticate GitHub as the source.
 
+## Automatic delayed-proof maintenance
+
+Repository observations remain manual. The separate `timestamp-refresh.yml` workflow is scheduled once per 24 hours at 04:43 UTC and supports manual dispatch, using only public indexes, proof sidecars and calendars. It attempts at most 128 proofs within its time budget; keeping up with the full 185-repository backlog is not established. It does not recapture repositories, decrypt evidence or load either RSA private key.
+
+After public sidecars/indexes are uploaded, the collector uploads `metadata-catalog.json` last, verifies its remote hash/size, and registers the catalog on `collector-attestations` before publishing the new `collector-state` pointer. Registration is idempotent and uses compare-and-swap; a failed registration preserves the previous working-state pointer. Bounded Release discovery provides fallback recovery, and unmarked/incomplete releases stay retry candidates.
+
+The worker keeps an operational pending queue separately from retained proof histories. An upgraded `.ots` and its canonical metadata are new immutable assets linked to the previous proof/metadata hashes; original files and frozen observation times remain unchanged. Rate refusals, calendar failures and partial discovery remain explicit and retryable.
+
+The shipped default has no trusted Bitcoin Core endpoint. A downloaded Bitcoin attestation is recorded as `bitcoin_attestation_unverified`, never promoted to verified by its presence or a block explorer. Queued proofs can be verified only through explicitly configured trusted Bitcoin Core RPC; keep that credential in protected configuration. Scheduling proof refresh does not schedule repository collection or satisfy the separate monthly storage-cap requirement.
+
+Proofs reaching Bitcoin-attestation presence without RPC leave the pending queue as `awaiting_trusted_rpc`, with their history retained. Adding a trusted node later does not rescan that archive automatically. The native maintenance CLI can requeue a bounded catalog with `--requeue-catalog CATALOG_SHA`; its returned cursor supports larger catalogs. No Docker is required.
+
 ## RFC 3161
 
 A configured TSA can return an immediately verifiable signed timestamp without a code-signing private key. Configure the endpoint, accepted trust roots, optional intermediate certificates and acceptable TSA policy. Do not silently select a different provider or treat certificates supplied by a response as trust anchors. Missing configuration, request failure, received-but-unverified response, and verified response are separate outcomes.

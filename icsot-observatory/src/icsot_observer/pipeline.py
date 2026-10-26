@@ -647,7 +647,7 @@ def _restore_mirrors(root: Path) -> dict[str, Any]:
             run_git(["init", "--bare", f"--object-format={object_format}", str(mirror)])
             bundle = str(store.location(git["portable_full_bundle"]["sha256"]).resolve())
             run_git(["-C", str(mirror), "bundle", "verify", bundle], timeout=1800)
-            run_git(["-C", str(mirror), "fetch", "--no-tags", bundle, "+refs/*:refs/*"], timeout=1800)
+            run_git(["-C", str(mirror), "fetch", "--no-auto-maintenance", "--no-tags", bundle, "+refs/*:refs/*"], timeout=1800)
         else:
             raise RuntimeError("No portable Git closure for missing mirror")
         if git.get("remote"):
@@ -1015,6 +1015,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                                     rfc3161_url=rfc3161_url, rfc3161_ca=rfc3161_ca, rfc3161_chain=rfc3161_chain)
         release_tag = f"collector-observations-r{repository_id}-g{uuid.uuid4().hex}"
         dependencies, uploaded_evidence_bytes = [], 0
+        proof_registration = None
         uploaded_assets: dict[str, dict] = {}
         publication_observations = []
         known = {entry["index"]["manifest_sha256"] for entry in catalog["exports"]}
@@ -1069,6 +1070,15 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
             dependencies.append(marker_ref)
             uploaded_evidence_bytes += marker_ref["ciphertext_bytes"]
             catalog.setdefault("publication_markers", []).append(marker_ref)
+            verified_marker = Path(temporary) / "verified-public-marker.json"
+            transport.download_asset(release_tag, marker_path.name, verified_marker)
+            if (_file_sha256(verified_marker) != marker_ref["ciphertext_sha256"] or
+                    verified_marker.stat().st_size != marker_ref["ciphertext_bytes"]):
+                raise RuntimeError("Public metadata catalog differs from the uploaded completion marker")
+            # Import only after all immutable public evidence is remotely
+            # available. Failure keeps the previous working-state pointer.
+            from .proof_maintenance import register_catalog
+            proof_registration = register_catalog(transport, _public_asset_ref(marker_ref))
         raw_catalog = canonical_json(catalog)
         temporary_catalog = root / (".transfer-catalog-" + uuid.uuid4().hex + ".tmp")
         try:
@@ -1104,13 +1114,15 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                                                          _rfc3161_policy(rfc3161_url, rfc3161_ca, rfc3161_chain))))},
                                       lane_heads=lane_heads,
                                       evidence_heads={"catalog_sha256": sha256(raw_catalog),
-                                                      "export_manifest_sha256": sorted(known)})
+                                                      "export_manifest_sha256": sorted(known),
+                                                      "proof_registration": proof_registration})
     publication_summary = {key: value for key, value in publication.items() if key != "pointer"}
     for field in ("snapshot_started_at", "snapshot_sealed_at", "clock_source"):
         publication_summary[field] = publication["pointer"][field]
     return {"repository_id": repository_id, "slug": slug, "collection": collection,
             "restore": restore_report, "publication": publication_summary,
             "new_evidence_upload_bytes": uploaded_evidence_bytes,
+            "proof_maintenance_registration": proof_registration or {"status": "no_new_catalog"},
             "monthly_cap_enforced": False,
             "deployment_scope": "one manually selected repository; no recurring schedule"}
 

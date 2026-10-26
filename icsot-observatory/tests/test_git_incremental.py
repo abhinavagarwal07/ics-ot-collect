@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from icsot_observer import gitarchive, gitstore
-from icsot_observer.checks import verify_all
+from icsot_observer.checks import _verify_portable_bundle, verify_all
 from icsot_observer.core import ObjectStore, canonical_json, sha256, write_once
 from icsot_observer.gitarchive import descriptor_digest, verify_portable_archive
 from icsot_observer.gitstore import collect_git, run_git
@@ -157,6 +157,32 @@ def test_annotated_tag_only_change_creates_real_object_delta(incremental_source,
     assert descriptor["bundle"]["prerequisite_object_ids"] == []
     assert descriptor["prerequisites"] == [baseline["portable_archive"]["bundle"]]
     verify_portable_archive(root, info, tmp_path / "restored.git")
+
+
+def test_controlled_fetches_do_not_launch_detached_maintenance(incremental_source, tmp_path, monkeypatch):
+    root, source = incremental_source
+    capture(root, "capture1")
+    next_commit(source)
+    trace = tmp_path / "git-trace.jsonl"
+    monkeypatch.setenv("GIT_TRACE2_EVENT", str(trace))
+    info = capture(root, "capture2")
+    verify_portable_archive(root, info, tmp_path / "restored.git")
+    # Cover the independently supported legacy full-bundle verifier too.
+    full = tmp_path / "full.bundle"
+    run_git(["-C", str(root / info["mirror_path_relative"]), "bundle", "create", str(full), "--all"])
+    _verify_portable_bundle(full, info)
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    fetches = [event["argv"] for event in events
+               if event["event"] == "start" and "fetch" in event.get("argv", [])]
+    assert len(fetches) == 5  # Source, cache, baseline+delta restore, legacy restore.
+    assert all("--no-auto-maintenance" in args for args in fetches)
+    assert not [event for event in events if event["event"] == "child_start" and
+                "maintenance" in event.get("argv", [])]
+    mirror = root / info["mirror_path_relative"]
+    cache = mirror / "icsot-verified-archive.git"
+    for repo in (mirror, cache):
+        assert not (repo / "gc.pid").exists()
+        assert not (repo / "maintenance.pid").exists()
 
 
 @pytest.mark.parametrize("corruption", ["missing", "wrong-size", "wrong-header-prerequisites", "wrong-lineage"])

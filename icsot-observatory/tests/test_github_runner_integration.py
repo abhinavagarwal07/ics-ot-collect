@@ -1,4 +1,5 @@
 import hashlib
+import copy
 import io
 import json
 import shutil
@@ -19,6 +20,9 @@ class MemoryGitHub:
     def __init__(self):
         self.head, self.counter = None, 0
         self.commits, self.assets, self.events = {}, {}, []
+        from icsot_observer.proof_maintenance import empty_state
+        self.proof_head, self.proof_state, self.proof_records = None, empty_state(), {}
+        self.proof_saves, self.fail_registration = 0, False
 
     def branch_head(self):
         return self.head
@@ -58,6 +62,32 @@ class MemoryGitHub:
     def download_asset(self, tag, name, destination):
         destination.write_bytes(self.assets[tag, name])
         self.events.append(("download", tag, name))
+
+    def load(self):
+        return self.proof_head, copy.deepcopy(self.proof_state)
+
+    def record(self, head, path):
+        assert head == self.proof_head
+        return self.proof_records.get(path)
+
+    def fetch(self, ref):
+        data = self.assets[ref["release_tag"], ref["name"]]
+        assert sha256(data) == ref["sha256"] and len(data) == ref["bytes"]
+        self.events.append(("proof_fetch", ref["release_tag"], ref["name"]))
+        return data
+
+    def save(self, parent, state, records=None):
+        from icsot_observer.github_state import StateConflictError, StateDeferredError
+        if self.fail_registration:
+            raise StateDeferredError("proof registration quota refusal", retry_not_before=2000000000, reason="rate_limit")
+        if parent != self.proof_head:
+            raise StateConflictError("concurrent proof queue update")
+        self.proof_saves += 1
+        self.proof_head = f"proof-{self.proof_saves}"
+        self.proof_state = copy.deepcopy(state)
+        self.proof_records.update(records or {})
+        self.events.append(("proof_registration", self.proof_head))
+        return self.proof_head
 
 
 def keys(tmp_path, prefix):
@@ -151,6 +181,7 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
     assert first["collection"]["runtime"]["completed"] == 2
     assert first["monthly_cap_enforced"] is False
     assert first["publication"]["state_uploaded_ciphertext_bytes"] > 0
+    assert first["proof_maintenance_registration"]["status"] == "registered"
     first_pointer = json.loads(transport.read_pointer(transport.head, 17))
     assert first_pointer["snapshot_sealed_at"] == first["publication"]["snapshot_sealed_at"]
     assert first_pointer["clock_source"] == "runner_system_clock"
@@ -163,6 +194,7 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
     assert second["restore"]["restored"] is True
     assert second["collection"]["runtime"]["completed"] == 2
     assert len(calls) == 4 and len(set(calls)) == 4
+    assert second["proof_maintenance_registration"]["status"] == "registered"
     assert second["new_evidence_upload_bytes"] < first["new_evidence_upload_bytes"]
     assert not any(event[0] == "download" and (event[1], event[2]) in prior_evidence for event in transport.events)
     catalog = json.loads((root / "transfer-catalog.json").read_bytes())
@@ -193,6 +225,10 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
                for member in entry["index"]["members"])
     pointer_position = next(n for n, event in enumerate(transport.events) if event[0] == "pointer")
     assert all(n < pointer_position for n, event in enumerate(transport.events) if event[0] == "upload")
+    registration_position = next(n for n, event in enumerate(transport.events) if event[0] == "proof_registration")
+    marker_verification_position = next(n for n, event in enumerate(transport.events)
+                                        if event[0] == "download" and event[2] == "metadata-catalog.json")
+    assert marker_verification_position < registration_position < pointer_position
     releases = {tag for tag, name in transport.assets if tag.startswith("collector-observations-r17-")}
     for release in releases:
         marker = json.loads(transport.assets[release, "metadata-catalog.json"])
@@ -210,7 +246,41 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
     for ref in catalog["publication_markers"]:
         assert any(item["name"] == ref["name"] and item["release_tag"] == ref["release_tag"]
                    for item in selected.index["dependencies"])
+    from icsot_observer.proof_maintenance import register_catalog
+    saves = transport.proof_saves
+    for ref in catalog["publication_markers"]:
+        assert register_catalog(transport, pipeline._public_asset_ref(ref))["status"] == "already_registered"
+    assert transport.proof_saves == saves
     assert not any("private" in name for tag, name in transport.assets)
+    if stamp and not rfc:
+        from icsot_observer.github_state import StateDeferredError
+        old_head, old_pointer = transport.head, transport.read_pointer(transport.head, 17)
+        old_state_assets = {key for key in transport.assets if key[0].startswith("collector-state-")}
+        old_markers = {(ref["release_tag"], ref["name"]) for ref in catalog["publication_markers"]}
+        old_proof_records = dict(transport.proof_records)
+        shutil.rmtree(root)
+        transport.fail_registration = True
+        with pytest.raises(StateDeferredError, match="registration quota"):
+            pipeline.run_github_persistent(config, observation_key="registration-refusal", **options)
+        assert transport.head == old_head and transport.read_pointer(old_head, 17) == old_pointer
+        assert transport.proof_records == old_proof_records
+        assert {key for key in transport.assets if key[0].startswith("collector-state-")} == old_state_assets
+        new_markers = [key for key in transport.assets if key[0].startswith("collector-observations-")
+                       and key[1] == "metadata-catalog.json" and key not in old_markers]
+        assert len(new_markers) == 1
+        marker_tag, marker_name = new_markers[0]
+        marker_bytes = transport.assets[new_markers[0]]
+        marker_ref = {"release_tag": marker_tag, "name": marker_name,
+                      "sha256": sha256(marker_bytes), "bytes": len(marker_bytes)}
+        captures_after_refusal = len(calls)
+        with pytest.raises(StateDeferredError):
+            register_catalog(transport, marker_ref)
+        assert transport.head == old_head
+        transport.fail_registration = False
+        assert register_catalog(transport, marker_ref)["status"] == "registered"
+        assert register_catalog(transport, marker_ref)["status"] == "already_registered"
+        assert len(calls) == captures_after_refusal
+        assert transport.head == old_head and transport.read_pointer(old_head, 17) == old_pointer
 
 
 def test_github_cli_deferral_reports_retry_utc_without_implying_capture_success(tmp_path, monkeypatch, capsys):

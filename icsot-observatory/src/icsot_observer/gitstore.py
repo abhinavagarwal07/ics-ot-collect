@@ -78,7 +78,14 @@ def run_git(args: list[str], *, timeout: int = 1200, input_text: str | None = No
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
                  "GIT_NAMESPACE", "GIT_SHALLOW_FILE", "GIT_CONFIG_PARAMETERS"):
         env.pop(name, None)
-    env["GIT_CONFIG_COUNT"] = "0"
+    # Git 2.55 can detach geometric repacking after even a small fetch. A
+    # verifier needs a stable pack inventory until fsck completes. Apply this
+    # only to our commands; never change the user's Git configuration.
+    env["GIT_CONFIG_COUNT"] = "2"
+    env["GIT_CONFIG_KEY_0"] = "maintenance.auto"
+    env["GIT_CONFIG_VALUE_0"] = "false"
+    env["GIT_CONFIG_KEY_1"] = "gc.auto"
+    env["GIT_CONFIG_VALUE_1"] = "0"
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
     p = subprocess.run(["git", *args], env=env, capture_output=True, text=True,
                        input=input_text, timeout=timeout)
@@ -257,7 +264,7 @@ def collect_git(root: Path, slug: str, repo_id: int, rid: str,
         before, before_peeled = _remote_ref_advertisement(remote)
         # Track heads, tags, and GitHub pull head refs separately from permanent refs.
         run_git([
-            "-C", str(repo), "fetch", "--no-prune", "--no-tags", "origin",
+            "-C", str(repo), "fetch", "--no-auto-maintenance", "--no-prune", "--no-tags", "origin",
             "+refs/heads/*:refs/live/heads/*",
             "+refs/tags/*:refs/live/tags/*",
             "+refs/pull/*/head:refs/live/pull/*/head",

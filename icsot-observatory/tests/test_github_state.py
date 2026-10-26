@@ -694,8 +694,8 @@ def test_transport_runner_token_headroom_refuses_before_state_publication():
     with pytest.raises(StateDeferredError, match="headroom") as failure:
         transport.publication_budget(60)
     assert failure.value.retry_not_before == 5000
-    assert failure.value.request_count == 1
-    assert runner.calls == [("GET", "rate_limit")]
+    assert failure.value.request_count == 2
+    assert runner.calls == [("GET", "repos/owner/collector"), ("GET", "rate_limit")]
 
 
 @pytest.mark.parametrize("primary", [False, True])
@@ -767,3 +767,85 @@ def test_snapshot_utc_interval_roundtrip_and_pointer_context_mismatch(setup, mon
         store.restore(StateSelection(selected.head, changed_pointer, selected.index))
     restored = store.restore(selected)
     assert restored["restored"]
+
+
+def rate_response(args, value, *, remaining, reset=5000, limit=1000, resource="core"):
+    raw = (f"HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: {remaining}\r\n"
+           f"X-RateLimit-Reset: {reset}\r\nX-RateLimit-Limit: {limit}\r\n"
+           f"X-RateLimit-Resource: {resource}\r\n\r\n").encode() + json.dumps(value).encode()
+    return subprocess.CompletedProcess(args, 0, raw, b"")
+
+
+def test_budget_generic_larger_bucket_cannot_increase_repository_headroom():
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if args[2] == "rate_limit":
+            value = {"resources": {"core": {"remaining": 2513, "reset": 6000, "limit": 5000}}}
+            return rate_response(args, value, remaining=2513, reset=6000, limit=5000)
+        return rate_response(args, {}, remaining=600, reset=5000, limit=1000)
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    with pytest.raises(StateDeferredError) as failure:
+        transport.publication_budget(600)
+    assert transport.rate_remaining == 599  # Repository probe, then conservative local-call charge.
+    assert transport.rate_reset == 5000
+    assert failure.value.retry_not_before == 5000
+    metrics = failure.value.rate_measurements
+    assert metrics["destination_github_repository_rate_probe"] == {
+        "remaining": 600, "reset": 5000, "limit": 1000, "resource": "core"}
+    assert metrics["destination_github_generic_core_rate_probe"]["remaining"] == 2513
+    assert metrics["destination_github_generic_rate_response_headers"]["limit"] == 5000
+    assert metrics["destination_github_rate_remaining_before_state_upload"] == 599
+    assert calls == ["repos/owner/collector", "rate_limit"]
+
+
+def test_repository_same_reset_cannot_increase_recent_observed_headroom():
+    values = iter((400, 700, 800))
+    def runner(args, **kwargs):
+        return rate_response(args, {}, remaining=next(values))
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    transport._api("repos/owner/collector")
+    assert transport.rate_remaining == 400
+    transport._api("repos/owner/collector/releases")
+    assert transport.rate_remaining == 399
+    transport._api("repos/owner/collector/git/ref/heads/collector-state")
+    assert transport.rate_remaining == 398
+    assert transport.rate_reset == 5000
+
+
+def test_different_active_resets_expire_independently_before_headroom_increases():
+    now = [1000]
+    values = iter(((100, 1100), (500, 1200), (700, 1200)))
+    def runner(args, **kwargs):
+        remaining, reset = next(values)
+        return rate_response(args, {}, remaining=remaining, reset=reset)
+    transport = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: now[0], rate_reserve=0)
+    transport._api("repos/owner/collector")
+    transport._api("repos/owner/collector/releases")
+    assert (transport.rate_remaining, transport.rate_reset) == (99, 1100)
+    now[0] = 1100
+    transport._api("repos/owner/collector/git/ref/heads/collector-state")
+    assert (transport.rate_remaining, transport.rate_reset) == (499, 1200)
+
+
+def test_transport_runtime_clone_preserves_constraints_and_probe_metadata():
+    def runner(args, **kwargs):
+        if args[2] == "rate_limit":
+            value = {"resources": {"core": {"remaining": 2513, "reset": 6000, "limit": 5000}}}
+            return rate_response(args, value, remaining=2513, reset=6000, limit=5000)
+        return rate_response(args, {}, remaining=600)
+    original = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    original.publication_budget(10)
+    wrapped = GhCliStateTransport("owner/collector", runner=runner, clock=lambda: 1000)
+    original.copy_runtime_state_to(wrapped)
+    assert wrapped.last_budget_metrics == original.last_budget_metrics
+    assert wrapped._rate_windows == original._rate_windows
+    assert wrapped._rate_windows is not original._rate_windows
+    wrapped._api("repos/owner/collector/releases")
+    assert wrapped.rate_remaining == 598
+    wrapped.copy_runtime_state_to(original)
+    assert original.rate_remaining == 598
+    assert original.request_count == 3
+    assert original._last_repo_rate_headers["remaining"] == 600
+    with pytest.raises(ValueError, match="cannot cross"):
+        original.copy_runtime_state_to(GhCliStateTransport("other/repository"))

@@ -248,7 +248,16 @@ def test_complete_capture_omits_verified_mirror_and_restores_offline(tmp_path, m
     assert not any(name.startswith("evidence/git") for name in names)
     manifest = restored / "evidence" / index["manifests"][0]["path"]
     assert hashlib.sha256(manifest.read_bytes()).hexdigest() == index["manifests"][0]["sha256"]
+    restore_fetches = []
+
+    def traced_git(arguments, **kwargs):
+        if len(arguments) > 2 and arguments[2] == "fetch":
+            restore_fetches.append(arguments)
+        return run_git(arguments, **kwargs)
+
+    monkeypatch.setattr("icsot_observer.gitstore.run_git", traced_git)
     verification = baseline.restore_mirrors(restored / "evidence")
+    assert restore_fetches and all("--no-auto-maintenance" in command for command in restore_fetches)
     assert verification["ok"], verification["errors"]
     assert verification["git_repositories_verified"] == 1
     assert verification["portable_git_bundles_verified"] == 1

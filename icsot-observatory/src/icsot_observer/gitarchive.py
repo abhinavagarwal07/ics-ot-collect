@@ -137,7 +137,8 @@ def _apply_archive(store: ObjectStore, repo: Path, descriptor: dict[str, Any]) -
                     raise RuntimeError("Portable Git baseline does not contain declared immutable ref")
         retained = _refs(repo, "refs/archive/")
         run_git(["-C", str(repo), "bundle", "verify", str(path)], timeout=1800)
-        run_git(["-C", str(repo), "fetch", "--no-tags", str(path), "+refs/*:refs/*"], timeout=1800)
+        run_git(["-C", str(repo), "fetch", "--no-tags", str(path), "+refs/*:refs/*",
+                 "--no-auto-maintenance"], timeout=1800)
         actual = _refs(repo, "refs/archive/")
         if any(actual.get(ref) != oid for ref, oid in retained.items()):
             raise RuntimeError("Portable Git archive overwrote an earlier immutable ref")

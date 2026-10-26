@@ -13,6 +13,7 @@ Git ancestry detects concurrent writers, not an administrator replacing history.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import lzma
@@ -158,10 +159,69 @@ class GhCliStateTransport:
         self.rate_remaining: int | None = None
         self.rate_reset: float | None = None
         self.retry_not_before: float | None = None
+        self._rate_windows: dict[tuple, int] = {}
+        self._last_repo_rate_headers: dict[str, Any] = {}
+        self._last_response_rate_headers: dict[str, Any] = {}
+        self.last_budget_metrics: dict[str, Any] = {}
         self._releases: dict[str, dict] = {}
         self._assets: dict[str, dict[str, dict]] = {}
         self._listed: set[str] = set()
         self._git_files: dict[tuple[str, str], bytes | None] = {}
+
+    def copy_runtime_state_to(self, other: "GhCliStateTransport") -> None:
+        """Preserve rate constraints when a specialized adapter wraps this one."""
+        if other.repository != self.repository:
+            raise ValueError("Destination transport state cannot cross repositories")
+        for name in ("request_count", "rate_remaining", "rate_reset", "retry_not_before",
+                     "_rate_windows", "_last_repo_rate_headers", "_last_response_rate_headers",
+                     "last_budget_metrics"):
+            setattr(other, name, copy.deepcopy(getattr(self, name)))
+        # These caches name immutable Git objects and uploaded asset identities;
+        # specialized adapters can retain discoveries made in either direction.
+        for name in ("_releases", "_assets", "_listed", "_git_files"):
+            setattr(other, name, getattr(self, name))
+
+    @staticmethod
+    def _rate_headers(headers: dict[str, str]) -> dict[str, Any]:
+        measured: dict[str, Any] = {}
+        for header, field, parser in (("x-ratelimit-remaining", "remaining", int),
+                                       ("x-ratelimit-reset", "reset", float),
+                                       ("x-ratelimit-limit", "limit", int)):
+            if header in headers:
+                try:
+                    measured[field] = parser(headers[header])
+                except ValueError:
+                    pass
+        if "x-ratelimit-resource" in headers:
+            measured["resource"] = headers["x-ratelimit-resource"]
+        return measured
+
+    def _refresh_rate_windows(self) -> None:
+        now = self.clock()
+        for key in list(self._rate_windows):
+            if key[1] <= now:
+                del self._rate_windows[key]
+        if self._rate_windows:
+            # Keep each reset independent. A larger or differently scoped
+            # observation cannot erase a still-live, more restrictive window.
+            key, remaining = min(self._rate_windows.items(), key=lambda item: (item[1], -item[0][1]))
+            self.rate_remaining, self.rate_reset = remaining, key[1]
+        else:
+            self.rate_remaining, self.rate_reset = None, None
+
+    def _observe_rate(self, measured: dict[str, Any], *, scope: str) -> None:
+        if (type(measured.get("remaining")) is not int or measured["remaining"] < 0 or
+                not isinstance(measured.get("reset"), (int, float)) or measured["reset"] <= self.clock()):
+            return
+        key = (scope, float(measured["reset"]), measured.get("resource"), measured.get("limit"))
+        previous = self._rate_windows.get(key)
+        self._rate_windows[key] = min(previous, measured["remaining"]) if previous is not None else measured["remaining"]
+        self._refresh_rate_windows()
+
+    def _destination_endpoint(self, endpoint: str) -> bool:
+        path = f"repos/{self.repository}"
+        return endpoint == path or endpoint.startswith(path + "/") or endpoint.startswith(
+            f"https://uploads.github.com/{path}/")
 
     @staticmethod
     def _response(raw: bytes) -> tuple[dict[str, str], bytes, int | None]:
@@ -188,10 +248,13 @@ class GhCliStateTransport:
         return headers, raw, status
 
     def _defer(self, reason: str, retry: float | None = None) -> StateDeferredError:
-        return StateDeferredError("GitHub state publication deferred: " + reason,
-                                  retry_not_before=retry, reason=reason, request_count=self.request_count)
+        error = StateDeferredError("GitHub state publication deferred: " + reason,
+                                   retry_not_before=retry, reason=reason, request_count=self.request_count)
+        error.rate_measurements = dict(self.last_budget_metrics)
+        return error
 
     def _guard_rate(self) -> None:
+        self._refresh_rate_windows()
         now = self.clock()
         if self.retry_not_before is not None and now < self.retry_not_before:
             raise self._defer("destination Retry-After has not elapsed", self.retry_not_before)
@@ -207,18 +270,18 @@ class GhCliStateTransport:
         for attempt in range(self.transient_retries + 1):
             self._guard_rate()
             self.request_count += 1
-            if self.rate_remaining is not None:
-                self.rate_remaining = max(0, self.rate_remaining - 1)
+            for key in self._rate_windows:
+                self._rate_windows[key] = max(0, self._rate_windows[key] - 1)
+            self._refresh_rate_windows()
             result = self.runner(command, input=data, stdout=stdout, stderr=subprocess.PIPE, check=False)
             raw = result.stdout or b""
             headers, body, status = self._response(raw) if capture_headers else ({}, raw, None)
-            for name, attribute, parser in (("x-ratelimit-remaining", "rate_remaining", int),
-                                            ("x-ratelimit-reset", "rate_reset", float)):
-                if name in headers:
-                    try:
-                        setattr(self, attribute, parser(headers[name]))
-                    except ValueError:
-                        pass
+            observed = self._rate_headers(headers)
+            self._last_response_rate_headers = observed
+            if self._destination_endpoint(args[1]):
+                if "remaining" in observed and "reset" in observed:
+                    self._last_repo_rate_headers = dict(observed)
+                self._observe_rate(observed, scope="repository")
             if not result.returncode:
                 return body if capture_headers else result.stdout
             error = result.stderr.decode("utf-8", "replace") if result.stderr else ""
@@ -237,10 +300,10 @@ class GhCliStateTransport:
                         pass
             rate_failure = (status == 429 or "HTTP 429" in error or
                             "rate limit" in combined.lower() or "secondary rate" in combined.lower() or
-                            status == 403 and self.rate_remaining == 0 or retry is not None)
+                            status == 403 and observed.get("remaining") == 0 or retry is not None)
             if rate_failure:
-                if retry is None and self.rate_remaining == 0:
-                    retry = self.rate_reset
+                if retry is None and observed.get("remaining") == 0:
+                    retry = observed.get("reset", self.rate_reset)
                 self.retry_not_before = retry
                 raise self._defer("destination API rate limit", retry)
             transient = (status in (502, 503, 504) or any(text in error.lower() for text in
@@ -264,20 +327,37 @@ class GhCliStateTransport:
         return json.loads(raw) if raw else None
 
     def publication_budget(self, required_requests: int) -> dict:
-        """Measure this runner's destination-token bucket before any state upload."""
+        """Measure repository headers and generic core without widening headroom."""
+        self._api(f"repos/{self.repository}")
+        repository_headers = dict(self._last_response_rate_headers)
+        if "remaining" not in repository_headers or "reset" not in repository_headers:
+            raise StateError("Destination repository rate headers could not be measured")
         measured = self._api("rate_limit")
+        generic_headers = dict(self._last_response_rate_headers)
         core = measured.get("resources", {}).get("core", {})
         if (type(core.get("remaining")) is not int or
                 not isinstance(core.get("reset"), (int, float))):
-            raise StateError("Destination token rate headroom could not be measured")
-        self.rate_remaining, self.rate_reset = core["remaining"], float(core["reset"])
+            raise StateError("Destination token generic rate headroom could not be measured")
+        # /rate_limit may report a different applicable bucket. It can add a
+        # smaller conservative constraint, but cannot replace repository headers
+        # with a larger remaining count or discard an earlier live reset.
+        if self.rate_remaining is None:
+            raise StateError("Destination repository rate window is unavailable")
+        if core["remaining"] <= self.rate_remaining:
+            self._observe_rate({**core, "resource": "core"}, scope="generic_core")
+        self.last_budget_metrics = {
+            "destination_github_repository_rate_probe": repository_headers,
+            "destination_github_generic_core_rate_probe": dict(core),
+            "destination_github_generic_rate_response_headers": generic_headers,
+            "destination_github_rate_remaining_before_state_upload": self.rate_remaining,
+            "destination_github_required_requests_estimate": required_requests,
+            "destination_github_rate_reserve": self.rate_reserve,
+            "destination_github_rate_reset": self.rate_reset,
+        }
         if required_requests > max(0, self.rate_remaining - self.rate_reserve):
             raise self._defer(f"destination headroom {self.rate_remaining} is below estimated "
                               f"{required_requests} requests plus reserve {self.rate_reserve}", self.rate_reset)
-        return {"destination_github_rate_remaining_before_state_upload": self.rate_remaining,
-                "destination_github_required_requests_estimate": required_requests,
-                "destination_github_rate_reserve": self.rate_reserve,
-                "destination_github_rate_reset": self.rate_reset}
+        return dict(self.last_budget_metrics)
 
     def branch_head(self) -> str | None:
         ref = self._api(f"repos/{self.repository}/git/ref/heads/{BRANCH}", missing_ok=True)

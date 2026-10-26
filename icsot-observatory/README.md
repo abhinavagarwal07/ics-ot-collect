@@ -8,6 +8,8 @@ The [persistent collector guide](docs/PERSISTENT.md) describes the implemented `
 
 Public observation indexes include the original UTC observation interval and hash-linked timestamp sidecars. OpenTimestamps receipts remain pending until Bitcoin verification. The manual pilot also requests RFC 3161 receipts with explicit trust-chain, nonce and digest verification; live success is separate from offline validation. See [UTC and timestamp evidence](docs/PERSISTENT.md#utc-intervals-and-timestamp-evidence).
 
+Repository collection remains manual. A separate daily/manual [proof-maintenance workflow](docs/TIMESTAMPING.md#automatic-delayed-proof-maintenance) retrieves delayed OTS evidence and appends immutable receipt/metadata history without recapture or decryption. Its default has no trusted Bitcoin Core node, so Bitcoin attestation presence remains unverified. Full-cohort daily proof throughput is unmeasured.
+
 The selected cohort is all 185 repositories in [public_patch_corpus_185.csv](../public_patch_corpus_185.csv), configured in [config.corpus.toml](config.corpus.toml) in CSV order. Pilot and priority labels do not filter the selection. Repository roles and measurement caveats remain in the CSV; observations of mirrors establish availability at those mirrors. Cohort changes must update both the CSV and configuration.
 
 `libfuse/libfuse` remains the smoke target in `config.libfuse.toml`. The workspace-root manual Actions workflow runs a shallow full capture, a delta capture, full-bundle restoration, byte verification and CSV/diff generation. It requests OpenTimestamps receipts but does not equate pending receipts with verified Bitcoin attestations. Artifact downloads are temporary transfer copies, not the indefinite archive.

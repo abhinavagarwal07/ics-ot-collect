@@ -1,0 +1,48 @@
+name: Refresh delayed public timestamp proofs
+
+on:
+  schedule:
+    - cron: '43 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-timestamp-proof-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: icsot-observatory
+        shell: bash
+    steps:
+      - name: Check out collector code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector and pinned OpenTimestamps client
+        run: python -m pip install --disable-pip-version-check -e . opentimestamps-client==0.7.2
+      - name: Discover and upgrade bounded public proofs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COLLECTOR_BITCOIN_RPC: ${{ secrets.COLLECTOR_BITCOIN_RPC }}
+        run: |
+          set +x
+          python -m icsot_observer.proof_maintenance \
+            --destination-repository "$GITHUB_REPOSITORY" \
+            --max-proofs 128 --max-pages 2 --max-markers 12 | tee "$RUNNER_TEMP/timestamp-refresh.json"
+      - name: Record queue and discovery backlog
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/timestamp-refresh.json"; then
+            cat "$RUNNER_TEMP/timestamp-refresh.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
