@@ -18,6 +18,7 @@ Create local, incremental, independently verifiable records of public GitHub obs
 - **Hard cap: 50 GB (50,000,000,000 stored bytes) of new evidence per UTC calendar month.** Pause collection before exceeding it; resume next month or after an explicit policy amendment. No automatic limit increase or deletion. No baseline exemption is assumed.
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.
 - Initial capture uses private GitHub Release assets, split into XZ archive parts with hashed indexes. Recurring collection is not enabled; six hours on the always-on host is the recommended starting cadence after incremental archiving is implemented.
+- Respect Actions runtime/disk/API limits; preserve explicit partial or missing outcomes and repair only affected targets/scopes. Avoid overwriting prior evidence or repeating the entire cohort to repair one failure.
 
 ## Functional requirements
 

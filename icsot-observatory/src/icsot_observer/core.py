@@ -75,6 +75,7 @@ class Config:
     max_pages: int
     primary_rate_wait_seconds: int = 0
     primary_rate_reserve: int = 0
+    secondary_rate_wait_seconds: int = 900
 
     @classmethod
     def load(cls, filename: str | Path) -> "Config":
@@ -99,6 +100,9 @@ class Config:
         primary_rate_reserve = int(c.get("primary_rate_reserve", 0))
         if primary_rate_reserve < 0:
             raise ValueError("primary_rate_reserve must be nonnegative")
+        secondary_rate_wait_seconds = int(c.get("secondary_rate_wait_seconds", 900))
+        if secondary_rate_wait_seconds < 0:
+            raise ValueError("secondary_rate_wait_seconds must be nonnegative")
         return cls(root=root, repositories=repos, api_version=version,
                    user_agent=c["user_agent"], token_env=c["token_env"],
                    http_timeout_seconds=int(c.get("http_timeout_seconds", 35)),
@@ -106,7 +110,8 @@ class Config:
                    overlap_hours=int(c.get("overlap_hours", 48)),
                    max_pages=int(c.get("max_pages", 10000)),
                    primary_rate_wait_seconds=primary_rate_wait_seconds,
-                   primary_rate_reserve=primary_rate_reserve)
+                   primary_rate_reserve=primary_rate_reserve,
+                   secondary_rate_wait_seconds=secondary_rate_wait_seconds)
 
 
 class ObjectStore:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import email.utils
 import random
@@ -10,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from .core import Config, ObjectStore, parse_github_time, sha256, utc_iso
@@ -48,6 +49,7 @@ class GitHubAPI:
         self.opener = urllib.request.build_opener(NoRedirect)
         self.requests = 0
         self.primary_rate_waited_seconds = 0.0
+        self.secondary_rate_waited_seconds = 0.0
         self._last_rate_record: dict | None = None
         self._repository_ids: dict[str, str] = {}
 
@@ -157,6 +159,18 @@ class GitHubAPI:
                     duration = max(1.0, reset - time.time() + 1.0)
                 except (TypeError, ValueError, OverflowError):
                     duration = None
+                retry_after = hdrs.get("retry-after")
+                if retry_after:
+                    try:
+                        announced = float(retry_after)
+                    except ValueError:
+                        try:
+                            announced = email.utils.parsedate_to_datetime(retry_after).timestamp() - time.time()
+                        except (TypeError, ValueError, OverflowError):
+                            announced = 60.0
+                    if not math.isfinite(announced) or announced < 0:
+                        announced = 60.0
+                    duration = max(duration or 0, announced, 1.0)
                 available = self.config.primary_rate_wait_seconds - self.primary_rate_waited_seconds
                 if attempt < 3 and duration is not None and duration <= available:
                     rec["primary_rate_wait_seconds"] = duration
@@ -164,19 +178,44 @@ class GitHubAPI:
                     time.sleep(duration)
                     continue
                 raise RuntimeError(f"Rate-limit budget exhausted for {purpose}; retry in next scheduled run")
-            if (status in (403, 429, 500, 502, 503, 504)) and attempt < 3:
-                retry = response_headers.get("Retry-After") or response_headers.get("retry-after")
-                duration = (2 ** attempt) + random.random()
+            throttled = status == 429 or (status == 403 and (
+                "retry-after" in hdrs or b"rate limit" in body[:4096].lower() or b"abuse" in body[:4096].lower()))
+            if throttled and attempt < 3:
+                retry = hdrs.get("retry-after")
+                duration = 60.0 * (2 ** attempt)
                 if retry:
                     try:
                         duration = float(retry)
                     except ValueError:
                         try:
                             when = email.utils.parsedate_to_datetime(retry)
-                            duration = (when - datetime.now(timezone.utc)).total_seconds()
+                            duration = when.timestamp() - time.time()
                         except (TypeError, ValueError, OverflowError):
-                            duration = 60  # unknown Retry-After: do not retry rapidly
+                            pass  # retain the conservative one-minute exponential delay
+                if not math.isfinite(duration) or duration < 0:
+                    duration = 60.0 * (2 ** attempt)
+                duration = max(1.0, duration)
+                available = self.config.secondary_rate_wait_seconds - self.secondary_rate_waited_seconds
+                if duration <= available:
+                    rec["secondary_rate_wait_seconds"] = duration
+                    self.secondary_rate_waited_seconds += duration
+                    time.sleep(duration)
+                    continue
+            if status in (500, 502, 503, 504) and attempt < 3:
+                # Server errors keep a short bounded retry. Long announced
+                # deferrals become explicit partial captures instead of early retries.
+                duration = (2 ** attempt) + random.random()
+                retry = hdrs.get("retry-after")
+                if retry:
+                    try:
+                        duration = float(retry)
+                    except ValueError:
+                        try:
+                            duration = email.utils.parsedate_to_datetime(retry).timestamp() - time.time()
+                        except (TypeError, ValueError, OverflowError):
+                            duration = 60
                 if 0 <= duration <= 30:
+                    rec["server_retry_wait_seconds"] = duration
                     time.sleep(duration)
                     continue
             raise RuntimeError(f"API failure {purpose}: HTTP {status}, {failure or 'unexpected status'}")

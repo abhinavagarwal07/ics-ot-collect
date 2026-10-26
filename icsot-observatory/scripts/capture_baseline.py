@@ -14,11 +14,15 @@ import lzma
 import os
 import platform
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from dataclasses import replace
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -29,12 +33,56 @@ from icsot_observer.pipeline import collect_one
 
 PART_BYTES = 1024 ** 3
 EXPECTED_REPOSITORIES = 185
+CAPTURE_TIMEOUT_SECONDS = 120 * 60
+VERIFICATION_TIMEOUT_SECONDS = 20 * 60
 SCOPE = (
     "One initial public GitHub observation: shallow full REST listings, advertised "
     "branch/tag/pull-head Git refs and reachable Git objects. Per-item historical "
     "timelines/reviews, Discussions and first-publication times are not established. "
     "OTS receipts remain pending until separately upgraded and verified."
 )
+
+
+class PhaseDeadlineExceeded(BaseException):
+    """Escape the collector's ordinary per-endpoint Exception handlers."""
+
+
+@contextmanager
+def phase_deadline(seconds: float, phase: str):
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    started = time.monotonic()
+
+    def expired(signum, frame):
+        raise PhaseDeadlineExceeded(f"{phase} exceeded its {seconds:g}-second phase deadline")
+
+    try:
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            remaining = max(0.001, previous_timer[0] - (time.monotonic() - started))
+            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
+
+
+def environment_report(work: Path) -> dict:
+    disk = shutil.disk_usage(work)
+    report = {"python": sys.version, "platform": platform.platform(),
+              "disk_free_bytes": disk.free, "disk_used_bytes": disk.used, "disk_total_bytes": disk.total,
+              "phase_deadlines_seconds": {"collection": CAPTURE_TIMEOUT_SECONDS,
+                                           "verification": VERIFICATION_TIMEOUT_SECONDS},
+              "tools": {}}
+    for name in ("git", "gh", "ots"):
+        try:
+            result = subprocess.run([name, "--version"], capture_output=True, text=True, timeout=10)
+            report["tools"][name] = {"path": shutil.which(name), "exit_code": result.returncode,
+                                     "version": (result.stdout or result.stderr).strip()[:1000]}
+        except (OSError, subprocess.TimeoutExpired) as error:
+            report["tools"][name] = {"error": f"{type(error).__name__}: {error}"}
+    return report
 
 
 def repository_key(slug: str) -> str:
@@ -237,6 +285,88 @@ def release_assets(repository: str, release_id: int) -> list[dict]:
     return [asset for page in pages for asset in page]
 
 
+def downloaded_asset_identity(repository: str, asset: dict) -> dict:
+    """Hash a remote asset with bounded memory when GitHub omits its digest."""
+    arguments = ["gh", "api", f"repos/{repository}/releases/assets/{asset['id']}",
+                 "-H", "Accept: application/octet-stream"]
+    with tempfile.TemporaryFile() as output:
+        for attempt in range(2):
+            output.seek(0)
+            output.truncate()
+            process = subprocess.run(arguments, stdout=output, stderr=subprocess.PIPE, timeout=1800)
+            if process.returncode == 0:
+                output.seek(0)
+                digest, size = hashlib.sha256(), 0
+                while block := output.read(4 * 1024 * 1024):
+                    digest.update(block)
+                    size += len(block)
+                return {"sha256": digest.hexdigest(), "bytes": size}
+            if attempt == 0 and wait_for_github_reset():
+                continue
+            raise RuntimeError(f"GitHub asset download failed with exit {process.returncode}")
+    raise AssertionError("unreachable")
+
+
+def verify_remote_asset(repository: str, asset: dict, identity: dict) -> None:
+    if asset.get("state") != "uploaded" or asset.get("size") != identity["bytes"]:
+        raise ValueError("Release asset is not uploaded or has the wrong size")
+    expected = "sha256:" + identity["sha256"]
+    if asset.get("digest"):
+        if asset["digest"] != expected:
+            raise ValueError("Release asset digest mismatch")
+    elif downloaded_asset_identity(repository, asset) != {
+            "sha256": identity["sha256"], "bytes": identity["bytes"]}:
+        raise ValueError("Downloaded release asset identity mismatch")
+
+
+def read_json_asset(repository: str, asset: dict) -> tuple[dict, bytes]:
+    raw = gh("api", f"repos/{repository}/releases/assets/{asset['id']}",
+             "-H", "Accept: application/octet-stream")
+    if asset.get("state") != "uploaded" or len(raw) != asset.get("size"):
+        raise ValueError("JSON asset is not uploaded or has the wrong length")
+    if asset.get("digest") and asset["digest"] != "sha256:" + sha256(raw):
+        raise ValueError("JSON asset digest mismatch")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("Expected a JSON object asset")
+    return value, raw
+
+
+def index_capture_accepted(index: dict) -> bool:
+    """Recheck scientific acceptance instead of trusting the index summary flag."""
+    result = index.get("collector_result") or {}
+    verification = index.get("verification") or {}
+    manifests = index.get("manifests") or []
+    if not isinstance(result, dict) or not isinstance(verification, dict) or not isinstance(manifests, list):
+        return False
+    if len(manifests) != 1 or not isinstance(manifests[0], dict):
+        return False
+    manifest = manifests[0]
+    bundle = manifest.get("portable_full_bundle") or {}
+    if not isinstance(bundle, dict):
+        return False
+    return bool(
+        index.get("complete") is True and index.get("capture_accepted") is True and
+        index.get("status") == "complete_for_declared_shallow_baseline" and index.get("errors") == [] and
+        result.get("status") == "complete" and result.get("repo") == index.get("repository") and
+        result.get("attestation") == "pending_bitcoin_completion" and
+        all(isinstance(result.get(key), str) and result[key] for key in ("proof", "immutable_initial_proof")) and
+        result.get("manifest_sha256") == manifest.get("sha256") and
+        isinstance(manifest.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"]) and
+        result.get("run_id") == manifest.get("run_id") and bool(manifest.get("run_id")) and
+        result.get("repository_id") == manifest.get("repository_id") and
+        type(manifest.get("repository_id")) is int and
+        manifest.get("status") == "complete" and manifest.get("mode") == "full" and
+        manifest.get("has_git") is True and
+        isinstance(bundle.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", bundle["sha256"]) and
+        type(bundle.get("bytes")) is int and bundle["bytes"] > 0 and
+        verification.get("ok") is True and verification.get("errors") == [] and
+        verification.get("manifests") == 1 and verification.get("portable_git_bundles_verified") == 1 and
+        verification.get("git_repositories_verified") == 1 and verification.get("raw_observations", 0) > 0 and
+        verification.get("partial_runs") == 0 and verification.get("unstamped_runs") == 0
+    )
+
+
 def upload_asset(tag: str, path: Path, repository: str):
     try:
         # A retry following an uncertain upload must first check the existing
@@ -249,9 +379,11 @@ def upload_asset(tag: str, path: Path, repository: str):
     identity = file_identity(path)
     for asset in release_assets(repository, release["id"]):
         if asset["name"] == path.name:
-            if asset["size"] == identity["bytes"] and asset.get("digest") == "sha256:" + identity["sha256"]:
+            try:
+                verify_remote_asset(repository, asset, identity)
                 return
-            raise RuntimeError("Existing release asset cannot be confirmed identical; refusing overwrite")
+            except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+                raise RuntimeError("Existing release asset cannot be confirmed identical; refusing overwrite") from error
     gh("release", "upload", tag, str(path), "--repo", repository, retry_rate_limit=False)
 
 
@@ -285,7 +417,7 @@ def capture(args) -> int:
         "errors": [],
     }
     write_json(reports / "capture-request.json", index)
-    write_json(reports / "environment.json", {"python": sys.version, "platform": platform.platform()})
+    write_json(reports / "environment.json", environment_report(work))
     result: dict = {"status": "unexpected_error"}
     verification: dict = {"ok": False, "errors": ["Verification did not run"]}
     try:
@@ -293,16 +425,19 @@ def capture(args) -> int:
         # the ordinary collector default or a monthly storage-budget layer.
         single = replace(config, root=evidence.resolve(), repositories=(args.slug,),
                          primary_rate_wait_seconds=3605, primary_rate_reserve=40)
-        result = collect_one(single, args.slug, "full", deep_full=False, bundle_full=True, stamp=True)
+        with phase_deadline(CAPTURE_TIMEOUT_SECONDS, "Collection"):
+            result = collect_one(single, args.slug, "full", deep_full=False, bundle_full=True, stamp=True)
     except BaseException as error:
         result = {"repo": args.slug, "status": "unexpected_error", "error": f"{type(error).__name__}: {error}"}
         index["errors"].append(result["error"])
     finally:
         write_json(reports / "collector-result.json", result)
         try:
-            verification = verify_all(evidence)
+            with phase_deadline(VERIFICATION_TIMEOUT_SECONDS, "Verification"):
+                verification = verify_all(evidence)
         except BaseException as error:
             verification = {"ok": False, "errors": [f"{type(error).__name__}: {error}"]}
+            index["errors"].append(f"Verification: {type(error).__name__}: {error}")
         write_json(reports / "verification.json", verification)
         manifests = inspect_manifests(evidence)
         index.update({"collector_result": result, "verification": verification, "manifests": manifests})
@@ -342,12 +477,14 @@ def capture(args) -> int:
 def finalize(args) -> int:
     config, sources = load_sources(args.config, args.csv)
     release = json.loads(gh("api", f"repos/{args.release_repository}/releases/tags/{args.release_tag}"))
-    if not release["draft"]:
-        raise RuntimeError("Expected the unpublished draft baseline release")
+    target = release.get("target_commitish", "")
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", target) and target.lower() != args.code_sha.lower():
+        raise ValueError("Release target commit differs from expected capture code SHA")
     observed_assets = release_assets(args.release_repository, release["id"])
     assets = {asset["name"]: asset for asset in observed_assets}
     summary = {
         "schema_version": 1, "release_tag": args.release_tag, "collector_code_sha": args.code_sha,
+        "finalizer_code_sha": getattr(args, "finalizer_code_sha", args.code_sha),
         **sources, "finalized_at": utc_iso(), "scope": SCOPE,
         "matrix_result": os.getenv("BASELINE_MATRIX_RESULT", "unknown"),
         "assets_observed_before_final_inventory": [
@@ -362,26 +499,33 @@ def finalize(args) -> int:
         row = {"repository": slug, "index_asset": name, "complete": False, "errors": []}
         try:
             asset = assets[name]
-            raw = gh("api", f"repos/{args.release_repository}/releases/assets/{asset['id']}",
-                     "-H", "Accept: application/octet-stream")
-            if len(raw) != asset["size"] or (asset.get("digest") and asset["digest"] != "sha256:" + sha256(raw)):
-                raise ValueError("Index asset length/digest mismatch")
-            index = json.loads(raw)
+            index, raw = read_json_asset(args.release_repository, asset)
             if (index["repository"] != slug or index["release_tag"] != args.release_tag or
                     index["collector_code_sha"] != args.code_sha or
                     any(index[key] != value for key, value in sources.items())):
                 raise ValueError("Index source identity mismatch")
             row.update({"index_sha256": sha256(raw), "capture_status": index["status"],
                         "capture_accepted": index["capture_accepted"], "manifests": index["manifests"]})
+            if not isinstance(index["errors"], list) or not all(isinstance(error, str) for error in index["errors"]):
+                raise ValueError("Invalid index errors")
+            row["errors"] = list(index["errors"])
+            if not isinstance(index["archive"], dict):
+                raise ValueError("Invalid archive record")
             parts = index["archive"]["parts"]
+            if not isinstance(parts, list) or not all(isinstance(part, dict) for part in parts):
+                raise ValueError("Invalid archive part list")
+            if len({part["name"] for part in parts}) != len(parts):
+                raise ValueError("Duplicate archive part names")
             for part in parts:
                 remote = assets.get(part["name"])
-                if not part.get("uploaded") or remote is None or remote["size"] != part["bytes"]:
+                if (part.get("uploaded") is not True or remote is None or type(part.get("bytes")) is not int or
+                        part["bytes"] <= 0 or not isinstance(part.get("sha256"), str) or
+                        not re.fullmatch(r"[0-9a-f]{64}", part["sha256"])):
                     raise ValueError("Missing or wrong-sized archive part")
-                if remote.get("digest") and remote["digest"] != "sha256:" + part["sha256"]:
-                    raise ValueError("Archive part release digest mismatch")
-            row["complete"] = bool(index["complete"] and index["archive"]["complete"] and parts)
-            row["errors"] = index["errors"]
+                verify_remote_asset(args.release_repository, remote, part)
+            row["complete"] = bool(index_capture_accepted(index) and index["archive"].get("complete") is True and parts)
+            if index.get("complete") and not row["complete"]:
+                row["errors"].append("Index claims completion but acceptance evidence is inconsistent")
         except (KeyError, ValueError, TypeError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             row["errors"].append(f"{type(error).__name__}: {error}")
         summary["repositories"].append(row)
@@ -391,8 +535,24 @@ def finalize(args) -> int:
     summary["status"] = "complete_for_declared_shallow_baseline" if summary["complete"] else "incomplete"
     args.work_root.mkdir(parents=True, exist_ok=True)
     inventory = args.work_root / "baseline-inventory.json"
-    write_json(inventory, summary)
-    upload_asset(args.release_tag, inventory, args.release_repository)
+    existing_inventory = assets.get(inventory.name)
+    if existing_inventory is not None:
+        recorded, recorded_raw = read_json_asset(args.release_repository, existing_inventory)
+        stable_keys = ("schema_version", "release_tag", "collector_code_sha", *sources,
+                       "repositories", "complete_repositories", "incomplete_repositories", "complete", "status")
+        if any(recorded.get(key) != summary[key] for key in stable_keys):
+            raise ValueError("Existing inventory differs from verified current capture outcomes; refusing overwrite")
+        inventory.write_bytes(recorded_raw)
+        summary = recorded
+    else:
+        if not release["draft"]:
+            raise RuntimeError("Published baseline release has no verifiable inventory")
+        write_json(inventory, summary)
+        upload_asset(args.release_tag, inventory, args.release_repository)
+    if not release["draft"]:
+        print(json.dumps({**{key: summary[key] for key in ("status", "complete_repositories", "incomplete_repositories")},
+                          "already_published": True, "finalizer_code_sha": getattr(args, "finalizer_code_sha", args.code_sha)}, indent=2))
+        return 0 if summary["complete"] else 2
     notes = args.work_root / "release-notes.md"
     notes.write_text(
         f"One-time 185-repository shallow baseline: **{summary['status']}**.\n\n"
@@ -400,6 +560,7 @@ def finalize(args) -> int:
         "See baseline-inventory.json and each repository's index asset for capture, verification, source hashes and ordered archive-part digests. "
         "A missing index represents missing/failed transfer, not successful coverage.\n\n"
         f"Collector commit: `{args.code_sha}`. Config SHA-256: `{sources['config_source_sha256']}`. CSV SHA-256: `{sources['csv_sha256']}`.\n\n"
+        f"Finalizer commit: `{getattr(args, 'finalizer_code_sha', args.code_sha)}`.\n\n"
         f"{SCOPE}\n\n"
         "All matrix jobs have reached a terminal state. This release is published once after collection; no cron, later state restore, "
         "automatic deletion or expiry is configured. Private Release storage remains deletable and is not an independent backup.\n"
@@ -479,8 +640,12 @@ def main(argv=None) -> int:
     if not REPO_RE.fullmatch(args.release_repository) or not re.fullmatch(r"corpus-baseline-[0-9]+-[0-9]+", args.release_tag):
         raise ValueError("Invalid release destination")
     actual_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    if args.code_sha != actual_sha:
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.code_sha):
+        raise ValueError("Expected a full capture code SHA")
+    if args.command == "capture" and args.code_sha != actual_sha:
         raise ValueError("Collector checkout does not match requested code SHA")
+    if args.command == "finalize":
+        args.finalizer_code_sha = actual_sha
     return capture(args) if args.command == "capture" else finalize(args)
 
 

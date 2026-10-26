@@ -7,6 +7,7 @@ Incremental preservation of public repository observations, with independently v
 - [Design](icsot-observatory/docs/DESIGN.md)
 - [SQLite schema](icsot-observatory/docs/SCHEMA.md)
 - [Storage and launch decision](icsot-observatory/docs/STORAGE.md)
+- [Actions limits, errors and recovery](icsot-observatory/docs/ACTIONS_OPERATIONS.md)
 
 The selected cohort is all **185 repositories** in [public_patch_corpus_185.csv](public_patch_corpus_185.csv), configured in [config.corpus.toml](icsot-observatory/config.corpus.toml): 42 healthcare, 51 ICS/OT/IIoT and 92 cross-sector projects. CSV order and all selections are preserved, regardless of pilot or priority labels. The CSV retains repository roles, source links and measurement caveats.
 
