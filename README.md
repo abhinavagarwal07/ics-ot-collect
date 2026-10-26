@@ -13,6 +13,8 @@ The selected cohort is all **185 repositories** in [public_patch_corpus_185.csv]
 
 Main evidence payloads are encrypted before upload using AES-256-GCM with RSA-OAEP-SHA256 key wrapping. Metadata and the recipient public key are public; the private RSA key stays on the owner's machine. See [encryption and restoration](icsot-observatory/docs/ENCRYPTION.md).
 
+The [encrypted resumed baseline](https://github.com/abhinavagarwal07/ics-ot-collect/actions/runs/40253057671) reuses 15 verified complete captures and attempts the remaining 170 targets. The original 16 archive parts and nine historical Actions artifacts were migrated into verified encrypted replacements before this repository became public.
+
 [`libfuse/libfuse`](https://github.com/libfuse/libfuse) remains the single-repository smoke target in [config.libfuse.toml](icsot-observatory/config.libfuse.toml).
 
 [The first live validation](icsot-observatory/docs/LIBFUSE_VALIDATION.md) passed in GitHub Actions, with a full capture, delta capture, two independently restored Git bundles, and byte-identical local CSV regeneration. Timestamp receipts remain pending verification.
