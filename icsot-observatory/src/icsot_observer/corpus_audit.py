@@ -897,8 +897,14 @@ def verify_small_bundle(path: Path, git: dict, budget: LocalBudget, *, volume_fa
                                  "\n".join(expression for expression, _ in chunk) + "\n")
                 if output.splitlines() != [value for _, value in chunk]:
                     raise ValueError("Restored Git object or annotated-tag peeled target differs")
+        counts = {}
+        for line in git_run(["-C", str(repo), "count-objects", "-v"]).splitlines():
+            key, _, value = line.partition(": ")
+            if key in {"count", "in-pack", "packs"}:
+                counts[key] = int(value)
         return {"status": "offline_restore_fsck_verified", "declared_refs": len(expected),
                 "restored_refs": len(actual), "fixed_volume_bytes": volume.size_bytes,
+                "git_object_storage_counts": counts,
                 "elapsed_seconds": round(time.monotonic() - started, 3)}
 
 
@@ -1024,7 +1030,8 @@ def audit_legacy_zip(entry: dict, release: dict, assets: dict, github: GitHubRea
     return result
 
 
-def audit_capture(capture: Capture, github: GitHubReadOnly, budget: LocalBudget, private_key_path: Path) -> dict:
+def audit_capture(capture: Capture, github: GitHubReadOnly, budget: LocalBudget, private_key_path: Path,
+                  *, git_volume_bytes: int = DEFAULT_VOLUME_BYTES) -> dict:
     parts, gaps = transport_parts(capture)
     result = {"capture_key": capture.key, "repository": capture.repository, "repository_role": capture.role,
               "source_index": capture.source_index, "transport_migration_index": capture.migration_reference,
@@ -1093,7 +1100,8 @@ def audit_capture(capture: Capture, github: GitHubReadOnly, budget: LocalBudget,
                 if not result["errors"]:
                     manifests = [value for path, (_, value) in audit.metadata.items() if path.endswith(".manifest.json")]
                     try:
-                        result["git_spotcheck"] = verify_small_bundle(selected.path, manifests[0]["git"], budget)
+                        result["git_spotcheck"] = verify_small_bundle(selected.path, manifests[0]["git"], budget,
+                            volume_factory=lambda shared: FixedGitVolume(shared, size_bytes=git_volume_bytes))
                         result["git_graph_verification"] = result["git_spotcheck"]["status"]
                     except BudgetError:
                         local_admission_gap("selected offline Git volume")
