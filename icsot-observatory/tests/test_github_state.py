@@ -384,7 +384,7 @@ def test_key_file_must_be_outside_working_root(setup):
                          public_key=tmp_path / "public.pem", private_key=private)
 
 
-@pytest.mark.parametrize("kind", ["symlink", "hardlink", "traversal", "absolute", "duplicate", "unlisted"])
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "traversal", "absolute", "duplicate", "unlisted", "sparse"])
 def test_safe_tar_extraction_rejects_unsafe_members(setup, kind):
     transport, make, tmp_path = setup
     store = make()
@@ -407,6 +407,8 @@ def test_safe_tar_extraction_rejects_unsafe_members(setup, kind):
             info.name = str(tmp_path / "escaped")
         elif kind == "unlisted":
             info.name = "unlisted"
+        elif kind == "sparse":
+            info.pax_headers = {"GNU.sparse.map": "0,4", "GNU.sparse.size": "4", "GNU.sparse.name": "checkpoint"}
         tar.addfile(info, io.BytesIO(b"data") if info.isfile() else None)
         if kind == "duplicate":
             tar.addfile(info, io.BytesIO(b"data"))
@@ -484,7 +486,7 @@ def test_cli_transport_never_forces_and_preserves_parent_tree(setup):
 
 def test_release_shards_reserve_index_room_and_restore_across_shards(setup):
     transport, make, _ = setup
-    store = make(max_assets_per_release=3)
+    store = make(max_assets_per_release=3, small_immutable_bytes=0)
     for number in range(7):
         value = f"CAS value {number}".encode()
         digest = hashlib.sha256(value).hexdigest()
@@ -1131,3 +1133,123 @@ def test_cold_draft_publish_estimate_reserves_thirteen_rest_metadata_requests_pe
     # No new payloads: fixed index/control estimate is 22. Each distinct cold
     # draft needs 13 metadata reads, plus one ciphertext GET for each old part.
     assert store._publication_requests_estimate([], {"parts": refs, "files": []}) == expected
+
+
+
+def cas_file(store, value):
+    digest = hashlib.sha256(value).hexdigest()
+    name = f"objects/sha256/{digest[:2]}/{digest}"
+    write(store, name, value)
+    return name
+
+
+def test_packing_reuses_legacy_raw_segments_and_adds_only_new_small_block(setup):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    originals = {cas_file(legacy, value): value for value in (b"first old CAS", b"second old CAS")}
+    pack_name = "git/7.git/objects/pack/pack-abc.pack"
+    pack_value = b"PACK" + os.urandom(16 * 1024)
+    write(legacy, pack_name, pack_value)
+    publish(legacy)
+    before = legacy.read()
+    old_files = {item["path"]: item for item in before.index["files"]}
+    assert all(before.index["parts"][item["segments"][0]["part"]]["kind"] == "raw" for item in old_files.values())
+    packed = make()
+    added = {cas_file(packed, value): value for value in (b"new CAS one", b"new CAS two")}
+    transport.uploads.clear()
+    result = publish(packed, before)
+    after = packed.read()
+    current = {item["path"]: item for item in after.index["files"]}
+    for name, old in old_files.items():
+        assert current[name]["segments"] == old["segments"]
+        for segment in old["segments"]:
+            assert after.index["parts"][segment["part"]] == before.index["parts"][segment["part"]]
+    assert result["new_parts"] == 1 and result["new_small_immutable_files_packed"] == 2
+    assert result["reused_parts"] == 3
+    assert len(transport.uploads) == 2  # One new block plus the new encrypted index.
+    assert len({current[name]["segments"][0]["part"] for name in added}) == 1
+    clear(packed)
+    packed.restore(after)
+    for name, value in {**originals, **added, pack_name: pack_value}.items():
+        assert (packed.root / name).read_bytes() == value
+
+
+def test_new_small_cas_packing_reduces_state_assets_and_quota_estimate(setup):
+    transport, make, _ = setup
+    store = make()
+    values = {cas_file(store, f"raw API response {number}".encode() * 8): number for number in range(100)}
+    result = publish(store)
+    selected = store.read()
+    assert result["new_parts"] == 1
+    assert result["new_small_immutable_files_packed"] == 100
+    assert len(transport.uploads) == 2  # Before packing: 101 uploads and 101 verification downloads.
+    assert sum(event[0] == "download" and event[1] != "index.enc" for event in transport.events) == 1
+    assert len(selected.index["files"]) == len(values)
+    assert next(iter(selected.index["parts"].values()))["kind"] == "tar"
+    assert store._publication_requests_estimate(selected.index["files"], {"parts": {}, "files": []}) == 24
+
+
+def test_packed_blocks_respect_decoded_byte_and_member_bounds(setup):
+    _, make, _ = setup
+    store = make(immutable_group_bytes=10240, immutable_group_members=2)
+    expected = {cas_file(store, bytes([number]) * 400): bytes([number]) * 400 for number in range(5)}
+    result = publish(store)
+    selected = store.read()
+    assert result["new_parts"] == 3
+    counts = {}
+    for item in selected.index["files"]:
+        part = item["segments"][0]["part"]
+        counts[part] = counts.get(part, 0) + 1
+    assert max(counts.values()) == 2
+    assert all(part["decoded_bytes"] <= 10240 for part in selected.index["parts"].values())
+    clear(store)
+    store.restore(selected)
+    assert all((store.root / name).read_bytes() == value for name, value in expected.items())
+
+
+def test_packed_immutable_blocks_retain_original_members_when_new_files_arrive(setup):
+    transport, make, _ = setup
+    store = make()
+    for number in range(5):
+        cas_file(store, f"retained {number}".encode())
+    publish(store)
+    before = store.read()
+    old_parts = copy.deepcopy(before.index["parts"])
+    old_segments = {item["path"]: copy.deepcopy(item["segments"]) for item in before.index["files"]}
+    cas_file(store, b"a later immutable API response")
+    result = publish(store, before)
+    after = store.read()
+    assert result["new_parts"] == 1 and result["reused_parts"] == 1
+    assert all(after.index["parts"][digest] == ref for digest, ref in old_parts.items())
+    assert all(item["segments"] == old_segments[item["path"]] for item in after.index["files"] if item["path"] in old_segments)
+    clear(store)
+    store.restore(after)
+    assert len(list((store.root / "objects/sha256").glob("*/*"))) == 6
+
+
+def test_missing_old_packed_immutable_member_fails_before_upload_or_pointer_change(setup):
+    transport, make, _ = setup
+    store = make()
+    names = [cas_file(store, value) for value in (b"keep", b"missing")]
+    publish(store)
+    before, old_head, upload_count = store.read(), transport.head, len(transport.uploads)
+    (store.root / names[1]).unlink()
+    with pytest.raises(StateError, match="immutable state file is missing"):
+        publish(store, before)
+    assert transport.head == old_head and len(transport.uploads) == upload_count
+
+
+def test_corrupt_new_small_immutable_block_never_materializes_files(setup):
+    transport, make, _ = setup
+    store = make()
+    for number in range(8):
+        cas_file(store, f"response {number}".encode())
+    publish(store)
+    selected = store.read()
+    ref = next(iter(selected.index["parts"].values()))
+    ciphertext = transport.assets[ref["release_tag"], ref["name"]]
+    transport.assets[ref["release_tag"], ref["name"]] = ciphertext[:-1] + bytes([ciphertext[-1] ^ 1])
+    clear(store)
+    with pytest.raises(StateError, match="hash/size differs"):
+        store.restore(selected)
+    assert list(store.root.iterdir()) == [store.root / ".collector.lock"]

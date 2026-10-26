@@ -665,14 +665,24 @@ class GitHubStateStore:
                  public_key: Path | str, private_key: Path | str | None = None,
                  logical_root: Path | str | None = None, part_bytes: int = MAX_PART_BYTES,
                  mutable_group_bytes: int = 64 * 1024 * 1024,
-                 max_assets_per_release: int = 900):
+                 max_assets_per_release: int = 900,
+                 small_immutable_bytes: int = 1024 * 1024,
+                 immutable_group_bytes: int = 64 * 1024 * 1024,
+                 immutable_group_members: int = 4096):
         if type(repository_id) is not int or repository_id < 1 or not REPO_RE.fullmatch(slug):
             raise ValueError("Selected positive repository ID and slug required")
         if not 10240 <= part_bytes <= MAX_PART_BYTES:
             raise ValueError("State plaintext parts must be between 10 KiB and 1 GiB")
         if type(max_assets_per_release) is not int or not 2 <= max_assets_per_release <= 1000:
             raise ValueError("State release asset limit must be between 2 and 1000")
+        if (type(small_immutable_bytes) is not int or not 0 <= small_immutable_bytes <= 64 * 1024 * 1024 or
+                type(immutable_group_bytes) is not int or not 10240 <= immutable_group_bytes <= 64 * 1024 * 1024 or
+                type(immutable_group_members) is not int or not 1 <= immutable_group_members <= 4096):
+            raise ValueError("Invalid bounded immutable snapshot packing policy")
         self.max_assets_per_release = max_assets_per_release
+        self.small_immutable_bytes = small_immutable_bytes
+        self.immutable_group_bytes = min(immutable_group_bytes, part_bytes)
+        self.immutable_group_members = immutable_group_members
         self.transport, self.repository_id, self.slug = transport, repository_id, slug
         self.root = Path(logical_root or f"/tmp/icsot-persistent-state/{repository_id}").resolve()
         self.public_key = Path(public_key).resolve()
@@ -967,12 +977,20 @@ class GitHubStateStore:
     @staticmethod
     def _extract_group(plain: Path, staging: Path, expected: dict[str, dict]) -> None:
         seen = set()
+        previous_end = 0
+        archive_bytes = plain.stat().st_size
         try:
             with tarfile.open(plain, "r:") as archive:
                 for member in archive:
                     name = _safe_path(member.name)
                     if not member.isfile() or name not in expected or name in seen:
                         raise StateError("Unsafe, duplicate, or unlisted state archive member")
+                    if (getattr(member, "sparse", None) is not None or
+                            member.offset < previous_end or member.offset % 512 or member.offset_data % 512 or
+                            member.offset_data < member.offset + 512 or
+                            member.offset_data + ((member.size + 511) // 512) * 512 > archive_bytes):
+                        raise StateError("Invalid or overlapping state archive member offsets")
+                    previous_end = member.offset_data + ((member.size + 511) // 512) * 512
                     if member.size != expected[name]["bytes"]:
                         raise StateError("State archive member size differs")
                     seen.add(name)
@@ -1035,30 +1053,32 @@ class GitHubStateStore:
                           "mode": 0o700 if info.st_mode & 0o111 else 0o600})
         return files
 
+    def _reuse_part(self, existing: dict, directory: Path, parts: dict, metrics: dict) -> str:
+        digest = existing["plaintext_sha256"]
+        if digest in parts:
+            if parts[digest] != existing:
+                raise StateError("Conflicting immutable snapshot part identities")
+            return digest
+        if _asset_identity(existing) not in self._verified_parts:
+            encrypted, plain = directory / (digest + ".verify.enc"), directory / (digest + ".verify")
+            self._download_verified(existing, encrypted)
+            self._decrypt(existing, encrypted, plain)
+            decoded = self._decode_part(existing, plain, directory / (digest + ".verify.decoded"))
+            self._verified_parts.add(_asset_identity(existing))
+            encrypted.unlink()
+            if decoded != plain:
+                decoded.unlink()
+            plain.unlink()
+        parts[digest] = dict(existing)
+        metrics["reused_parts"] += 1
+        return digest
+
     def _part(self, plaintext: Path, kind: str, release: str, prior: dict, directory: Path,
               parts: dict, metrics: dict, *, compress: bool = True) -> str:
         decoded_sha256, decoded_bytes = _digest(plaintext), plaintext.stat().st_size
         existing = prior.get((decoded_sha256, decoded_bytes, kind))
         if existing:
-            digest = existing["plaintext_sha256"]
-            if digest in parts:
-                return digest
-            # Reuse the original ciphertext identity, never fresh encryption for
-            # unchanged CAS/packs. Restore already checked both hashes; callers
-            # that skipped restore pay this verification once before reuse.
-            if _asset_identity(existing) not in self._verified_parts:
-                encrypted, plain = directory / (digest + ".verify.enc"), directory / (digest + ".verify")
-                self._download_verified(existing, encrypted)
-                self._decrypt(existing, encrypted, plain)
-                decoded = self._decode_part(existing, plain, directory / (digest + ".verify.decoded"))
-                self._verified_parts.add(_asset_identity(existing))
-                encrypted.unlink()
-                if decoded != plain:
-                    decoded.unlink()
-                plain.unlink()
-            parts[digest] = dict(existing)
-            metrics["reused_parts"] += 1
-            return digest
+            return self._reuse_part(existing, directory, parts, metrics)
         encoding = "raw"
         if compress:
             compressed = directory / ("encoded-" + uuid.uuid4().hex + ".xz")
@@ -1104,49 +1124,78 @@ class GitHubStateStore:
         return (name.startswith("objects/sha256/") or
                 name.startswith("git/") and "/objects/" in name)
 
-    def _publication_requests_estimate(self, files: list[dict], prior: dict) -> int:
+    @staticmethod
+    def _tar_info(item: dict) -> tarfile.TarInfo:
+        info = tarfile.TarInfo(item["path"])
+        info.size, info.mode, info.mtime = item["bytes"], item["mode"], 0
+        return info
+
+    @classmethod
+    def _tar_member_bytes(cls, item: dict) -> int:
+        return len(cls._tar_info(item).tobuf(tarfile.PAX_FORMAT)) + ((item["bytes"] + 511) // 512) * 512
+
+    @staticmethod
+    def _tar_total_bytes(member_bytes: int) -> int:
+        return ((member_bytes + 1024 + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
+
+    def _group_files(self, items: list[dict], target: int) -> list[list[dict]]:
+        groups, group, size = [], [], 0
+        for item in items:
+            required = self._tar_member_bytes(item)
+            if self._tar_total_bytes(required) > target:
+                raise StateError("Snapshot member cannot fit the selected packed block")
+            if group and (len(group) >= self.immutable_group_members or self._tar_total_bytes(size + required) > target):
+                groups.append(group)
+                group, size = [], 0
+            group.append(item)
+            size += required
+        if group:
+            groups.append(group)
+        return groups
+
+    def _snapshot_plan(self, files: list[dict], prior: dict) -> dict:
         previous = {item["path"]: item for item in prior.get("files", [])}
-        raw_parts = 0
-        groups = 0
-        group_size = 10240
-        group_items = 0
+        current = {item["path"]: item for item in files}
+        # Immutable closure is append-only. A vanished old packed member cannot
+        # be dropped from a reused block's exact extraction map.
+        for name, old in previous.items():
+            if self._immutable(name) and name not in current:
+                raise StateError("Previously retained immutable state file is missing")
+        raw, small, mutable, reused = [], [], [], {}
+        mutable_target = min(self.part_bytes, max(tarfile.RECORDSIZE, self.group_bytes))
         for item in files:
-            if self._immutable(item["path"]) or item["bytes"] > self.group_bytes:
-                old = previous.get(item["path"])
-                chunk_count = max(1, (item["bytes"] + self.part_bytes - 1) // self.part_bytes)
-                old_segments = old.get("segments", []) if old else []
-                chunk_sizes = [min(self.part_bytes, max(0, item["bytes"] - offset * self.part_bytes))
-                               for offset in range(chunk_count)]
-                unchanged_chunks = (old and old["sha256"] == item["sha256"] and old["bytes"] == item["bytes"] and
-                                    len(old_segments) == chunk_count and
-                                    all(prior["parts"][segment["part"]]["kind"] == "raw" and
-                                        prior["parts"][segment["part"]]["decoded_bytes"] == expected
-                                        for segment, expected in zip(old_segments, chunk_sizes)))
-                if unchanged_chunks:
-                    continue  # Original plaintext chunks can reuse verified ciphertext.
-                raw_parts += chunk_count
-                continue
-            required = ((item["bytes"] + 511) // 512) * 512 + 512 + 10240
-            if group_items and group_size + required > self.part_bytes:
-                groups += 1
-                group_items, group_size = 0, 10240
-            group_items += 1
-            group_size += required
-            if group_size >= self.group_bytes:
-                groups += 1
-                group_items, group_size = 0, 10240
-        groups += bool(group_items)
-        parts = raw_parts + groups  # Mutable groups conservatively all new.
+            name, old = item["path"], previous.get(item["path"])
+            if self._immutable(name):
+                if old is not None:
+                    if item["sha256"] != old["sha256"] or item["bytes"] != old["bytes"]:
+                        raise StateError("Previously retained immutable state file changed")
+                    reused[name] = copy.deepcopy(old["segments"])
+                    continue
+                pack_file = name.startswith("git/") and "/objects/pack/" in name
+                if (self.small_immutable_bytes and item["bytes"] <= self.small_immutable_bytes and not pack_file and
+                        self._tar_total_bytes(self._tar_member_bytes(item)) <= self.immutable_group_bytes):
+                    small.append(item)
+                else:
+                    raw.append(item)
+            elif (item["bytes"] <= self.group_bytes and
+                  self._tar_total_bytes(self._tar_member_bytes(item)) <= mutable_target):
+                mutable.append(item)
+            else:
+                raw.append(item)
+        groups = self._group_files(small, self.immutable_group_bytes) + self._group_files(mutable, mutable_target)
+        return {"raw": raw, "groups": groups, "reused": reused,
+                "new_small_immutable_files": len(small)}
+
+    def _publication_requests_estimate(self, files: list[dict], prior: dict) -> int:
+        plan = self._snapshot_plan(files, prior)
+        raw_parts = sum(max(1, (item["bytes"] + self.part_bytes - 1) // self.part_bytes) for item in plan["raw"])
+        parts = raw_parts + len(plan["groups"])  # Mutable groups conservatively all new.
         releases = max(1, (parts + self.max_assets_per_release - 2) // (self.max_assets_per_release - 1))
         unverified = [part for part in prior["parts"].values()
                       if _asset_identity(part) not in self._verified_parts]
         # A cold authorized draft can need REST tag 404 + numeric ID recheck
         # + up to eleven asset-list pages; GraphQL lookup has its own bucket.
         old_release_reads = 13 * len({part["release_tag"] for part in unverified}) + len(unverified)
-        # Upload+verification per payload/index, release lookup+creation, and
-        # generous fixed Git blob/tree/commit/CAS plus one-conflict headroom.
-        # Exact draft checks use the separate GraphQL bucket; each new
-        # Release still needs only REST tag lookup + create in this estimate.
         return 2 * (parts + 1) + 2 * releases + 18 + old_release_reads
 
     def publish(self, selection: StateSelection, *, dependencies: list[dict] | tuple = (),
@@ -1221,57 +1270,44 @@ class GitHubStateStore:
                            for part in prior["parts"].values()}
             self.transport.ensure_release(release)
             metrics["_releases"].add(release)
-            groups: list[list[dict]] = []
-            group: list[dict] = []
-            group_size = 10240
+            plan = self._snapshot_plan(files, prior)
+            metrics["new_small_immutable_files_packed"] = plan["new_small_immutable_files"]
             for item in files:
-                immutable = self._immutable(item["path"])
-                if immutable or item["bytes"] > self.group_bytes:
-                    item["segments"] = []
-                    with (staging / item["path"]).open("rb") as source:
-                        prefix = source.read(32)
-                        source.seek(0)
-                        already_compressed = (item["path"].startswith("git/") and "/objects/" in item["path"] or
-                                              prefix.startswith((b"PACK", b"# v2 git bundle", b"# v3 git bundle",
-                                                                 b"\xfd7zXZ\x00", b"\x1f\x8b")))
-                        while True:
-                            chunk = directory / "chunk"
-                            with chunk.open("wb") as output:
-                                remaining = self.part_bytes
-                                while remaining and (data := source.read(min(4 * 1024 * 1024, remaining))):
-                                    output.write(data)
-                                    remaining -= len(data)
-                            if chunk.stat().st_size == 0 and item["segments"]:
-                                chunk.unlink()
-                                break
-                            digest = self._part(chunk, "raw", release, prior_parts, directory, parts, metrics,
-                                                compress=not already_compressed)
-                            item["segments"].append({"part": digest})
-                            count = chunk.stat().st_size
+                if item["path"] in plan["reused"]:
+                    item["segments"] = plan["reused"][item["path"]]
+                    for segment in item["segments"]:
+                        self._reuse_part(prior["parts"][segment["part"]], directory, parts, metrics)
+            for item in plan["raw"]:
+                item["segments"] = []
+                with (staging / item["path"]).open("rb") as source:
+                    prefix = source.read(32)
+                    source.seek(0)
+                    already_compressed = (item["path"].startswith("git/") and "/objects/" in item["path"] or
+                                          prefix.startswith((b"PACK", b"# v2 git bundle", b"# v3 git bundle",
+                                                             b"\xfd7zXZ\x00", b"\x1f\x8b")))
+                    while True:
+                        chunk = directory / "chunk"
+                        with chunk.open("wb") as output:
+                            remaining = self.part_bytes
+                            while remaining and (data := source.read(min(4 * 1024 * 1024, remaining))):
+                                output.write(data)
+                                remaining -= len(data)
+                        if chunk.stat().st_size == 0 and item["segments"]:
                             chunk.unlink()
-                            if count < self.part_bytes:
-                                break
-                else:
-                    padded = ((item["bytes"] + 511) // 512) * 512 + 512
-                    # PAX extended names require extra headers. Reserve a full
-                    # 10 KiB per member and check the actual tar before upload.
-                    required = padded + 10240
-                    if group and group_size + required > self.part_bytes:
-                        groups.append(group)
-                        group, group_size = [], 10240
-                    group.append(item)
-                    group_size += required
-                    if group_size >= self.group_bytes:
-                        groups.append(group)
-                        group, group_size = [], 10240
-            if group:
-                groups.append(group)
+                            break
+                        digest = self._part(chunk, "raw", release, prior_parts, directory, parts, metrics,
+                                            compress=not already_compressed)
+                        item["segments"].append({"part": digest})
+                        count = chunk.stat().st_size
+                        chunk.unlink()
+                        if count < self.part_bytes:
+                            break
+            groups = plan["groups"]
             for number, members in enumerate(groups):
                 archive_path = directory / f"group-{number}.tar"
                 with tarfile.open(archive_path, "w", format=tarfile.PAX_FORMAT) as archive:
                     for item in members:
-                        info = tarfile.TarInfo(item["path"])
-                        info.size, info.mode, info.mtime = item["bytes"], item["mode"], 0
+                        info = self._tar_info(item)
                         with (staging / item["path"]).open("rb") as source:
                             archive.addfile(info, source)
                 if archive_path.stat().st_size > self.part_bytes:
