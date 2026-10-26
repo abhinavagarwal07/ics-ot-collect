@@ -26,11 +26,15 @@ Even empty targets require at least nine source reads each before rechecks, retr
 
 Public target repositories do not make execution free in this **private collector repository**. Standard Linux x64 costs $0.006 per billed minute beyond included usage; each job is rounded up to a whole minute. Account plan, remaining included minutes and billing stop limits have not been verified. [Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [runner pricing](https://docs.github.com/en/billing/reference/actions-runner-pricing).
 
+The owner reports no billing setup. GitHub documents that **without a valid payment method, Actions usage is blocked after the included allowance is exhausted**. The amounts below describe hypothetical paid usage, not a debt that this no-payment setup is accruing. Usage belongs to the repository owner's [personal billing account](https://github.com/settings/billing). [No-payment behavior](https://docs.github.com/en/billing/concepts/product-billing/github-actions#using-more-than-your-included-quota).
+
 - Five minutes per capture implies approximately 925 runner-minutes, or $5.55 gross before included usage.
 - Ten minutes implies approximately 1,850 minutes, or $11.10 gross.
 - The configured timeout ceiling is `(185 × 180 + 90 + 10) × $0.006 = $200.40`, excluding separate validation workflows. This is a ceiling, **not a forecast**.
 
 API waits consume runner minutes. Increasing parallelism reduces elapsed time only when useful work can proceed; it does not reduce aggregate billable time.
+
+Standard Ubuntu runners in a **public execution repository** have free compute usage; runtime, API, concurrency and acceptable-use limits still apply. Making this existing repository public would expose its source history, cohort CSV and evidence releases. A separate public execution repository could retain private evidence here, using a separate narrowly scoped upload credential: its automatic `GITHUB_TOKEN` cannot write into this private repository. Larger runners remain paid even for public repositories. [Public runner billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [workflow token scope](https://docs.github.com/en/actions/concepts/security/github_token).
 
 ## Failure handling and remaining gaps
 
