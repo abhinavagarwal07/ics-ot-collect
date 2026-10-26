@@ -67,7 +67,7 @@ def load_cohort(config_path: Path, csv_path: Path, *, expected_count: int = 185)
 
 
 def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
-               pointer_loader, cold_bootstraps: int = 2, now: float | None = None,
+               pointer_loader, cold_bootstraps: int = 0, now: float | None = None,
                history_settings: dict | None = None, resource_limits: dict | None = None) -> dict:
     if type(cold_bootstraps) is not int or not 0 <= cold_bootstraps <= MAX_COLD_BOOTSTRAPS:
         raise ValueError("cold_bootstraps must be an integer from 0 through 8")
@@ -220,6 +220,7 @@ def public_outcome(result: dict, entry: dict) -> dict:
             "resource_limits": entry.get("resource_limits"),
             "history_policy": entry.get("history_policy"),
             "new_evidence_upload_bytes": result["new_evidence_upload_bytes"],
+            "measurement_description": "Newly uploaded retained evidence-generation asset bytes, including ciphertext and metadata; initial full captures and duplicate bytes count. This is not a measure of novel upstream changes.",
             "new_state_upload_bytes": result["publication"]["state_uploaded_ciphertext_bytes"],
             "state_referenced_ciphertext_bytes": result["publication"]["state_referenced_ciphertext_bytes"],
             "state_generation": result["publication"]["generation"],
@@ -237,7 +238,7 @@ def main(argv=None) -> int:
         child.add_argument("--destination-repository", required=True)
         child.add_argument("--output", required=True, type=Path)
         if name == "plan":
-            child.add_argument("--cold-bootstraps", type=int, default=2)
+            child.add_argument("--cold-bootstraps", type=int, default=0)
             child.add_argument("--github-output", type=Path)
         else:
             child.add_argument("--plan", required=True, type=Path)

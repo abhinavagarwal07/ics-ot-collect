@@ -8,7 +8,7 @@ on:
       cold_bootstraps:
         description: 'Explicit fresh public working-state bootstraps this cycle (0–8)'
         required: false
-        default: 2
+        default: 0
         type: number
 
 permissions:
@@ -63,7 +63,7 @@ jobs:
           subprocess.run([sys.executable, "-m", "icsot_observer.recurrence", "plan",
               "--config", "config.corpus.toml", "--csv", "../public_patch_corpus_185.csv",
               "--code-sha", os.environ["GITHUB_SHA"], "--destination-repository", os.environ["GITHUB_REPOSITORY"],
-              "--cold-bootstraps", os.environ.get("COLD_BOOTSTRAPS") or "2",
+              "--cold-bootstraps", os.environ.get("COLD_BOOTSTRAPS") or "0",
               "--output", "analysis/recurring-plan/recurring-plan.json",
               "--github-output", os.environ["GITHUB_OUTPUT"]], check=True)
           PY
@@ -76,7 +76,7 @@ jobs:
           gh release create "$tag" analysis/recurring-plan/recurring-plan.json \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Six-hour collection plan ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}" \
-            --notes 'Immutable metadata plan for all 185 cohort entries. Ready state resumes incrementally; at most eight explicitly selected missing-state entries bootstrap from new public observations. Other entries remain bootstrap_pending or paused. This release is not a completed-cohort claim. Retained evidence has a separate 50-GB UTC-month policy; runtime monthly admission is not enforced. Operational-state ciphertext is accounted separately.'
+            --notes 'Immutable metadata plan for all 185 cohort entries. Ready state resumes incrementally. Scheduled fresh bootstraps default to zero; only an explicit manual selection can request up to eight new public bootstraps. Retained baseline initialization is handled separately. Other entries remain bootstrap_pending or paused. This release is not a completed-cohort claim. Retained evidence has a separate 50-GB UTC-month policy; runtime monthly admission is not enforced. Operational-state ciphertext is accounted separately.'
           printf 'plan_release=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
   observe:

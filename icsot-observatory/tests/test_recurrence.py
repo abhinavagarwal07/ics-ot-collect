@@ -33,7 +33,7 @@ def plan(tmp_path, **options):
     return build_plan(cfg, sources=SOURCES, code_sha=CODE,
                       identity_loader=options.pop("identity_loader", identities.__getitem__),
                       pointer_loader=options.pop("pointer_loader", lambda repo_id: pointer if repo_id == 17 else None),
-                      now=options.pop("now", 100000), **options)
+                      now=options.pop("now", 100000), cold_bootstraps=options.pop("cold_bootstraps", 2), **options)
 
 
 def test_entire_cohort_plan_selects_ready_state_and_only_bounded_explicit_cold_wave(tmp_path):
