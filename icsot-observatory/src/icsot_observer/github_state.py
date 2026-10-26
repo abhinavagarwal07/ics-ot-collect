@@ -75,6 +75,7 @@ class StateTransport(Protocol):
     def ensure_release(self, tag: str) -> None: ...
     def upload_asset(self, tag: str, name: str, source: Path) -> None: ...
     def download_asset(self, tag: str, name: str, destination: Path) -> None: ...
+    def find_asset(self, tag: str, name: str, *, refresh: bool = False) -> dict | None: ...
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,42 @@ class StateSelection:
     head: str | None
     pointer: dict[str, Any] | None
     index: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class PreparedState:
+    """Local SHA-pinned bytes for one generation; retain directory until commit."""
+
+    directory: Path
+    manifest_sha256: str
+    generation: str
+    source_import_sha256: str
+    pointer: dict[str, Any]
+    assets: tuple[dict[str, Any], ...]
+    release_tags: tuple[str, ...]
+
+
+class _PreparedSink:
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.assets: list[dict] = []
+        self.index: dict | None = None
+        self.source_files: list[dict] = []
+
+    def capture(self, ref: dict, source: Path) -> None:
+        relative = f"assets/{ref['release_tag']}/{ref['name']}"
+        target = self.directory / relative
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if target.exists():
+            raise StateError("Prepared ciphertext path already exists")
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copyfile(source, target)
+        os.chmod(target, 0o600)
+        if target.stat().st_size != ref["ciphertext_bytes"] or _digest(target) != ref["ciphertext_sha256"]:
+            raise StateError("Prepared ciphertext differs from encryption output")
+        self.assets.append({"path": relative, "ref": dict(ref)})
 
 
 def _digest(path: Path) -> str:
@@ -618,10 +655,26 @@ class GhCliStateTransport:
             raise StateError("Uploaded GitHub asset digest differs from local ciphertext")
         self._assets[tag][name] = asset
 
+    def find_asset(self, tag: str, name: str, *, refresh: bool = False) -> dict | None:
+        self._release(tag)
+        if refresh:
+            self._listed.discard(tag)
+            self._assets[tag] = {}
+        return self._find_asset(tag, name)
+
     def _asset(self, tag: str, name: str) -> dict:
+        asset = self._find_asset(tag, name)
+        if asset is None:
+            raise StateError("Immutable state asset is missing or ambiguous")
+        return asset
+
+    def _find_asset(self, tag: str, name: str) -> dict | None:
         release = self._release(tag)
         if name in self._assets[tag]:
-            return self._assets[tag][name]
+            asset = self._assets[tag][name]
+            if type(asset.get("id")) is not int:
+                raise StateError("Invalid immutable asset ID")
+            return asset
         if tag not in self._listed:
             assets = {}
             for page in range(1, 12):  # Releases contain at most 1,000 assets.
@@ -642,8 +695,10 @@ class GhCliStateTransport:
             self._assets[tag] = assets
             self._listed.add(tag)
         asset = self._assets[tag].get(name)
-        if not asset or type(asset.get("id")) is not int:
-            raise StateError("Immutable state asset is missing or ambiguous")
+        if asset is None:
+            return None
+        if type(asset.get("id")) is not int:
+            raise StateError("Invalid immutable asset ID")
         return asset
 
     def download_asset(self, tag: str, name: str, destination: Path) -> None:
@@ -695,6 +750,8 @@ class GitHubStateStore:
         if self.group_bytes < 1:
             self.group_bytes = 1
         self._verified_parts: set[bytes] = set()
+        self._prepared_verified: dict[str, set[bytes]] = {}
+        self._verified_downloads: set[bytes] = set()
 
     def _lock(self):
         return nullcontext() if ControllerLock.owned(self.root) else ControllerLock(self.root)
@@ -824,6 +881,7 @@ class GitHubStateStore:
         self.transport.download_asset(ref["release_tag"], ref["name"], target)
         if target.stat().st_size != ref["ciphertext_bytes"] or _digest(target) != ref["ciphertext_sha256"]:
             raise StateError("Remote immutable asset hash/size differs")
+        self._verified_downloads.add(_asset_identity(ref))
 
     def _decrypt(self, ref: dict, encrypted: Path, plaintext: Path) -> None:
         if self.private_key is None:
@@ -1011,9 +1069,9 @@ class GitHubStateStore:
         pieces = path.split("/")
         return (pieces[-1].endswith((".lock", "-wal", "-shm")) or
                 any(piece.startswith((".icsot-", ".capture-export-")) for piece in pieces) or
-                "icsot-verified-archive.git" in pieces)
+                any(piece in ("icsot-verified-archive.git", "icsot-verified-recent.git") for piece in pieces))
 
-    def _snapshot_files(self, staging: Path) -> list[dict]:
+    def _snapshot_files(self, staging: Path, *, materialize: bool = True) -> list[dict]:
         files = []
         for source in sorted(self.root.rglob("*")):
             name = source.relative_to(self.root).as_posix()
@@ -1043,9 +1101,12 @@ class GitHubStateStore:
                 finally:
                     backup.close()
                     original.close()
-            else:
+            elif materialize:
                 shutil.copyfile(source, target)
-            os.chmod(target, 0o600)
+            else:
+                target = source
+            if target != source:
+                os.chmod(target, 0o600)
             digest = _digest(target)
             if name.startswith("objects/sha256/") and source.name != digest:
                 raise StateError("Working-state CAS filename/hash differs")
@@ -1074,7 +1135,8 @@ class GitHubStateStore:
         return digest
 
     def _part(self, plaintext: Path, kind: str, release: str, prior: dict, directory: Path,
-              parts: dict, metrics: dict, *, compress: bool = True) -> str:
+              parts: dict, metrics: dict, *, compress: bool = True,
+              prepared_sink: _PreparedSink | None = None) -> str:
         decoded_sha256, decoded_bytes = _digest(plaintext), plaintext.stat().st_size
         existing = prior.get((decoded_sha256, decoded_bytes, kind))
         if existing:
@@ -1101,17 +1163,21 @@ class GitHubStateStore:
         shard = metrics["_asset_count"] // (self.max_assets_per_release - 1)
         actual_release = release if shard == 0 else release + f"-p{shard + 1}"
         if actual_release not in metrics["_releases"]:
-            self.transport.ensure_release(actual_release)
+            if prepared_sink is None:
+                self.transport.ensure_release(actual_release)
             metrics["_releases"].add(actual_release)
         metrics["_asset_count"] += 1
         ref = {**record, "release_tag": actual_release, "name": name, "kind": kind,
                "encoding": encoding, "decoded_sha256": decoded_sha256, "decoded_bytes": decoded_bytes}
-        self.transport.upload_asset(actual_release, name, encrypted)
-        verify = directory / (digest + ".remote")
-        self._download_verified(ref, verify)
-        verify.unlink()
+        if prepared_sink is None:
+            self.transport.upload_asset(actual_release, name, encrypted)
+            verify = directory / (digest + ".remote")
+            self._download_verified(ref, verify)
+            verify.unlink()
+            self._verified_parts.add(_asset_identity(ref))
+        else:
+            prepared_sink.capture(ref, encrypted)
         encrypted.unlink()
-        self._verified_parts.add(_asset_identity(ref))
         parts[digest] = ref
         metrics["new_parts"] += 1
         metrics["state_uploaded_ciphertext_bytes"] += ref["ciphertext_bytes"]
@@ -1159,7 +1225,7 @@ class GitHubStateStore:
         # Immutable closure is append-only. A vanished old packed member cannot
         # be dropped from a reused block's exact extraction map.
         for name, old in previous.items():
-            if self._immutable(name) and name not in current:
+            if self._immutable(name) and not self._excluded(name) and name not in current:
                 raise StateError("Previously retained immutable state file is missing")
         raw, small, mutable, reused = [], [], [], {}
         mutable_target = min(self.part_bytes, max(tarfile.RECORDSIZE, self.group_bytes))
@@ -1202,6 +1268,15 @@ class GitHubStateStore:
                 code_hashes: dict | None = None, config_hashes: dict | None = None,
                 lane_heads: dict | None = None, evidence_heads: dict | None = None,
                 quiescent: bool = False) -> dict:
+        return self._build_publication(selection, dependencies=dependencies, code_hashes=code_hashes,
+                                       config_hashes=config_hashes, lane_heads=lane_heads,
+                                       evidence_heads=evidence_heads, quiescent=quiescent)
+
+    def _build_publication(self, selection: StateSelection, *, dependencies: list[dict] | tuple = (),
+                code_hashes: dict | None = None, config_hashes: dict | None = None,
+                lane_heads: dict | None = None, evidence_heads: dict | None = None,
+                quiescent: bool = False, generation: str | None = None,
+                prepared_sink: _PreparedSink | None = None) -> dict:
         request_start = getattr(self.transport, "request_count", 0)
         graphql_start = getattr(self.transport, "graphql_request_count", 0)
         if not quiescent:
@@ -1213,7 +1288,9 @@ class GitHubStateStore:
         elif selection.index is not None:
             raise StateError("Index without authoritative pointer")
         prior = selection.index or {"parts": {}, "dependencies": []}
-        generation = uuid.uuid4().hex
+        generation = generation or uuid.uuid4().hex
+        if not _GENERATION.fullmatch(generation):
+            raise ValueError("A prepared generation must be 32 lowercase hexadecimal characters")
         predecessor = selection.pointer["index"]["ciphertext_sha256"] if selection.pointer else None
         release = f"collector-state-r{self.repository_id}-g{generation}"
         metrics = {"new_parts": 0, "reused_parts": 0, "state_uploaded_ciphertext_bytes": 0,
@@ -1253,12 +1330,18 @@ class GitHubStateStore:
             # Snapshot copy + current raw/tar + XZ + local/remote ciphertext.
             # Encryption envelope overhead is bounded by the codec's 64 KiB header.
             publish_peak = source_bytes + 4 * (largest_payload + 65536)
+            if prepared_sink is not None:
+                # Retain every encrypted asset plus a generous per-file/index
+                # metadata allowance until authoritative pointer acknowledgement.
+                publish_peak += source_bytes + 65536 * (source_files + 1)
             self._preflight_disk(directory=directory, required=publish_peak,
                                  operation="publication snapshot and encrypted verification")
             staging = directory / "snapshot"
             staging.mkdir(mode=0o700)
             snapshot_started_at = utc_iso()
             files = self._snapshot_files(staging)
+            if prepared_sink is not None:
+                prepared_sink.source_files = copy.deepcopy(files)
             estimate = self._publication_requests_estimate(files, prior)
             budget = getattr(self.transport, "publication_budget", None)
             if callable(budget):
@@ -1268,7 +1351,14 @@ class GitHubStateStore:
             parts = {}
             prior_parts = {(part["decoded_sha256"], part["decoded_bytes"], part["kind"]): part
                            for part in prior["parts"].values()}
-            self.transport.ensure_release(release)
+            if prepared_sink is None:
+                self.transport.ensure_release(release)
+            else:
+                # Finish any old-part remote authentication before producing
+                # new ciphertext, so a quota deferral cannot leave half a seal.
+                verified_prior, verification_metrics = {}, {"reused_parts": 0}
+                for ref in prior["parts"].values():
+                    self._reuse_part(ref, directory, verified_prior, verification_metrics)
             metrics["_releases"].add(release)
             plan = self._snapshot_plan(files, prior)
             metrics["new_small_immutable_files_packed"] = plan["new_small_immutable_files"]
@@ -1296,7 +1386,7 @@ class GitHubStateStore:
                             chunk.unlink()
                             break
                         digest = self._part(chunk, "raw", release, prior_parts, directory, parts, metrics,
-                                            compress=not already_compressed)
+                                            compress=not already_compressed, prepared_sink=prepared_sink)
                         item["segments"].append({"part": digest})
                         count = chunk.stat().st_size
                         chunk.unlink()
@@ -1312,7 +1402,8 @@ class GitHubStateStore:
                             archive.addfile(info, source)
                 if archive_path.stat().st_size > self.part_bytes:
                     raise StateError("Grouped snapshot exceeds plaintext part limit")
-                part_id = self._part(archive_path, "tar", release, prior_parts, directory, parts, metrics)
+                part_id = self._part(archive_path, "tar", release, prior_parts, directory, parts, metrics,
+                                     prepared_sink=prepared_sink)
                 for item in members:
                     item["segments"] = [{"part": part_id, "member": item["path"]}]
                 archive_path.unlink()
@@ -1335,10 +1426,15 @@ class GitHubStateStore:
             pointer = {**self._binding(generation, predecessor), **snapshot_times, "index": ref,
                        "context_sha256": hashlib.sha256(canonical_json(context)).hexdigest()}
             self._check_index(pointer, index)
-            self.transport.upload_asset(release, ref["name"], encrypted)
-            self._download_verified(ref, directory / "verified-index.enc")
+            if prepared_sink is None:
+                self.transport.upload_asset(release, ref["name"], encrypted)
+                self._download_verified(ref, directory / "verified-index.enc")
+                commit = self._advance(selection, pointer)
+            else:
+                prepared_sink.capture(ref, encrypted)
+                prepared_sink.index = copy.deepcopy(index)
+                commit = None
             metrics["state_uploaded_ciphertext_bytes"] += ref["ciphertext_bytes"]
-            commit = self._advance(selection, pointer)
         state_release_count = len(metrics.pop("_releases"))
         metrics.pop("_asset_count")
         request_total = getattr(self.transport, "request_count", 0)
@@ -1358,6 +1454,299 @@ class GitHubStateStore:
                 "index_sha256": ref["ciphertext_sha256"], "pointer": pointer,
                 "state_referenced_ciphertext_bytes": sum(p["ciphertext_bytes"] for p in parts.values()) + ref["ciphertext_bytes"],
                 "state_plaintext_bytes": sum(item["bytes"] for item in files)}
+
+    @staticmethod
+    def _local_record(path: Path, value: dict, *, replace: bool = False) -> None:
+        temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("xb") as output:
+                os.chmod(temporary, 0o600)
+                output.write(canonical_json(value))
+                output.flush()
+                os.fsync(output.fileno())
+            if replace:
+                os.replace(temporary, path)
+            else:
+                os.link(temporary, path)
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _authoritative_pointer(self) -> tuple[str | None, bytes | None]:
+        head = self.transport.branch_head()
+        binding = self._check_slug_binding(head)
+        raw = self.transport.read_pointer(head, self.repository_id) if head else None
+        if binding is not None and raw is None:
+            raise StateConflictError("Repository binding exists without its authoritative state pointer")
+        if raw is not None:
+            if binding is None:
+                raise StateConflictError("State pointer has no authoritative repository slug binding")
+            self._check_pointer(_json(raw, "authoritative state pointer"))
+        return head, raw
+
+    def _prepared_directory(self, directory: Path | str) -> Path:
+        directory = Path(directory).resolve()
+        if directory.is_relative_to(self.root) or self.root.is_relative_to(directory):
+            raise StateError("Prepared state directory must be separate from the captured root")
+        if self.private_key and self.private_key.is_relative_to(directory):
+            raise StateError("Prepared state directory must not contain the operational private key")
+        return directory
+
+    def prepare(self, selection: StateSelection, *, directory: Path | str, generation: str,
+                source_import_sha256: str, dependencies: list[dict] | tuple = (),
+                code_hashes: dict | None = None, config_hashes: dict | None = None,
+                lane_heads: dict | None = None, evidence_heads: dict | None = None,
+                quiescent: bool = False) -> PreparedState:
+        """Freeze local bytes without uploading or committing any GitHub state.
+
+        Record the returned generation, manifest hash and asset references in
+        the caller's durable disposition before ``publish_prepared``. Keep this
+        directory across bounded reset waits; no backend sleep or new generation
+        retry is performed. Recovery on another runner needs these exact files.
+        """
+        if not quiescent:
+            raise StateError("Preparation requires joined capture/finalizer callbacks")
+        if not isinstance(generation, str) or not _GENERATION.fullmatch(generation):
+            raise ValueError("Explicit stable 32-hex generation required")
+        if not isinstance(source_import_sha256, str) or not _HASH.fullmatch(source_import_sha256):
+            raise ValueError("Source import SHA-256 required")
+        directory = self._prepared_directory(directory)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if any(directory.iterdir()):
+            raise StateError("Preparation requires an empty directory; load existing prepared bytes by their SHA")
+        os.chmod(directory, 0o700)
+        heads = dict(evidence_heads or {})
+        if heads.get("source_import_sha256", source_import_sha256) != source_import_sha256:
+            raise StateError("Source import binding differs from evidence heads")
+        heads["source_import_sha256"] = source_import_sha256
+        with self._lock():
+            _, actual = self._authoritative_pointer()
+            expected = canonical_json(selection.pointer) if selection.pointer else None
+            if actual != expected:
+                raise StateConflictError("State pointer changed before preparation")
+            sink = _PreparedSink(directory)
+            metrics = self._build_publication(selection, dependencies=dependencies,
+                                             code_hashes=code_hashes, config_hashes=config_hashes,
+                                             lane_heads=lane_heads, evidence_heads=heads, quiescent=True,
+                                             generation=generation, prepared_sink=sink)
+            assert sink.index is not None
+            metrics["state_prepared_ciphertext_bytes"] = metrics["state_uploaded_ciphertext_bytes"]
+            metrics["state_uploaded_ciphertext_bytes"] = 0
+            metrics["status"] = "prepared_locally"
+            value = {"schema_version": 1, "kind": "icsot_prepared_state_v1",
+                     "repository_id": self.repository_id, "slug": self.slug, "logical_root": str(self.root),
+                     "recipient_spki_sha256": self.recipient, "generation": generation,
+                     "source_import_sha256": source_import_sha256,
+                     "selection": {"head": selection.head, "pointer": selection.pointer, "index": selection.index},
+                     "expected_pointer_sha256": hashlib.sha256(canonical_json(selection.pointer)).hexdigest(),
+                     "pointer": metrics["pointer"], "index": sink.index, "source_files": sink.source_files,
+                     "assets": sink.assets, "metrics": metrics}
+            self._local_record(directory / "prepared.json", value)
+            digest = _digest(directory / "prepared.json")
+        return self.load_prepared(directory, digest)
+
+    def load_prepared(self, directory: Path | str, expected_manifest_sha256: str) -> PreparedState:
+        """Load only a caller-pinned manifest; the upload journal is not authority."""
+        directory = self._prepared_directory(directory)
+        if not isinstance(expected_manifest_sha256, str) or not _HASH.fullmatch(expected_manifest_sha256):
+            raise ValueError("Pinned prepared-manifest SHA-256 required")
+        raw = (directory / "prepared.json").read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_manifest_sha256:
+            raise StateError("Prepared manifest SHA-256 differs")
+        value = _json(raw, "prepared state manifest")
+        self._validate_prepared(value, directory, check_payloads=False)
+        return PreparedState(directory, expected_manifest_sha256, value["generation"], value["source_import_sha256"],
+                             copy.deepcopy(value["pointer"]), tuple(copy.deepcopy(asset["ref"]) for asset in value["assets"]),
+                             tuple(sorted({asset["ref"]["release_tag"] for asset in value["assets"]})))
+
+    def _validate_prepared(self, value: dict, directory: Path, *, check_payloads: bool) -> StateSelection:
+        if (value.get("schema_version") != 1 or value.get("kind") != "icsot_prepared_state_v1" or
+                value.get("repository_id") != self.repository_id or value.get("slug") != self.slug or
+                value.get("logical_root") != str(self.root) or value.get("recipient_spki_sha256") != self.recipient or
+                public_key_fingerprint(self.public_key) != self.recipient):
+            raise StateError("Prepared state repository/root/recipient binding differs")
+        generation, source = value.get("generation"), value.get("source_import_sha256")
+        if (not isinstance(generation, str) or not _GENERATION.fullmatch(generation) or
+                not isinstance(source, str) or not _HASH.fullmatch(source)):
+            raise StateError("Invalid prepared generation/source binding")
+        pointer, index = value.get("pointer"), value.get("index")
+        if not isinstance(pointer, dict) or not isinstance(index, dict):
+            raise StateError("Missing prepared pointer/index")
+        self._check_index(pointer, index)
+        if pointer["generation"] != generation or index["context"]["evidence_heads"].get("source_import_sha256") != source:
+            raise StateError("Prepared source/generation differs from encrypted index context")
+        original = value.get("selection")
+        if not isinstance(original, dict):
+            raise StateError("Missing prepared predecessor selection")
+        selection = StateSelection(original.get("head"), original.get("pointer"), original.get("index"))
+        if selection.pointer is not None:
+            if not isinstance(selection.index, dict):
+                raise StateError("Prepared predecessor pointer lacks index")
+            self._check_index(selection.pointer, selection.index)
+        elif selection.index is not None:
+            raise StateError("Prepared predecessor index lacks pointer")
+        if value.get("expected_pointer_sha256") != hashlib.sha256(canonical_json(selection.pointer)).hexdigest():
+            raise StateError("Prepared expected-pointer hash differs")
+        predecessor = selection.pointer["index"]["ciphertext_sha256"] if selection.pointer else None
+        if pointer["predecessor_index_sha256"] != predecessor:
+            raise StateError("Prepared predecessor lineage differs")
+        source_files = [{key: item[key] for key in ("path", "bytes", "sha256", "mode")} for item in index["files"]]
+        if value.get("source_files") != source_files:
+            raise StateError("Prepared source file map differs from encrypted index")
+        assets = value.get("assets")
+        if not isinstance(assets, list) or not assets:
+            raise StateError("Prepared state has no ciphertext assets")
+        expected_refs = {_asset_identity(ref) for ref in index["parts"].values()}
+        expected_refs.add(_asset_identity(pointer["index"]))
+        prior_refs = {_asset_identity(ref) for ref in (selection.index or {}).get("parts", {}).values()}
+        seen = set()
+        for asset in assets:
+            if not isinstance(asset, dict):
+                raise StateError("Invalid prepared asset")
+            ref = _asset_ref(asset.get("ref"))
+            identity = _asset_identity(ref)
+            name = f"assets/{ref['release_tag']}/{ref['name']}"
+            if asset.get("path") != name or identity in seen:
+                raise StateError("Invalid or duplicate prepared asset path")
+            seen.add(identity)
+            path = directory / name
+            if not path.resolve().is_relative_to(directory) or path.is_symlink() or not path.is_file():
+                raise StateError("Prepared ciphertext is missing or unsafe")
+            if check_payloads and (path.stat().st_size != ref["ciphertext_bytes"] or _digest(path) != ref["ciphertext_sha256"]):
+                raise StateError("Prepared ciphertext SHA-256/size differs")
+        if seen != expected_refs - prior_refs:
+            raise StateError("Prepared asset set differs from new encrypted index dependencies")
+        if _asset_identity(assets[-1]["ref"]) != _asset_identity(pointer["index"]):
+            raise StateError("Prepared index must be the final uploaded state asset")
+        return selection
+
+    def _validate_prepared_root(self, value: dict) -> None:
+        with tempfile.TemporaryDirectory(prefix="icsot-prepared-root-check-") as temporary:
+            files = self._snapshot_files(Path(temporary), materialize=False)
+        if files != value["source_files"]:
+            raise StateError("Quiescent working root changed after preparation")
+
+    def publish_prepared(self, prepared: PreparedState, *, source_import_sha256: str | None = None,
+                         quiescent: bool = False) -> dict:
+        """Upload one frozen generation; caller controls bounded reset-aware retries."""
+        if not quiescent:
+            raise StateError("Prepared publication requires joined callbacks")
+        if not isinstance(prepared, PreparedState):
+            raise TypeError("A SHA-pinned PreparedState is required")
+        loaded = self.load_prepared(prepared.directory, prepared.manifest_sha256)
+        if (loaded.generation != prepared.generation or loaded.source_import_sha256 != prepared.source_import_sha256 or
+                source_import_sha256 is not None and source_import_sha256 != loaded.source_import_sha256):
+            raise StateError("Prepared source/generation request changed")
+        value = _json((loaded.directory / "prepared.json").read_bytes(), "prepared state manifest")
+        selection = self._validate_prepared(value, loaded.directory, check_payloads=False)
+        request_start = getattr(self.transport, "request_count", 0)
+        graphql_start = getattr(self.transport, "graphql_request_count", 0)
+        verified = self._prepared_verified.setdefault(loaded.manifest_sha256, set())
+        acknowledged_upload_bytes = 0
+        def progress(status: str, *, pointer_commit: str | None = None) -> None:
+            self._local_record(loaded.directory / "progress.json", {
+                "schema_version": 1, "status": status, "generation": loaded.generation,
+                "prepared_manifest_sha256": loaded.manifest_sha256,
+                "source_import_sha256": loaded.source_import_sha256,
+                "release_tags": list(loaded.release_tags), "pointer": loaded.pointer,
+                "verified_assets": [asset["ref"] for asset in value["assets"] if _asset_identity(asset["ref"]) in verified],
+                "pointer_commit": pointer_commit}, replace=True)
+        with self._lock():
+            head, actual = self._authoritative_pointer()
+            desired = canonical_json(value["pointer"])
+            already_committed = actual == desired
+            old = canonical_json(selection.pointer) if selection.pointer else None
+            if not already_committed and actual != old:
+                raise StateConflictError("State pointer changed before prepared publication")
+            if not already_committed:
+                self._validate_prepared_root(value)
+                self._validate_prepared(value, loaded.directory, check_payloads=True)
+                progress("publication_pending")  # Durable local disposition BEFORE any mutation.
+                pending = [asset for asset in value["assets"] if _asset_identity(asset["ref"]) not in verified]
+                new_assets = {_asset_identity(asset["ref"]) for asset in value["assets"]}
+                cold_prior = [ref for ref in value["index"]["parts"].values()
+                              if _asset_identity(ref) not in new_assets and _asset_identity(ref) not in self._verified_parts]
+                prior_dependencies = {_asset_identity(ref) for ref in (selection.index or {}).get("dependencies", [])}
+                dependencies = [ref for ref in value["index"]["dependencies"]
+                                if _asset_identity(ref) not in prior_dependencies | self._verified_downloads]
+                tags = {asset["ref"]["release_tag"] for asset in pending}
+                required = (2 * len(pending) + 15 * len(tags) + 18 + len(dependencies) +
+                            13 * len({ref["release_tag"] for ref in dependencies}) + len(cold_prior) +
+                            13 * len({ref["release_tag"] for ref in cold_prior}))
+                budget = getattr(self.transport, "publication_budget", None)
+                budget_metrics = budget(required) if callable(budget) else {}
+                maximum_download = max([asset["ref"]["ciphertext_bytes"] for asset in pending] +
+                                       [ref["ciphertext_bytes"] for ref in dependencies] +
+                                       [ref["ciphertext_bytes"] + ref["plaintext_bytes"] +
+                                        (ref["decoded_bytes"] if ref["encoding"] == "xz" else 0) for ref in cold_prior] + [0])
+                self._preflight_disk(directory=loaded.directory, required=maximum_download,
+                                     operation="prepared upload verification")
+                find_asset = getattr(self.transport, "find_asset", None)
+                if pending and not callable(find_asset):
+                    raise StateError("Prepared transport must support exact asset reconciliation")
+                with tempfile.TemporaryDirectory(prefix="icsot-prepared-verify-", dir=loaded.directory) as temporary:
+                    temporary = Path(temporary)
+                    authenticated_prior, prior_metrics = {}, {"reused_parts": 0}
+                    for ref in cold_prior:
+                        self._reuse_part(ref, temporary, authenticated_prior, prior_metrics)
+                    for number, ref in enumerate(dependencies):
+                        target = temporary / f"dependency-{number}"
+                        self._download_verified(ref, target)
+                        target.unlink()
+                    refreshed = set()
+                    for number, asset in enumerate(pending):
+                        ref = asset["ref"]
+                        tag, name = ref["release_tag"], ref["name"]
+                        self.transport.ensure_release(tag)
+                        remote = find_asset(tag, name, refresh=tag not in refreshed)
+                        refreshed.add(tag)
+                        if remote is None:
+                            try:
+                                self.transport.upload_asset(tag, name, loaded.directory / asset["path"])
+                                acknowledged_upload_bytes += ref["ciphertext_bytes"]
+                            except Exception:
+                                progress("upload_unacknowledged")
+                                raise  # Retry SAME prepared bytes, never another UUID.
+                        else:
+                            if (remote.get("name") != name or remote.get("size") != ref["ciphertext_bytes"] or
+                                    remote.get("digest") not in (None, "sha256:" + ref["ciphertext_sha256"])):
+                                raise StateError("Existing prepared asset identity differs; refusing replacement")
+                        target = temporary / f"asset-{number}"
+                        self._download_verified(ref, target)
+                        target.unlink()
+                        verified.add(_asset_identity(ref))
+                        progress("publication_pending")
+                self._validate_prepared_root(value)
+                _, current = self._authoritative_pointer()
+                if current != old and current != desired:
+                    raise StateConflictError("State pointer changed before prepared commit")
+                head = self._advance(selection, value["pointer"]) if current != desired else self.transport.branch_head()
+                progress("complete", pointer_commit=head)
+            else:
+                budget_metrics = {}
+                progress("complete", pointer_commit=head)
+        report = dict(value["metrics"])
+        request_total = getattr(self.transport, "request_count", 0)
+        graphql_total = getattr(self.transport, "graphql_request_count", 0)
+        report.update(budget_metrics)
+        report.update(status="already_committed" if already_committed else "complete", pointer_commit=head,
+                      prepared_manifest_sha256=loaded.manifest_sha256,
+                      source_import_sha256=loaded.source_import_sha256,
+                      state_prepared_ciphertext_bytes=sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"]),
+                      state_generation_new_ciphertext_bytes=sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"]),
+                      state_uploaded_ciphertext_bytes=0 if already_committed else sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"]),
+                      state_upload_bytes_acknowledged_this_attempt=acknowledged_upload_bytes,
+                      destination_github_api_requests_total=request_total,
+                      destination_github_api_requests_for_publish=request_total - request_start,
+                      destination_github_graphql_api_requests_total=graphql_total,
+                      destination_github_graphql_api_requests_for_publish=graphql_total - graphql_start,
+                      destination_github_rest_api_requests_total=request_total - graphql_total,
+                      destination_github_rest_api_requests_for_publish=request_total - request_start - (graphql_total - graphql_start))
+        return report
 
     def _advance(self, selection: StateSelection, pointer: dict) -> str:
         expected, old = selection.head, canonical_json(selection.pointer) if selection.pointer else None

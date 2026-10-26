@@ -84,6 +84,14 @@ class FakeGitHub:
         self.events.append(("download", name))
         destination.write_bytes(self.assets[tag, name])
 
+    def find_asset(self, tag, name, *, refresh=False):
+        self.events.append(("find", name))
+        contents = self.assets.get((tag, name))
+        if contents is None:
+            return None
+        return {"id": 1, "name": name, "size": len(contents),
+                "digest": "sha256:" + hashlib.sha256(contents).hexdigest()}
+
 
 @pytest.fixture(scope="module")
 def rsa_key():
@@ -1253,3 +1261,314 @@ def test_corrupt_new_small_immutable_block_never_materializes_files(setup):
     with pytest.raises(StateError, match="hash/size differs"):
         store.restore(selected)
     assert list(store.root.iterdir()) == [store.root / ".collector.lock"]
+
+
+
+def prepared_state(store, tmp_path, selection=None, **kwargs):
+    return store.prepare(selection or store.read(), directory=tmp_path / "prepared-publication",
+                         generation="a" * 32, source_import_sha256="b" * 64, quiescent=True, **kwargs)
+
+
+def test_preparation_is_local_and_publication_reuses_exact_frozen_ciphertext(setup, monkeypatch):
+    transport, make, tmp_path = setup
+    store = make()
+    name = cas_file(store, b"imported original raw API body")
+    write(store, "migration-receipt.json", b"frozen import receipt")
+    prepared = prepared_state(store, tmp_path)
+    assert transport.head is None and transport.uploads == []
+    assert not any(event[0] in ("release", "commit", "advance") for event in transport.events)
+    assert prepared.generation == "a" * 32 and prepared.source_import_sha256 == "b" * 64
+    assert prepared.release_tags and prepared.pointer["generation"] == prepared.generation
+    raw = json.loads((prepared.directory / "prepared.json").read_bytes())
+    identities = {asset["path"]: hashlib.sha256((prepared.directory / asset["path"]).read_bytes()).hexdigest()
+                  for asset in raw["assets"]}
+    def forbidden_encryption(*args, **kwargs):
+        raise AssertionError("Publishing prepared state must never encrypt again")
+    monkeypatch.setattr("icsot_observer.github_state.encrypt_file", forbidden_encryption)
+    report = store.publish_prepared(prepared, quiescent=True)
+    assert report["status"] == "complete"
+    assert report["generation"] == prepared.generation
+    assert report["state_uploaded_ciphertext_bytes"] == sum(ref["ciphertext_bytes"] for ref in prepared.assets)
+    assert all(hashlib.sha256((prepared.directory / path).read_bytes()).hexdigest() == digest for path, digest in identities.items())
+    assert json.loads((prepared.directory / "progress.json").read_bytes())["status"] == "complete"
+    selected = store.read()
+    assert selected.pointer == prepared.pointer
+    clear(store)
+    store.restore(selected)
+    assert (store.root / name).read_bytes() == b"imported original raw API body"
+
+
+def test_prepared_quota_reset_retry_keeps_generation_bytes_and_verified_uploads(setup):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"retained source payload")
+    prepared = prepared_state(store, tmp_path)
+    raw = json.loads((prepared.directory / "prepared.json").read_bytes())
+    original_bytes = {asset["path"]: (prepared.directory / asset["path"]).read_bytes() for asset in raw["assets"]}
+    original_upload = transport.upload_asset
+    def quota_defer(tag, name, source):
+        if name == "index.enc":
+            raise StateDeferredError("quota reset pending", retry_not_before=5000)
+        original_upload(tag, name, source)
+    transport.upload_asset = quota_defer
+    with pytest.raises(StateDeferredError) as failure:
+        store.publish_prepared(prepared, quiescent=True)
+    assert failure.value.retry_not_before == 5000
+    assert transport.head is None
+    assert prepared.directory.exists()
+    first_uploads = list(transport.uploads)
+    transport.upload_asset = original_upload
+    result = store.publish_prepared(prepared, quiescent=True)
+    assert result["status"] == "complete"
+    assert result["state_uploaded_ciphertext_bytes"] == result["state_generation_new_ciphertext_bytes"]
+    assert result["state_upload_bytes_acknowledged_this_attempt"] == prepared.pointer["index"]["ciphertext_bytes"]
+    assert all(transport.uploads.count(asset) == 1 for asset in first_uploads)
+    assert all((prepared.directory / path).read_bytes() == value for path, value in original_bytes.items())
+    assert store.read().pointer["generation"] == "a" * 32
+
+
+def test_prepared_uncertain_upload_is_reconciled_without_duplicate_post(setup):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"raw API body")
+    prepared = prepared_state(store, tmp_path)
+    actual_upload = transport.upload_asset
+    failed = [False]
+    def lost_ack(tag, name, source):
+        actual_upload(tag, name, source)
+        if not failed[0]:
+            failed[0] = True
+            raise OSError("acknowledgement lost")
+    transport.upload_asset = lost_ack
+    with pytest.raises(OSError, match="lost"):
+        store.publish_prepared(prepared, quiescent=True)
+    assert len(transport.uploads) == 1 and transport.head is None
+    transport.upload_asset = actual_upload
+    result = store.publish_prepared(prepared, quiescent=True)
+    assert result["status"] == "complete"
+    assert len(transport.uploads) == len(prepared.assets)
+    assert all(transport.uploads.count((ref["release_tag"], ref["name"])) == 1 for ref in prepared.assets)
+
+
+def test_reloaded_prepared_journal_is_not_upload_authority(setup):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"raw API body")
+    prepared = prepared_state(store, tmp_path)
+    # A forged journal claiming every upload is complete cannot advance a pointer.
+    (prepared.directory / "progress.json").write_text(json.dumps({"status": "complete", "verified_assets": list(prepared.assets)}))
+    reloaded_store = make()
+    reloaded = reloaded_store.load_prepared(prepared.directory, prepared.manifest_sha256)
+    result = reloaded_store.publish_prepared(reloaded, quiescent=True)
+    assert result["status"] == "complete"
+    assert len(transport.uploads) == len(prepared.assets)
+    assert all((ref["release_tag"], ref["name"]) in transport.assets for ref in prepared.assets)
+
+
+@pytest.mark.parametrize("change", ["root", "source", "ciphertext", "manifest"])
+def test_prepared_source_or_ciphertext_changes_fail_before_remote_upload(setup, change):
+    transport, make, tmp_path = setup
+    store = make()
+    write(store, "migration-receipt.json", b"original receipt")
+    prepared = prepared_state(store, tmp_path)
+    kwargs = {}
+    if change == "root":
+        write(store, "migration-receipt.json", b"changed receipt")
+    elif change == "source":
+        kwargs["source_import_sha256"] = "c" * 64
+    elif change == "ciphertext":
+        raw = json.loads((prepared.directory / "prepared.json").read_bytes())
+        (prepared.directory / raw["assets"][0]["path"]).write_bytes(b"corrupt")
+    else:
+        raw = json.loads((prepared.directory / "prepared.json").read_bytes())
+        raw["source_import_sha256"] = "c" * 64
+        (prepared.directory / "prepared.json").write_bytes(canonical_json(raw))
+    with pytest.raises(StateError):
+        store.publish_prepared(prepared, quiescent=True, **kwargs)
+    assert transport.head is None and transport.uploads == []
+
+
+def test_prepared_pointer_conflict_aborts_and_exact_committed_pointer_is_idempotent(setup):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"raw API body")
+    prepared = prepared_state(store, tmp_path)
+    result = store.publish_prepared(prepared, quiescent=True)
+    count, head = len(transport.uploads), transport.head
+    write(store, "later-live-work", b"not part of this already committed generation")
+    repeated = store.publish_prepared(prepared, quiescent=True)
+    assert repeated["status"] == "already_committed" and repeated["pointer_commit"] == head
+    assert len(transport.uploads) == count
+    assert repeated["state_uploaded_ciphertext_bytes"] == 0
+    publish(store, store.read())
+    current_count = len(transport.uploads)
+    with pytest.raises(StateConflictError, match="pointer changed"):
+        store.publish_prepared(prepared, quiescent=True)
+    assert len(transport.uploads) == current_count
+
+
+def test_prepared_publication_rebases_other_repository_only(setup):
+    transport, make, tmp_path = setup
+    store, other = make(7), make(8)
+    cas_file(store, b"first repo raw bytes")
+    write(other, "other", b"another selected repository")
+    prepared = prepared_state(store, tmp_path)
+    original = other.read()
+    transport.on_advance = lambda: publish(other, original)
+    result = store.publish_prepared(prepared, quiescent=True)
+    assert result["status"] == "complete"
+    assert set(transport.commits[transport.head]) == {7, 8}
+
+
+def test_prepared_budget_defers_before_encryption_and_private_staging_is_outside_root(setup, monkeypatch):
+    transport, make, tmp_path = setup
+    store = make()
+    write(store, "migration-receipt.json", b"receipt")
+    with pytest.raises(StateError, match="separate"):
+        store.prepare(store.read(), directory=store.root / "prepared", generation="a" * 32,
+                      source_import_sha256="b" * 64, quiescent=True)
+    def insufficient(required):
+        raise StateDeferredError("headroom deferred", retry_not_before=5000)
+    transport.publication_budget = insufficient
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Quota admission must precede expensive encryption")
+    monkeypatch.setattr("icsot_observer.github_state.encrypt_file", unexpected)
+    with pytest.raises(StateDeferredError):
+        prepared_state(store, tmp_path)
+    assert transport.uploads == [] and transport.head is None
+    assert list((tmp_path / "prepared-publication").iterdir()) == []
+
+
+def test_recent_disposable_verification_cache_is_excluded_from_snapshots(setup):
+    _, make, _ = setup
+    store = make()
+    write(store, "git/7.git/icsot-verified-recent.git/objects/large-cache", b"disposable verification copy")
+    write(store, "migration-receipt.json", b"retained")
+    publish(store)
+    assert [item["path"] for item in store.read().index["files"]] == ["migration-receipt.json"]
+
+
+def test_prepared_sqlite_wal_backup_can_be_revalidated_without_changing_root(setup):
+    _, make, tmp_path = setup
+    store = make()
+    database = store.root / "runtime.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.execute("CREATE TABLE committed(value TEXT)")
+    connection.execute("INSERT INTO committed VALUES ('baseline import')")
+    connection.commit()
+    prepared = prepared_state(store, tmp_path)
+    result = store.publish_prepared(prepared, quiescent=True)
+    assert result["status"] == "complete"
+    connection.close()
+
+
+
+def test_prepared_retry_rejects_changed_operational_recipient(setup, rsa_key):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"retained source")
+    prepared = prepared_state(store, tmp_path)
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    replacement = tmp_path / "new-recipient.pem"
+    replacement.write_bytes(other.public_key().public_bytes(serialization.Encoding.PEM,
+                                                            serialization.PublicFormat.SubjectPublicKeyInfo))
+    switched = GitHubStateStore(transport, repository_id=store.repository_id, slug=store.slug,
+                               logical_root=store.root, public_key=replacement)
+    with pytest.raises(StateError, match="recipient binding differs"):
+        switched.publish_prepared(prepared, quiescent=True)
+    assert transport.uploads == [] and transport.head is None
+
+
+def test_prepared_existing_remote_different_bytes_never_clobbered(setup):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"retained source")
+    prepared = prepared_state(store, tmp_path)
+    first = prepared.assets[0]
+    transport.assets[first["release_tag"], first["name"]] = b"somebody else's bytes"
+    with pytest.raises(StateError, match="identity differs"):
+        store.publish_prepared(prepared, quiescent=True)
+    assert transport.uploads == [] and transport.head is None
+
+
+def test_prepared_same_repo_pointer_race_during_upload_cannot_advance_own_generation(setup):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"retained source")
+    prepared = prepared_state(store, tmp_path)
+    original_upload = transport.upload_asset
+    changed = [False]
+    def competing(tag, name, source):
+        original_upload(tag, name, source)
+        if not changed[0]:
+            changed[0] = True
+            publish(store, store.read())
+    transport.upload_asset = competing
+    with pytest.raises(StateConflictError, match="before prepared commit"):
+        store.publish_prepared(prepared, quiescent=True)
+    assert store.read().pointer["generation"] != prepared.generation
+
+
+
+@pytest.mark.parametrize("corrupt_old", [False, True])
+def test_reloaded_prepared_state_reauthenticates_old_reused_parts_before_new_uploads(setup, corrupt_old):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"original retained CAS body")
+    publish(store)
+    selected = store.read()
+    old_ref = next(iter(selected.index["parts"].values()))
+    cas_file(store, b"newly captured CAS body")
+    prepared = prepared_state(store, tmp_path, selection=selected)
+    old_head, old_uploads = transport.head, len(transport.uploads)
+    resumed = make()
+    loaded = resumed.load_prepared(prepared.directory, prepared.manifest_sha256)
+    budgets = []
+    transport.publication_budget = lambda required: budgets.append(required) or {}
+    if corrupt_old:
+        transport.assets[old_ref["release_tag"], old_ref["name"]] = b"corrupt retained state"
+        with pytest.raises(StateError, match="hash/size differs"):
+            resumed.publish_prepared(loaded, quiescent=True)
+        assert transport.head == old_head and len(transport.uploads) == old_uploads
+    else:
+        transport.events.clear()
+        result = resumed.publish_prepared(loaded, quiescent=True)
+        assert result["status"] == "complete"
+        old_verification = transport.events.index(("download", old_ref["name"]))
+        first_new_upload = next(index for index, event in enumerate(transport.events) if event[0] == "upload")
+        assert old_verification < first_new_upload
+    assert budgets[0] >= 51  # Includes 13 old-Release reads plus the retained-part GET.
+
+
+
+def test_prepare_rejects_existing_numeric_pointer_without_slug_binding(setup):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"previous working state")
+    publish(store)
+    selection = store.read()
+    uploads = len(transport.uploads)
+    transport.bindings[transport.head].pop(store.slug.lower())
+    with pytest.raises(StateConflictError, match="no authoritative repository slug binding"):
+        prepared_state(store, tmp_path, selection=selection)
+    assert len(transport.uploads) == uploads
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_prepared_publish_rejects_missing_slug_binding_before_upload_or_idempotent_ack(setup, committed):
+    transport, make, tmp_path = setup
+    store = make()
+    cas_file(store, b"previous working state")
+    publish(store)
+    selected = store.read()
+    cas_file(store, b"next working state")
+    prepared = prepared_state(store, tmp_path, selection=selected)
+    if committed:
+        store.publish_prepared(prepared, quiescent=True)
+    uploads = len(transport.uploads)
+    transport.bindings[transport.head].pop(store.slug.lower())
+    with pytest.raises(StateConflictError, match="no authoritative repository slug binding"):
+        store.publish_prepared(prepared, quiescent=True)
+    assert len(transport.uploads) == uploads
