@@ -35,6 +35,7 @@ from .runtime import ControllerLock, PersistentQueue
 MIGRATION_BRANCH = "collector-migrations"
 MAX_METADATA_BYTES = 16 * 1024 ** 2
 MAX_CAPSULE_BYTES = 128 * 1024
+MIGRATION_STATE_CIPHERTEXT_CAP = 8 * 1024 ** 3
 DISPOSITIONS = {"queued", "seed_verified", "state_published", "deferred", "source_repair_pending"}
 REPAIR_INVENTORY_SHA256 = "3b39f6a290794a0e6ad763a48ccc9a78b782d1da375658142489238678505d21"
 # Explicit reviewed repair authorization, not a failure-triggered fallback.
@@ -334,6 +335,7 @@ def _record(plan: dict, entry: dict, prior: dict | None, disposition: str, **det
             "migration_id": plan["migration_id"], "repository_id": entry["repository_id"], "slug": entry["slug"],
             "source_index_sha256": (entry.get("source_index") or {}).get("sha256"),
             "source_manifest_sha256": (entry.get("source_manifest") or {}).get("sha256"),
+            "migration_state_ciphertext_cap_bytes": MIGRATION_STATE_CIPHERTEXT_CAP,
             "original_source_status": (entry.get("source_manifest") or {}).get("status"),
             "created_at": (prior or {}).get("created_at", now), "updated_at": now,
             **{key: value for key, value in (prior or {}).items() if key.startswith(("prepared_", "fresh_")) or key in (
@@ -607,6 +609,54 @@ def _resource_pause_reason(error: Exception):
     return None
 
 
+def safe_error_location(error: Exception):
+    """Return reviewed code coordinates, never exception text or local paths."""
+    modules = {"legacy_bootstrap.py", "legacy_archive.py", "archive_reader.py", "legacy_capsules.py",
+               "legacy_git.py", "legacy_api.py", "github_state.py", "pipeline.py", "runtime.py"}
+    location, frame = None, error.__traceback__
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        path = Path(code.co_filename)
+        if (path.parent.name == "icsot_observer" and path.name in modules and
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", code.co_name)):
+            location = {"module": path.name, "function": code.co_name, "line": frame.tb_lineno}
+        frame = frame.tb_next
+    return location
+
+
+def _retry_destination(operation, *, deadline, clock, sleeper):
+    """Retry one idempotent metadata boundary within the existing job window."""
+    for attempt in range(6):
+        if clock() >= deadline:
+            raise StateDeferredError("Destination metadata runtime exhausted", reason="destination_metadata_runtime_budget")
+        try:
+            return operation()
+        except StateDeferredError as error:
+            retry = error.retry_not_before
+            if retry is None or attempt == 5:
+                raise
+            retry = max(retry, clock() + 1)
+            if retry >= deadline:
+                raise
+            while clock() < retry:
+                sleeper(min(60, retry - clock(), deadline - clock()))
+
+
+def _shared_branch_exhaustion(error):
+    # These exact source-authored exhaustion guards exclude identity, slug,
+    # recipient and changed-own-pointer conflicts from automatic recovery.
+    return isinstance(error, StateConflictError) and str(error) in {
+        "Migration disposition changed concurrently", "Too many concurrent state branch updates"}
+
+
+def _own_pointer_unchanged(backend, expected):
+    authoritative = getattr(backend, "_authoritative_pointer", None)
+    if callable(authoritative):
+        _, current = authoritative()  # Also validates the create-only slug binding.
+        return current == (canonical_json(expected) if expected is not None else None)
+    return backend.read().pointer == expected
+
+
 def _publication_preflight(transport, entry: dict, index: dict | None = None):
     """Conservative metadata admission before large source transfer, then exact prepare admission."""
     if not hasattr(transport, "publication_budget"):
@@ -781,7 +831,15 @@ class RepairPublicationController:
                     prepared_manifest_sha256=prepared.manifest_sha256, prepared_local_only=True,
                     prepared_release_tags=list(prepared.release_tags), prepared_pointer=prepared.pointer,
                     prepared_assets=list(prepared.assets))
-        return self.perform(backend.publish_prepared, prepared, source_import_sha256=receipt_sha, quiescent=True)
+        def publish_identical():
+            try:
+                return backend.publish_prepared(prepared, source_import_sha256=receipt_sha, quiescent=True)
+            except StateConflictError as error:
+                if _shared_branch_exhaustion(error) and _own_pointer_unchanged(backend, selection.pointer):
+                    raise StateDeferredError("Shared working-state branch contention",
+                        reason="working_state_branch_contention", retry_not_before=self.clock() + 2) from error
+                raise
+        return self.perform(publish_identical)
 
 
 def _file_digest(path):
@@ -815,7 +873,7 @@ def _initialize_fresh_repair(plan, entry, *, config, code_sha, destination_repos
             if getattr(backend, "recipient", plan["operational_recipient_spki_sha256"]) != plan["operational_recipient_spki_sha256"]:
                 raise StateDeferredError("Operational recipient differs from frozen migration plan",
                                          reason="operational_recipient_mismatch")
-            selection = backend.read()
+            selection = _retry_destination(backend.read, deadline=deadline, clock=clock, sleeper=sleeper)
             if selection.pointer is not None:
                 return record("state_published", reason_code="already_operational", new_observations=0,
                               new_evidence_upload_bytes=0, state_uploaded_ciphertext_bytes=0)
@@ -824,7 +882,8 @@ def _initialize_fresh_repair(plan, entry, *, config, code_sha, destination_repos
         if config.history_profile != "full_history":
             raise StateDeferredError("Fresh repair history profile remains gated", reason="history_profile_requires_independent_baseline")
         record("queued", origin="explicit_fresh_repair_of_unusable_legacy_source")
-        preflight = _publication_preflight(transport, entry)
+        preflight = _retry_destination(lambda: _publication_preflight(transport, entry),
+                                      deadline=deadline, clock=clock, sleeper=sleeper)
         identity = (repair_identity_loader(entry["slug"]) if repair_identity_loader else
                     _repair_identity(config, entry["slug"], scratch))
         if identity.get("private") is not False or identity.get("id") != entry["repository_id"]:
@@ -862,7 +921,8 @@ def _initialize_fresh_repair(plan, entry, *, config, code_sha, destination_repos
     except Exception as error:
         resource = _resource_pause_reason(error)
         return record("deferred" if resource else "source_repair_pending", _best_effort=True,
-                      reason_code=resource or type(error).__name__, resource_review_required=bool(resource))
+                      reason_code=resource or type(error).__name__, resource_review_required=bool(resource),
+                      error_location=safe_error_location(error))
 
 
 def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Config,
@@ -890,26 +950,49 @@ def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Confi
         return {"slug": slug, "disposition": "source_repair_pending", "reason_code": "original_identity_unproven"}
     limits = entry.get("repair_resource_limits", entry.get("resource_limits", DEFAULT_LIMITS))
     transport = transport or BoundedStateTransport(destination_repository,
-        evidence_bytes=limits["max_new_evidence_ciphertext_bytes"], state_bytes=limits["max_new_state_ciphertext_bytes"])
+        evidence_bytes=limits["max_new_evidence_ciphertext_bytes"], state_bytes=MIGRATION_STATE_CIPHERTEXT_CAP)
     reader = reader or GitHubSourceReader()
     ledger = ledger or GitHubMigrationLedger(transport)
-    prior = ledger.read(plan["migration_id"], entry["repository_id"])
+    prior, expected_pointer, pointer_known = None, None, entry.get("strategy") == "fresh_repair"
+    deadline = clock() + max_runtime_seconds
+    scratch.mkdir(parents=True, exist_ok=True)
+    backend = backend or GitHubStateStore(transport, repository_id=entry["repository_id"], slug=slug,
+        public_key=state_public_key_path, private_key=operational_private_key_path, logical_root=working_root)
 
     def record(disposition, *, _best_effort=False, **details):
         nonlocal prior
         pending = _record(plan, entry, prior, disposition, **details)
+        def write_record():
+            try:
+                return ledger.write(pending)
+            except StateConflictError as error:
+                expected = ((prior or {}).get("prepared_pointer")
+                            if disposition == "state_published" and details.get("state_generation")
+                            else expected_pointer)
+                if (pointer_known and _shared_branch_exhaustion(error) and
+                        _own_pointer_unchanged(backend, expected)):
+                    raise StateDeferredError("Shared migration metadata branch contention",
+                        reason="migration_ledger_contention", retry_not_before=clock() + 2) from error
+                raise
         try:
-            prior = ledger.write(pending)
+            prior = (write_record() if _best_effort else
+                     _retry_destination(write_record, deadline=deadline, clock=clock, sleeper=sleeper))
         except StateDeferredError:
             if not _best_effort:
                 raise
             prior = {**pending, "disposition_recording": "not_confirmed_due_to_shared_destination_quota"}
         return prior
 
-    deadline = clock() + max_runtime_seconds
-    scratch.mkdir(parents=True, exist_ok=True)
-    backend = backend or GitHubStateStore(transport, repository_id=entry["repository_id"], slug=slug,
-        public_key=state_public_key_path, private_key=operational_private_key_path, logical_root=working_root)
+    try:
+        prior = _retry_destination(lambda: ledger.read(plan["migration_id"], entry["repository_id"]),
+                                   deadline=deadline, clock=clock, sleeper=sleeper)
+    except StateDeferredError as error:
+        # Unknown prior may contain a prepared-generation hold. Never replace
+        # it with a newly constructed record that could discard those refs.
+        return _record(plan, entry, None, "deferred", reason_code=error.reason,
+                       retry_not_before=error.retry_not_before,
+                       disposition_recording="not_attempted_prior_unknown",
+                       new_observations=0, new_evidence_upload_bytes=0)
     if entry.get("strategy") == "fresh_repair":
         return _initialize_fresh_repair(plan, entry, config=config, code_sha=code_sha,
             destination_repository=destination_repository, working_root=working_root, scratch=scratch,
@@ -923,7 +1006,8 @@ def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Confi
                 raise StateDeferredError("Operational recipient differs from sealed capsule catalog", reason="operational_recipient_mismatch")
             if config.history_profile != "full_history":
                 raise StateDeferredError("Legacy full state cannot silently seed another history profile", reason="history_profile_requires_independent_baseline")
-            selection = backend.read()
+            selection = _retry_destination(backend.read, deadline=deadline, clock=clock, sleeper=sleeper)
+            expected_pointer, pointer_known = selection.pointer, True
             if selection.pointer is not None:
                 return record("state_published", reason_code="already_operational",
                               origin="already_operational_state_no_migration",
@@ -938,7 +1022,8 @@ def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Confi
             if entry["disposition"] == "source_repair_pending" or not entry.get("parts"):
                 return record("source_repair_pending", reason_code="source_material_unavailable")
             record("queued")
-            preflight = _publication_preflight(transport, entry)
+            preflight = _retry_destination(lambda: _publication_preflight(transport, entry),
+                                          deadline=deadline, clock=clock, sleeper=sleeper)
             index_raw = reader.metadata(entry["source_index"])
             index = json.loads(index_raw)
             migration_raw = reader.metadata(entry["migration_index"]) if entry.get("migration_index") else None
@@ -1067,9 +1152,17 @@ def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Confi
                    prepared_manifest_sha256=prepared.manifest_sha256, prepared_local_only=True,
                    prepared_release_tags=list(prepared.release_tags), prepared_pointer=prepared.pointer,
                    prepared_assets=list(prepared.assets))
+            def publish_identical():
+                try:
+                    return backend.publish_prepared(prepared, source_import_sha256=receipt_digest, quiescent=True)
+                except StateConflictError as error:
+                    if _shared_branch_exhaustion(error) and _own_pointer_unchanged(backend, selection.pointer):
+                        raise StateDeferredError("Shared working-state branch contention",
+                            reason="working_state_branch_contention", retry_not_before=clock() + 2) from error
+                    raise
             for attempt in range(6):
                 try:
-                    publication = backend.publish_prepared(prepared, source_import_sha256=receipt_digest, quiescent=True)
+                    publication = publish_identical()
                     return record("state_published", reason_code="verified_legacy_seed_published",
                         origin="verified_legacy_baseline_migration",
                         state_generation=publication["generation"], state_pointer_commit=publication["pointer_commit"],
@@ -1111,9 +1204,11 @@ def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Confi
             resource = _resource_pause_reason(error)
             if resource:
                 return record("deferred", reason_code=resource, resource_review_required=True,
-                              restore_resource_admission=locals().get("restore_admission"))
+                              restore_resource_admission=locals().get("restore_admission"),
+                              error_location=safe_error_location(error))
             return record("source_repair_pending", reason_code=type(error).__name__,
-                          external_recovery_required=bool((prior or {}).get("prepared_generation")))
+                          external_recovery_required=bool((prior or {}).get("prepared_generation")),
+                          error_location=safe_error_location(error))
 
 
 def operational_pointer_loader(transport):

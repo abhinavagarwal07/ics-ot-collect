@@ -1,9 +1,11 @@
 """Synthetic, tiny offline legacy-to-native recovery; never study observations."""
 import copy
+import base64
 import io
 import json
 import shutil
 import tarfile
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -504,3 +506,254 @@ def test_every_implicit_selected_path_ancestor_is_admitted(closure):
     for depth in (1, 7, 19):
         deep = admitted_for("imports/" + "/".join(f"level-{i}" for i in range(depth)) + "/generated.json")
         assert deep - shallow >= depth * 16384
+
+
+def _metadata_only_seed(index_raw, migration_raw, *, index_asset_id=200, migration_asset_id=201, cipher_asset_id=101):
+    """A labeled metadata-validation projection; no payload/import is claimed."""
+    index, migration = json.loads(index_raw), json.loads(migration_raw)
+    row = index["manifests"][0]
+    release = {"release_repository": migration["repository"], "release_tag": migration["release_tag"],
+               "release_id": migration["release_id"]}
+    members = [{"path": "evidence/" + row["path"], "sha256": row["sha256"], "bytes": row["bytes"]}]
+    bundle = row.get("portable_full_bundle")
+    if bundle:
+        members.append({"path": f"evidence/objects/sha256/{bundle['sha256'][:2]}/{bundle['sha256']}",
+                        "sha256": bundle["sha256"], "bytes": bundle["bytes"]})
+    parts = []
+    for ordinal, part in enumerate(index["archive"]["parts"], 1):
+        alias = migration["parts"][part["name"]]
+        parts.append({"ordinal": ordinal, "plaintext": alias["plaintext"],
+                      "ciphertext": {**release, **alias["ciphertext"], "asset_id": cipher_asset_id + ordinal - 1}, "capsule": None})
+    return seal_legacy_seed({"schema_version": 1, "kind": "legacy_baseline_package_v1",
+        "repository_id": row["repository_id"], "slug": index["repository"],
+        "source_index": {**release, "asset_id": index_asset_id, "name": index.get("repository_key", "SYNTHETIC-metadata-only") + ".index.json",
+                         "sha256": sha256(index_raw), "bytes": len(index_raw)},
+        "source_manifest": {key: row[key] for key in ("path", "sha256", "bytes", "run_id", "started_at", "finished_at")},
+        "owner_recipient_spki_sha256": migration["recipient"],
+        "transport": {"kind": "migrated_encrypted_baseline",
+                      "migration_index": {**release, "asset_id": migration_asset_id, "name": "encryption-migration-index.json",
+                                          "sha256": sha256(migration_raw), "bytes": len(migration_raw)}, "parts": parts},
+        "members": members,
+        "import_receipt": {"path": "imports/SYNTHETIC-metadata-only-validation.json", "sha256": sha256(b"{}"), "bytes": 2}})
+
+
+@pytest.fixture
+def release_wide_migration_metadata():
+    """Sixteen synthetic repository aliases; the current index declares one."""
+    aliases = {}
+    for number in range(16):
+        plain = {"name": f"SYNTHETIC-repo-{number:02d}.tar.xz.part-0001", "bytes": 1000 + number,
+                 "sha256": sha256(f"synthetic-plaintext-{number}".encode())}
+        cipher = {"name": plain["name"] + ".enc", "bytes": 2000 + number,
+                  "sha256": sha256(f"synthetic-ciphertext-{number}".encode())}
+        aliases[plain["name"]] = {"plaintext": plain, "ciphertext": cipher}
+    manifest = {"repository_id": 123, "repository_input_slug": "example/selected", "run_id": "synthetic-legacy",
+                "started_at": "2026-01-01T00:00:00Z", "finished_at": "2026-01-01T00:00:01Z", "responses": []}
+    row = {"path": "runs/123/synthetic-legacy.manifest.json", "sha256": sha256(canonical_json(manifest)),
+           "bytes": len(canonical_json(manifest)), "repository_id": 123,
+           **{key: manifest[key] for key in ("run_id", "started_at", "finished_at")}}
+    selected = next(iter(aliases.values()))
+    index = {"repository": "example/selected", "release_tag": "corpus-baseline-SYNTHETIC", "manifests": [row],
+             "archive": {"complete": True, "parts": [selected["plaintext"]]}}
+    migration = {"repository": "example/archive", "release_tag": index["release_tag"], "release_id": 10,
+                 "recipient": sha256(b"SYNTHETIC owner public key"), "parts": aliases}
+    index_raw, migration_raw = canonical_json(index), canonical_json(migration)
+    return index, migration, index_raw, migration_raw, _metadata_only_seed(index_raw, migration_raw)
+
+
+def test_seed_selects_current_repository_from_authenticated_sixteen_alias_migration(release_wide_migration_metadata):
+    from icsot_observer.legacy_archive import normalize_legacy_parts
+    index, migration, index_raw, migration_raw, seed = release_wide_migration_metadata
+    assert len(migration["parts"]) == 16 and len(index["archive"]["parts"]) == 1
+    # The shared per-package normalizer deliberately remains strict.
+    with pytest.raises(ValueError, match="Unused transport overrides"):
+        normalize_legacy_parts(index, migration["parts"])
+    assert validate_legacy_seed(seed, source_index=index_raw, migration_index=migration_raw) is seed
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("missing", "exact frozen transport alias"),
+    ("wrong_plaintext", "exact frozen transport alias"),
+    ("wrong_ciphertext", "ordered part identities"),
+    ("unrelated_alias", "exact frozen transport alias"),
+    ("duplicate_source_part", "Duplicate archive part name"),
+    ("unrelated_declared_part", "ordered part identities"),
+    ("duplicate_declared_part", "ordered part identities"),
+])
+def test_selected_migration_aliases_remain_exact_and_strict(release_wide_migration_metadata, fault, reason):
+    index, migration, index_raw, migration_raw, seed = release_wide_migration_metadata
+    index, migration, seed = copy.deepcopy(index), copy.deepcopy(migration), copy.deepcopy(seed)
+    name = index["archive"]["parts"][0]["name"]
+    other = next(alias for alias_name, alias in migration["parts"].items() if alias_name != name)
+    if fault == "missing":
+        del migration["parts"][name]
+    elif fault == "wrong_plaintext":
+        migration["parts"][name]["plaintext"]["sha256"] = "f" * 64
+    elif fault == "wrong_ciphertext":
+        migration["parts"][name]["ciphertext"]["sha256"] = "f" * 64
+    elif fault == "unrelated_alias":
+        migration["parts"][name] = other
+    elif fault == "duplicate_source_part":
+        index["archive"]["parts"].append(copy.deepcopy(index["archive"]["parts"][0]))
+    else:
+        declared = copy.deepcopy(seed["transport"]["parts"][0])
+        declared["ordinal"] = 2
+        if fault == "unrelated_declared_part":
+            declared["plaintext"] = other["plaintext"]
+            declared["ciphertext"].update(other["ciphertext"])
+        seed["transport"]["parts"].append(declared)
+    index_raw, migration_raw = canonical_json(index), canonical_json(migration)
+    seed["source_index"].update(sha256=sha256(index_raw), bytes=len(index_raw))
+    seed["transport"]["migration_index"].update(sha256=sha256(migration_raw), bytes=len(migration_raw))
+    seed = seal_legacy_seed(seed)
+    with pytest.raises(ValueError, match=reason):
+        validate_legacy_seed(seed, source_index=index_raw, migration_index=migration_raw)
+
+
+def test_whole_migration_hash_and_duplicate_json_guard_are_not_relaxed(release_wide_migration_metadata):
+    index, migration, index_raw, migration_raw, seed = copy.deepcopy(release_wide_migration_metadata)
+    selected = index["archive"]["parts"][0]["name"]
+    unrelated = next(name for name in migration["parts"] if name != selected)
+    migration["parts"][unrelated]["ciphertext"]["sha256"] = "f" * 64
+    with pytest.raises(LegacySeedError, match="Original metadata bytes differ"):
+        validate_legacy_seed(seed, source_index=index_raw, migration_index=canonical_json(migration))
+    entries = [json.dumps(name) + ":" + json.dumps(alias) for name, alias in migration["parts"].items()]
+    entries.insert(1, entries[0])
+    raw = ('{"repository":' + json.dumps(migration["repository"]) + ',"release_tag":' + json.dumps(migration["release_tag"]) +
+           ',"parts":{' + ",".join(entries) + '}}').encode()
+    seed["transport"]["migration_index"].update(sha256=sha256(raw), bytes=len(raw))
+    seed = seal_legacy_seed(seed)
+    with pytest.raises(LegacySeedError, match="Invalid original metadata JSON"):
+        validate_legacy_seed(seed, source_index=index_raw, migration_index=raw)
+
+
+def test_native_seed_validation_does_not_apply_release_wide_migration_aliases(release_wide_migration_metadata):
+    index, migration, _, migration_raw, seed = release_wide_migration_metadata
+    index, seed = copy.deepcopy(index), copy.deepcopy(seed)
+    alias = migration["parts"][index["archive"]["parts"][0]["name"]]
+    index["archive"]["parts"] = [{**alias["ciphertext"], "plaintext": alias["plaintext"]}]
+    raw = canonical_json(index)
+    seed["source_index"].update(sha256=sha256(raw), bytes=len(raw))
+    seed["transport"].update(kind="native_encrypted_baseline", migration_index=None)
+    seed = seal_legacy_seed(seed)
+    assert validate_legacy_seed(seed, source_index=raw, migration_index=migration_raw) is seed
+
+
+def test_exact_cached_gdcm_index_and_whole_release_migration_replay_without_payloads():
+    from icsot_observer.legacy_archive import normalize_legacy_parts
+    index_raw = zlib.decompress(base64.b64decode(GDCM_ORIGINAL_INDEX_ZLIB_BASE64))
+    migration_raw = zlib.decompress(base64.b64decode(GDCM_RELEASE_MIGRATION_ZLIB_BASE64))
+    assert sha256(index_raw) == GDCM_ORIGINAL_INDEX_SHA256
+    assert sha256(migration_raw) == GDCM_RELEASE_MIGRATION_SHA256
+    assert len(index_raw) == 3631 and len(migration_raw) == 19762
+    index, migration = json.loads(index_raw), json.loads(migration_raw)
+    assert index["repository"] == "malaterre/GDCM" and len(migration["parts"]) == 16
+    with pytest.raises(ValueError, match="Unused transport overrides"):
+        normalize_legacy_parts(index, migration["parts"])
+    seed = _metadata_only_seed(index_raw, migration_raw, index_asset_id=676527405,
+                               migration_asset_id=676599050, cipher_asset_id=676584527)
+    assert validate_legacy_seed(seed, source_index=index_raw, migration_index=migration_raw) is seed
+
+
+# Exact public JSON metadata from the original GDCM index and its complete
+# 16-repository migration index. Lossless compressed literals keep this replay
+# portable without network access, payloads, keys, or untracked analysis files.
+# These metadata facts are real; the small seed/receipt used below is explicitly
+# a metadata-only test projection, not a claimed restored study observation.
+GDCM_ORIGINAL_INDEX_SHA256 = '36991eb75bdb6b6099c2a383094b41065abfea86c12d47a139e3a74511781449'
+GDCM_ORIGINAL_INDEX_ZLIB_BASE64 = (
+    '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'
+    'qnE='
+)
+
+GDCM_RELEASE_MIGRATION_SHA256 = 'eb0a7d48c072bdfe1b36f7092f341a1d07e92357e5fca2cd9f82d462b9d9c3a4'
+GDCM_RELEASE_MIGRATION_ZLIB_BASE64 = (
+    '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'
+)

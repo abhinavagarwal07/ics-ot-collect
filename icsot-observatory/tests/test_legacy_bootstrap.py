@@ -237,7 +237,7 @@ def engine(tmp_path, monkeypatch):
         return initialize_repository(plan, cfg.repositories[0], code_sha=CODE, config=cfg,
             destination_repository="owner/collector", operational_private_key_path=tmp_path / "unused-private",
             state_public_key_path=tmp_path / "unused-public", evidence_public_key_path=tmp_path / "unused-evidence-public",
-            working_root=cfg.root, scratch=tmp_path / "scratch", transport=transport, reader=reader, ledger=ledger,
+            working_root=cfg.root, scratch=tmp_path / "scratch", transport=options.pop("transport", transport), reader=reader, ledger=ledger,
             helpers=helpers, backend=backend, clock=lambda: now[0], sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds), **options)
     return SimpleNamespace(run=run, plan=plan, config=cfg, entry=entry, backend=backend, ledger=ledger,
                            helpers=helpers, events=events, now=now, transport=transport, reader=reader)
@@ -318,6 +318,107 @@ def test_quota_admission_refuses_before_source_transfer(engine, monkeypatch):
     assert "archive_import" not in engine.events
 
 
+@pytest.mark.parametrize("phase", ["ledger_read", "state_read", "ledger_write", "publication_budget"])
+def test_startup_destination_quota_waits_before_source_work_without_replaying_import(engine, phase):
+    target, name = {"ledger_read": (engine.ledger, "read"), "state_read": (engine.backend, "read"),
+                    "ledger_write": (engine.ledger, "write"), "publication_budget": (engine.transport, "publication_budget")}[phase]
+    original, calls, first_inputs = getattr(target, name), [], []
+    def quota_once(*args, **kwargs):
+        calls.append(engine.now[0])
+        if len(calls) <= 2:
+            first_inputs.append(args)
+        if len(calls) == 1:
+            raise StateDeferredError("destination quota", reason="rate_limit", retry_not_before=1120.)
+        return original(*args, **kwargs)
+    setattr(target, name, quota_once)
+    result = engine.run()
+    assert result["disposition"] == "state_published", result
+    assert calls[:2] == [1000., 1120.] and engine.now[0] == 1120.
+    assert engine.events.count("archive_import") == engine.events.count("prepare") == engine.events.count("publish") == 1
+    if phase == "ledger_write":
+        assert first_inputs[0][0] is first_inputs[1][0]  # SAME frozen record across reset.
+
+
+def test_startup_wait_never_crosses_the_existing_job_deadline(engine):
+    def quota(*args, **kwargs):
+        raise StateDeferredError("later reset", reason="rate_limit", retry_not_before=1120.)
+    engine.backend.read = quota
+    result = engine.run(max_runtime_seconds=60)
+    assert result["disposition"] == "deferred" and engine.now[0] == 1000.
+    assert not engine.events
+
+
+def test_unknown_prior_during_quota_never_overwrites_a_held_prepared_generation(engine):
+    key = (engine.plan["migration_id"], engine.entry["repository_id"])
+    held = {"migration_id": key[0], "repository_id": key[1], "disposition": "deferred",
+            "prepared_generation": "9" * 32, "prepared_manifest_sha256": "8" * 64,
+            "prepared_pointer": {"generation": "9" * 32},
+            "prepared_assets": [{"release_tag": "held-state", "name": "part-0001.enc", "ciphertext_sha256": "7" * 64}],
+            "prepared_local_only": True}
+    engine.ledger.records[key] = copy.deepcopy(held)
+    original_bytes = canonical_json(engine.ledger.records[key])
+    reads = []
+    def unreadable(*args, **kwargs):
+        reads.append(engine.now[0])
+        raise StateDeferredError("shared destination quota", reason="rate_limit", retry_not_before=engine.now[0] + 10)
+    engine.ledger.read = unreadable
+    result = engine.run()
+    assert result["disposition"] == "deferred"
+    assert result["disposition_recording"] == "not_attempted_prior_unknown"
+    assert len(reads) == 6 and engine.ledger.writes == []
+    assert canonical_json(engine.ledger.records[key]) == original_bytes
+    assert engine.events == [] and result["new_observations"] == result["new_evidence_upload_bytes"] == 0
+
+
+@pytest.mark.parametrize("changed_pointer", [False, True])
+def test_shared_ledger_exhaustion_retries_only_when_own_pointer_is_unchanged(engine, changed_pointer):
+    from icsot_observer.github_state import StateConflictError
+    original, writes = engine.ledger.write, []
+    def collide(value):
+        writes.append(value)
+        if len(writes) == 1:
+            if changed_pointer:
+                engine.backend.selection = SimpleNamespace(pointer={"generation": "newer"})
+            raise StateConflictError("Migration disposition changed concurrently")
+        return original(value)
+    engine.ledger.write = collide
+    result = engine.run()
+    if changed_pointer:
+        assert result["reason_code"] == "StateConflictError" and engine.now[0] == 1000.
+        assert "archive_import" not in engine.events and "publish" not in engine.events
+    else:
+        assert result["disposition"] == "state_published" and engine.now[0] == 1002.
+        assert writes[0] is writes[1] and engine.events.count("archive_import") == 1
+
+
+def test_shared_state_branch_exhaustion_keeps_the_same_prepared_snapshot(engine):
+    from icsot_observer.github_state import StateConflictError
+    original, calls = engine.backend.publish_prepared, []
+    def collide(prepared, **options):
+        calls.append(prepared)
+        if len(calls) == 1:
+            raise StateConflictError("Too many concurrent state branch updates")
+        return original(prepared, **options)
+    engine.backend.publish_prepared = collide
+    result = engine.run()
+    assert result["disposition"] == "state_published" and engine.now[0] == 1002.
+    assert len(calls) == 2 and calls[0] is calls[1]
+    assert engine.events.count("prepare") == engine.events.count("archive_import") == 1
+
+
+def test_migration_state_copy_cap_is_eight_gib_without_changing_evidence_guard(engine, monkeypatch):
+    from icsot_observer import legacy_bootstrap
+    limits = {}
+    def transport(repository, **options):
+        limits.update(options)
+        return engine.transport
+    monkeypatch.setattr(legacy_bootstrap, "BoundedStateTransport", transport)
+    result = engine.run(transport=None)
+    assert result["disposition"] == "state_published"
+    assert limits == {"evidence_bytes": 2 * 1024 ** 3, "state_bytes": 8 * 1024 ** 3}
+    assert result["migration_state_ciphertext_cap_bytes"] == 8 * 1024 ** 3
+
+
 def test_host_resource_limit_pauses_without_reclassifying_original_source(engine):
     from icsot_observer.archive_reader import ArchiveError
     def cap(*args, **options):
@@ -337,6 +438,21 @@ def test_actual_disk_exhaustion_is_deferred_without_reclassifying_source(engine,
     result = engine.run()
     assert result["disposition"] == "deferred" and result["reason_code"] == "host_disk_exhausted"
     assert result["original_source_status"] == "partial"
+
+
+def test_public_failure_location_contains_only_reviewed_source_coordinates(engine):
+    from icsot_observer.archive_reader import ArchiveError
+    sentinel = "UNTRUSTED_BODY_EXCEPTION_MESSAGE_SENTINEL"
+    def failure(*args, **options):
+        raise ArchiveError(sentinel)
+    engine.helpers.archive_import = failure
+    result = engine.run()
+    assert result["reason_code"] == "ArchiveError"
+    location = result["error_location"]
+    assert set(location) == {"module", "function", "line"}
+    assert location["module"] == "legacy_bootstrap.py" and location["function"] == "initialize_repository"
+    assert type(location["line"]) is int
+    assert sentinel not in json.dumps(engine.ledger.writes)
 
 
 @pytest.mark.parametrize("max_elapsed,inactivity", [(0.05, 10), (10, 0.05)])

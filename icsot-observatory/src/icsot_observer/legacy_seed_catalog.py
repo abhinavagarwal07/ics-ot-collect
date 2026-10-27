@@ -243,7 +243,18 @@ def validate_legacy_seed(seed: dict, *, repository_id: int | None = None, slug: 
             if (migration.get("release_tag") != index_ref["release_tag"]
                     or migration.get("repository") != index_ref["release_repository"]):
                 raise LegacySeedError("Original migration mapping source differs")
-            overrides = migration.get("parts")
+            all_overrides = migration.get("parts")
+            source_parts = index["archive"].get("parts")
+            if not isinstance(all_overrides, dict) or not isinstance(source_parts, list):
+                raise LegacySeedError("Frozen original migration part mapping is invalid")
+            # A release migration index covers many repositories. Authenticate
+            # that whole document above, then give the strict per-package
+            # normalizer only aliases named by this unchanged source index.
+            overrides = {}
+            for part in source_parts:
+                name = _identity(part)["name"]
+                if name in all_overrides:
+                    overrides[name] = all_overrides[name]
         normalized = normalize_legacy_parts(index, overrides)
         expected = [{"plaintext": p["plaintext"], "ciphertext": {k: p["ciphertext"][k] for k in ("name", "sha256", "bytes")}} for p in parts]
         if normalized != expected:
