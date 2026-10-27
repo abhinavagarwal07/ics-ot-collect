@@ -1,12 +1,10 @@
 name: Initialize operational state from retained baselines
 
 on:
-  schedule:
-    - cron: '47 */6 * * *'
   workflow_dispatch:
     inputs:
       catalog_ref:
-        description: 'Published immutable capsule-catalog AssetRef JSON; blank retries the active full migration plan'
+        description: 'Published immutable capsule-catalog AssetRef JSON; blank selects eligible active-plan work and reports recovery holds'
         required: false
         type: string
 
@@ -16,6 +14,7 @@ permissions:
 concurrency:
   group: persistent-collection
   cancel-in-progress: false
+  queue: max
 
 defaults:
   run:
@@ -29,6 +28,8 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       planned_count: ${{ steps.plan.outputs.planned_count }}
+      blocked_count: ${{ steps.plan.outputs.blocked_count }}
+      planning_status: ${{ steps.plan.outputs.planning_status }}
       plan_ref: ${{ steps.plan.outputs.plan_ref }}
       plan_sha256: ${{ steps.plan.outputs.plan_sha256 }}
       code_sha: ${{ steps.plan.outputs.code_sha }}
@@ -43,7 +44,7 @@ jobs:
           python-version: '3.12'
       - name: Install collector
         run: python -m pip install --disable-pip-version-check -e .
-      - name: Freeze all 185 dispositions or resume every unfinished eligible source
+      - name: Report all 185 dispositions and select eligible work while retaining recovery holds
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}

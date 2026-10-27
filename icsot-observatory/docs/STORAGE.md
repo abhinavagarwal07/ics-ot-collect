@@ -40,7 +40,7 @@ python scripts/capture_baseline.py restore --root /path/to/extracted/evidence
 
 ## Recurring collection
 
-**No recurring interval is enabled yet.** The implemented `persistent` command defaults to independent six-hour API/Git intervals with durable mirrors, queue and state. Execution may use a persistent host or a GitHub-backed adapter that restores authenticated working state before each bounded run; a host has not been deployed. Hosted Actions cron is best effort and can be delayed or dropped. [Scheduled events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+**The six-hour recurring Actions workflow is enabled.** The `persistent` command also supports independent API/Git intervals with durable mirrors, queue and state. The GitHub-backed adapter restores authenticated working state before each bounded run; a persistent host has not been deployed. Baseline initialization and recovery are manual. Hosted Actions cron is best effort and can be delayed or dropped; a configured interval is not a claim of completed cohort coverage. [Scheduled events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 
 Genuine incremental Git archives with explicit prerequisites and encrypted per-capture transfers are now implemented and tested offline. Legacy `--bundle-full` still rewrites the full Git history; the active one-time baseline keeps that behavior. Recurring execution must retain and restore prior working state to avoid another baseline, enforce the monthly storage cap, and verify remote retention. See [durable collection](PERSISTENT.md).
 
