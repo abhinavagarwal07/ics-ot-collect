@@ -53,7 +53,7 @@ def test_recovery_candidates_are_authenticated_captured_and_linked_without_prior
     estimates = []
     transport.publication_budget = lambda required: estimates.append(required) or {}
     result = store.publish_prepared(prepared, quiescent=True)
-    assert estimates == [35]  # Only the new index: upload, GET, release/control reserve.
+    assert estimates == [49]  # New index plus fresh, read-only historical verification.
     assert result["reused_parts"] == 1 and result["new_parts"] == 0
     assert result["state_upload_bytes_acknowledged_this_attempt"] == prepared.pointer["index"]["ciphertext_bytes"]
     assert result["state_generation_new_ciphertext_bytes"] == prepared.pointer["index"]["ciphertext_bytes"]
@@ -172,11 +172,11 @@ def pilot(setup, monkeypatch):
     monkeypatch.setattr("icsot_observer.legacy_recovery.import_legacy_seed", importer)
     MemoryJournal.values, MemoryJournal.events = {}, []
     clear(store)
-    def run(attempt="one", current_store=store, scratch=None):
+    def run(attempt="one", current_store=store, scratch=None, journal_factory=MemoryJournal, **retry_options):
         return recover(manifest, sha256(canonical_json(manifest)), code_sha="a" * 40, config=config,
             backend=current_store, ledger=ledger, reader=SimpleNamespace(metadata=lambda ref: canonical_json(plan)), working_root=store.root,
             scratch=scratch or temporary / "scratch", operational_private_key_path=store.private_key,
-            evidence_public_key_path=store.public_key, journal_factory=MemoryJournal, attempt_identity=attempt)
+            evidence_public_key_path=store.public_key, journal_factory=journal_factory, attempt_identity=attempt, **retry_options)
     return SimpleNamespace(transport=transport, store=store, run=run, imports=imports, temporary=temporary,
                            record=record, manifest=manifest, ledger=ledger, config=config)
 
@@ -449,3 +449,251 @@ def test_nonuploaded_candidate_is_not_admitted_as_remote_reuse(pilot):
         if (ref := original_find(*args, **kwargs)) is not None else None)
     from icsot_observer.legacy_recovery import _available
     assert _available(p.store, p.manifest['candidate_parts']) == []
+
+
+def test_real_provider_confirmed_missing_generation_release_is_unavailable():
+    from icsot_observer.github_state import GhCliStateTransport
+    from icsot_observer.legacy_recovery import _available
+    from test_github_state import graphql_result, metadata_response
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if '/releases/tags/' in args[2]:
+            return metadata_response(args, {}, status=404)
+        if args[2] == 'graphql':
+            value = graphql_result(None)
+            value['data']['repository']['nameWithOwner'] = 'owner/archive'
+            return metadata_response(args, value)
+        raise AssertionError('Missing generation must never create or list releases')
+    transport = GhCliStateTransport('owner/archive', runner=runner)
+    ref = {'release_tag': 'collector-state-r1614410-g' + 'a' * 32, 'name': 'index.enc',
+           'ciphertext_sha256': 'b' * 64, 'ciphertext_bytes': 100}
+    assert _available(SimpleNamespace(transport=transport), [ref]) == []
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('failure', ['auth403', 'quota429', 'malformed_json', 'graphql_error', 'graphql_partial'])
+def test_real_provider_candidate_errors_are_never_classified_as_absence(failure):
+    from icsot_observer.github_state import GhCliStateTransport, StateReleaseMissingError
+    from icsot_observer.legacy_recovery import _available
+    from test_github_state import graphql_result, metadata_response
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if failure == 'auth403':
+            return metadata_response(args, {'message': 'Forbidden'}, status=403)
+        if failure == 'quota429':
+            return subprocess.CompletedProcess(args, 1,
+                b'HTTP/2.0 429 Too Many Requests\r\nRetry-After: 120\r\n\r\n{"message":"secondary rate limit"}', b'')
+        if failure == 'malformed_json':
+            return subprocess.CompletedProcess(args, 0, b'HTTP/2.0 200 OK\r\n\r\n{broken', b'')
+        if '/releases/tags/' in args[2]:
+            return metadata_response(args, {}, status=404)
+        value = graphql_result(None, repository='owner/archive')
+        if failure == 'graphql_error':
+            value['errors'] = [{'type': 'FORBIDDEN', 'message': 'denied'}]
+        else:
+            value['data']['repository'] = None
+        return metadata_response(args, value)
+    transport = GhCliStateTransport('owner/archive', runner=runner, clock=lambda: 1000)
+    ref = {'release_tag': 'collector-state-r1614410-g' + 'a' * 32, 'name': 'index.enc',
+           'ciphertext_sha256': 'b' * 64, 'ciphertext_bytes': 100}
+    with pytest.raises(StateError) as error:
+        _available(SimpleNamespace(transport=transport), [ref])
+    assert not isinstance(error.value, StateReleaseMissingError)
+    assert len(calls) <= 2 and all('/releases' not in call or '/tags/' in call for call in calls)
+
+
+def test_restart_after_descriptor_journal_and_before_main_release_creation(pilot):
+    from icsot_observer.github_state import GhCliStateTransport
+    from test_github_state import graphql_result, metadata_response
+    p = pilot
+    original_assets = copy.deepcopy(p.transport.assets)
+    def stop_before_release(required):
+        if MemoryJournal.values:
+            raise StateDeferredError('Stopped before creating generation release')
+        return {}
+    p.transport.publication_budget = stop_before_release
+    with pytest.raises(StateDeferredError):
+        p.run()
+    first = copy.deepcopy(MemoryJournal.values['7' * 32])
+    missing_tag = f"collector-state-r{PILOT_ID}-g{first['attempts'][0]['generation']}"
+    assert not any(tag == missing_tag for tag, name in p.transport.assets)
+    clear(p.store)
+    shutil.rmtree(p.temporary / 'scratch')
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if '/releases/tags/' in args[2]:
+            return metadata_response(args, {}, status=404)
+        return metadata_response(args, graphql_result(None, repository='owner/archive'))
+    real = GhCliStateTransport('owner/archive', runner=runner)
+    ordinary_find = p.transport.find_asset
+    def release_aware(tag, name, *, refresh=False):
+        if tag == missing_tag:
+            return real.find_asset(tag, name, refresh=refresh)
+        return ordinary_find(tag, name, refresh=refresh)
+    p.transport.find_asset = release_aware
+    p.transport.publication_budget = lambda required: {}
+    result = p.run('new-runner')
+    assert result['status'] == 'complete' and result['generation'] != first['attempts'][0]['generation']
+    assert len(p.imports) == 2 and calls and 'graphql' in calls
+    assert all(p.transport.assets[key] == value for key, value in original_assets.items())
+
+
+def test_headerless_provider_quota_mid_upload_waits_with_same_prepared_ciphertext(pilot, monkeypatch):
+    from icsot_observer.github_state import GhCliStateTransport
+    from test_github_state import rate_response
+    import icsot_observer.legacy_recovery as recovery_module
+    p = pilot
+    now, sleeps, requests, attempted_ciphers, encryptions = [1000], [], [], [], []
+    def runner(args, **kwargs):
+        requests.append(args[2])
+        if args[2] == 'rate_limit':
+            return rate_response(args, {'resources': {'core': {'remaining': 0, 'reset': 1120, 'limit': 5000}}},
+                                 remaining=0, reset=1120, limit=5000)
+        return subprocess.CompletedProcess(args, 1,
+            b'HTTP/2.0 403 Forbidden\r\n\r\n{"message":"API rate limit exceeded for installation"}', b'HTTP 403')
+    real = GhCliStateTransport('owner/archive', runner=runner, clock=lambda: now[0])
+    ordinary_upload = p.transport.upload_asset
+    deferred = [False]
+    def upload(tag, name, source):
+        if tag.startswith(f'collector-state-r{PILOT_ID}-g'):
+            attempted_ciphers.append((tag, name, sha256(source.read_bytes())))
+            if not deferred[0]:
+                deferred[0] = True
+                real._api(f'repos/owner/archive/releases/assets', method='POST', payload={})
+        return ordinary_upload(tag, name, source)
+    p.transport.upload_asset = upload
+    encrypt = recovery_module.encrypt_file
+    def count_encrypt(*args, **kwargs):
+        encryptions.append(1)
+        return encrypt(*args, **kwargs)
+    monkeypatch.setattr(recovery_module, 'encrypt_file', count_encrypt)
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+    result = p.run(clock=lambda: now[0], sleeper=sleep, max_runtime_seconds=600)
+    assert result['status'] == 'complete' and len(p.imports) == len(encryptions) == 1
+    assert len(MemoryJournal.values['7' * 32]['attempts']) == 1
+    assert attempted_ciphers[0] == attempted_ciphers[1]
+    assert sum(sleeps) == 120 and max(sleeps) <= 60
+    assert requests == ['repos/owner/archive/releases/assets', 'rate_limit']
+
+
+def test_descriptor_ack_loss_reconciles_same_ciphertext_without_reencryption(pilot, monkeypatch):
+    import icsot_observer.legacy_recovery as recovery_module
+    p = pilot
+    ordinary_upload, encrypted = p.transport.upload_asset, []
+    encrypt = recovery_module.encrypt_file
+    def count_encrypt(*args, **kwargs):
+        encrypted.append(1)
+        return encrypt(*args, **kwargs)
+    monkeypatch.setattr(recovery_module, 'encrypt_file', count_encrypt)
+    def upload(tag, name, source):
+        ordinary_upload(tag, name, source)
+        if name == 'prepared-descriptor.enc':
+            raise OSError('Descriptor acknowledgement lost')
+    p.transport.upload_asset = upload
+    result = p.run()
+    assert result['status'] == 'complete' and len(encrypted) == len(p.imports) == 1
+    assert sum(name == 'prepared-descriptor.enc' for tag, name in p.transport.uploads) == 1
+
+
+def test_quota_reset_beyond_absolute_recovery_budget_preserves_durable_attempt(pilot):
+    p = pilot
+    original_upload = p.transport.upload_asset
+    def upload(tag, name, source):
+        if tag.startswith(f'collector-state-r{PILOT_ID}-g'):
+            raise StateDeferredError('Reset beyond runtime', retry_not_before=1600)
+        original_upload(tag, name, source)
+    p.transport.upload_asset = upload
+    with pytest.raises(StateDeferredError):
+        p.run(clock=lambda: 1000, sleeper=lambda seconds: pytest.fail('Must leave cleanup margin'), max_runtime_seconds=300)
+    journal = MemoryJournal.values['7' * 32]
+    assert len(journal['attempts']) == len(p.imports) == 1
+    assert journal['attempts'][0]['descriptor'] and journal['status'] == 'upload_unacknowledged'
+    assert p.transport.head is None and (p.temporary / 'scratch' / 'prepared' / 'prepared.json').exists()
+
+
+def test_ambiguous_journal_write_retries_identical_frozen_record(pilot):
+    p = pilot
+    now, writes, failed = [1000], [], [False]
+    class AmbiguousJournal(MemoryJournal):
+        def write(self, value):
+            writes.append(canonical_json(value))
+            if not failed[0]:
+                failed[0] = True
+                self.values[self.key] = copy.deepcopy(value)
+                raise StateDeferredError('Journal acknowledgement lost', retry_not_before=1060)
+            if len(writes) == 2:
+                assert value == self.values[self.key]
+            return super().write(value)
+    result = p.run(journal_factory=AmbiguousJournal, clock=lambda: now[0],
+                   sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds), max_runtime_seconds=600)
+    assert result['status'] == 'complete' and writes[0] == writes[1]
+    assert len(p.imports) == len(MemoryJournal.values['7' * 32]['attempts']) == 1
+
+
+def test_descriptor_uncertain_upload_with_corrupt_readback_fails_closed(pilot):
+    p = pilot
+    ordinary_upload = p.transport.upload_asset
+    def upload(tag, name, source):
+        ordinary_upload(tag, name, source)
+        if name == 'prepared-descriptor.enc':
+            data = p.transport.assets[tag, name]
+            p.transport.assets[tag, name] = data[:-1] + bytes([data[-1] ^ 1])
+            raise OSError('Acknowledgement lost')
+    p.transport.upload_asset = upload
+    with pytest.raises(StateConflictError, match='descriptor identity differs'):
+        p.run()
+    assert p.transport.head is None and MemoryJournal.events == [] and len(p.imports) == 1
+
+
+def test_descriptor_quota_wait_keeps_single_encryption_and_generation(pilot, monkeypatch):
+    import icsot_observer.legacy_recovery as recovery_module
+    p = pilot
+    now, encryptions, failed = [1000], [], [False]
+    encrypt = recovery_module.encrypt_file
+    def count_encrypt(*args, **kwargs):
+        encryptions.append(1)
+        return encrypt(*args, **kwargs)
+    monkeypatch.setattr(recovery_module, 'encrypt_file', count_encrypt)
+    def budget(required):
+        if (p.temporary / 'scratch' / 'recovery-descriptor-seal.json').exists() and not failed[0]:
+            failed[0] = True
+            raise StateDeferredError('Quota before descriptor upload', retry_not_before=1120)
+        return {}
+    p.transport.publication_budget = budget
+    result = p.run(clock=lambda: now[0], sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds), max_runtime_seconds=600)
+    assert result['status'] == 'complete' and len(encryptions) == len(p.imports) == 1
+    assert now[0] == 1120 and len(MemoryJournal.values['7' * 32]['attempts']) == 1
+
+
+@pytest.mark.parametrize('fresh_store', [False, True], ids=['warm-verification-cache', 'cold-store'])
+def test_deleted_historical_candidate_is_never_published_or_recreated(setup, fresh_store):
+    transport, make, temporary = setup
+    transport.repository = 'owner/archive'
+    store = make(small_immutable_bytes=0)
+    cas_file(store, b'PACK' + os.urandom(16000))
+    old = old_preparation(store, temporary / 'original')
+    asset = json.loads((old.directory / 'prepared.json').read_bytes())['assets'][0]
+    ref = asset['ref']
+    transport.upload_asset(ref['release_tag'], ref['name'], old.directory / asset['path'])
+    prepared = store.prepare(store.read(), directory=temporary / 'replacement', generation='e' * 32,
+        source_import_sha256='f' * 64, recovery_candidates=pool_for(store, old, [ref]), quiescent=True)
+    # The captured local ciphertext still exists; it must never repair a deleted
+    # historical remote identity or be mistaken for fresh remote verification.
+    assert (prepared.directory / asset['path']).is_file()
+    del transport.assets[ref['release_tag'], ref['name']]
+    if fresh_store:
+        store = make(small_immutable_bytes=0)
+        prepared = store.load_prepared(prepared.directory, prepared.manifest_sha256)
+        assert not store._verified_parts
+    transport.events.clear()
+    prior_uploads = list(transport.uploads)
+    with pytest.raises(StateError, match='Historical prepared asset is missing'):
+        store.publish_prepared(prepared, quiescent=True)
+    assert transport.head is None and transport.uploads == prior_uploads
+    assert (ref['release_tag'], ref['name']) not in transport.assets
+    assert not any(event[0] in ('release', 'upload', 'commit', 'advance') for event in transport.events)

@@ -51,6 +51,10 @@ class StateError(RuntimeError):
     """Invalid, corrupt, incompatible, or concurrently changed working state."""
 
 
+class StateReleaseMissingError(StateError):
+    """Exact authorized REST/GraphQL lookup established release absence."""
+
+
 class StateDeferredError(StateError):
     """Publication deferred by destination API headroom or a rate response."""
 
@@ -226,6 +230,8 @@ class GhCliStateTransport:
         self._last_repo_rate_headers: dict[str, Any] = {}
         self._last_response_rate_headers: dict[str, Any] = {}
         self._last_response_retry_not_before: float | None = None
+        self._last_quota_probe: dict[str, Any] = {}
+        self._fallback_rate_seconds = 60
         self.last_budget_metrics: dict[str, Any] = {}
         self._releases: dict[str, dict] = {}
         self._assets: dict[str, dict[str, dict]] = {}
@@ -240,7 +246,7 @@ class GhCliStateTransport:
                      "_rate_windows", "_last_repo_rate_headers", "_last_response_rate_headers",
                      "graphql_request_count", "graphql_rate_remaining", "graphql_rate_reset",
                      "_graphql_rate_windows", "_last_graphql_rate_headers", "_last_response_retry_not_before",
-                     "last_budget_metrics"):
+                     "_last_quota_probe", "_fallback_rate_seconds", "last_budget_metrics"):
             setattr(other, name, copy.deepcopy(getattr(self, name)))
         # These caches name immutable Git objects and uploaded asset identities;
         # specialized adapters can retain discoveries made in either direction.
@@ -351,7 +357,61 @@ class GhCliStateTransport:
         error.rate_measurements = dict(self.last_budget_metrics)
         if self._last_graphql_rate_headers:
             error.rate_measurements["destination_github_graphql_rate_probe"] = dict(self._last_graphql_rate_headers)
+        if self._last_quota_probe:
+            error.rate_measurements["destination_github_recovery_rate_probe"] = dict(self._last_quota_probe)
         return error
+
+    def _probe_core_quota(self) -> dict:
+        """One free-primary GET, outside the exhausted-request guard.
+
+        It is still a counted HTTP operation. Probe failures preserve the
+        original deferral; original response diagnostics remain untouched.
+        """
+        self.request_count += 1
+        self._last_quota_probe = {"status": "unavailable"}
+        try:
+            result = self.runner(["gh", "api", "rate_limit", "--method", "GET", "--include"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            _, raw, status = self._response(result.stdout or b"")
+            if result.returncode or status is not None and not 200 <= status < 300:
+                return {}
+            value = json.loads(raw)
+            core = value.get("resources", {}).get("core", {})
+            if (not isinstance(core, dict) or type(core.get("remaining")) is not int or core["remaining"] < 0 or
+                    type(core.get("limit")) is not int or core["limit"] < 1 or
+                    not isinstance(core.get("reset"), (int, float)) or core["reset"] <= self.clock()):
+                return {}
+            measured = {key: core[key] for key in ("remaining", "reset", "limit")}
+            measured["resource"] = "core"
+            self._observe_rate(measured, scope="generic_core_probe")
+            self._last_quota_probe = {"status": "complete", **measured}
+            return measured
+        except (OSError, subprocess.SubprocessError, StateError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def _rate_retry(self, observed: dict, combined: str, retry: float | None, *, graphql: bool) -> float:
+        secondary = "secondary" in combined.lower() or "abuse" in combined.lower()
+        primary = observed.get("remaining") == 0 or (not secondary and "api rate limit exceeded" in combined.lower())
+        resource = observed.get("resource") or self._last_repo_rate_headers.get("resource", "core")
+        known = [key[1] for key in self._rate_windows if key[2] in (None, resource)] if not graphql else []
+        known_reset = max(known, default=None)
+        reset = observed.get("reset") or (self.graphql_rate_reset if graphql else known_reset)
+        if not graphql and resource == "core" and retry is None and "reset" not in observed and not secondary:
+            probe = self._probe_core_quota()
+            primary = primary or probe.get("remaining") == 0
+            if probe.get("reset") is not None:
+                reset = max(reset or 0, probe["reset"])
+        if primary and reset is not None:
+            retry = max(retry or 0, reset)
+        if retry is None:
+            retry = self.clock() + self._fallback_rate_seconds
+            self._fallback_rate_seconds = min(900, self._fallback_rate_seconds * 2)
+        if primary and not graphql:
+            self._observe_rate({"remaining": 0, "reset": retry, "resource": resource,
+                "limit": self._last_repo_rate_headers.get("limit")}, scope="repository")
+        if self._last_response_retry_not_before is not None or secondary or not primary or graphql and reset is None:
+            self.retry_not_before = max(self.retry_not_before or 0, retry)
+        return retry
 
     def _guard_rate(self, *, graphql: bool = False) -> None:
         self._refresh_rate_windows()
@@ -408,13 +468,7 @@ class GhCliStateTransport:
                             "rate limit" in combined.lower() or "secondary rate" in combined.lower() or
                             status == 403 and observed.get("remaining") == 0 or retry is not None)
             if rate_failure:
-                if retry is None and observed.get("remaining") == 0:
-                    retry = observed.get("reset", self.graphql_rate_reset if graphql else self.rate_reset)
-                secondary = "secondary" in combined.lower() or "abuse" in combined.lower()
-                if retry is None:
-                    retry, secondary = self.clock() + 60, True
-                if self._last_response_retry_not_before is not None or secondary:
-                    self.retry_not_before = retry
+                retry = self._rate_retry(observed, combined, retry, graphql=graphql)
                 raise self._defer("destination API rate limit", retry)
             transient = (status in (502, 503, 504) or any(text in error.lower() for text in
                          ("connection reset", "connection timed out", "unexpected eof")))
@@ -658,7 +712,7 @@ class GhCliStateTransport:
         new = release is None
         if new:
             if not create:
-                raise StateError("GitHub release tag was not found")
+                raise StateReleaseMissingError("GitHub release tag was not found")
             release = self._api(f"repos/{self.repository}/releases", method="POST", payload={
                 "tag_name": tag, "prerelease": True, "name": tag,
                 "body": "Encrypted collector working state; retain prerequisites."})
@@ -1159,24 +1213,26 @@ class GitHubStateStore:
         return files
 
     def _reuse_part(self, existing: dict, directory: Path, parts: dict, metrics: dict,
-                    *, prepared_sink: _PreparedSink | None = None) -> str:
+                    *, prepared_sink: _PreparedSink | None = None, fresh: bool = False) -> str:
         digest = existing["plaintext_sha256"]
         if digest in parts:
             if parts[digest] != existing:
                 raise StateError("Conflicting immutable snapshot part identities")
             return digest
-        if _asset_identity(existing) not in self._verified_parts or prepared_sink is not None:
+        authenticated = _asset_identity(existing) in self._verified_parts
+        if not authenticated or prepared_sink is not None or fresh:
             encrypted, plain = directory / (digest + ".verify.enc"), directory / (digest + ".verify")
             self._download_verified(existing, encrypted)
-            self._decrypt(existing, encrypted, plain)
-            decoded = self._decode_part(existing, plain, directory / (digest + ".verify.decoded"))
+            if not authenticated or prepared_sink is not None:
+                self._decrypt(existing, encrypted, plain)
+                decoded = self._decode_part(existing, plain, directory / (digest + ".verify.decoded"))
+                if decoded != plain:
+                    decoded.unlink()
+                plain.unlink()
             self._verified_parts.add(_asset_identity(existing))
             if prepared_sink is not None:
                 prepared_sink.capture(existing, encrypted)
             encrypted.unlink()
-            if decoded != plain:
-                decoded.unlink()
-            plain.unlink()
         parts[digest] = dict(existing)
         metrics["reused_parts"] += 1
         return digest
@@ -1821,13 +1877,20 @@ class GitHubStateStore:
             raise StateError("Prepared source/generation request changed")
         value = _json((loaded.directory / "prepared.json").read_bytes(), "prepared state manifest")
         selection = self._validate_prepared(value, loaded.directory, check_payloads=False)
+        current_tag = f"collector-state-r{self.repository_id}-g{loaded.generation}"
+        def generation_asset(ref):
+            return ref["release_tag"] == current_tag or re.fullmatch(
+                re.escape(current_tag) + r"-p(?:[2-9]|[1-9][0-9]+)", ref["release_tag"])
+        if value["pointer"]["index"]["release_tag"] != current_tag:
+            raise StateError("Prepared index is outside its current generation namespace")
+        historical = [asset["ref"] for asset in value["assets"] if not generation_asset(asset["ref"])]
+        historical_ids = {_asset_identity(ref) for ref in historical}
         request_start = getattr(self.transport, "request_count", 0)
         graphql_start = getattr(self.transport, "graphql_request_count", 0)
         verified = self._prepared_verified.setdefault(loaded.manifest_sha256, set())
-        # Authenticated candidates captured by this preparation already exist
-        # remotely. Count them as verified reuse, not new upload requests.
-        verified.update(_asset_identity(asset["ref"]) for asset in value["assets"]
-                        if _asset_identity(asset["ref"]) in self._verified_parts)
+        # Captured historical parts are read-only dependencies. Their remote
+        # existence must be checked again even when this process verified them.
+        verified.difference_update(historical_ids)
         acknowledged_upload_bytes = 0
         def progress(status: str, *, pointer_commit: str | None = None) -> None:
             record = {
@@ -1851,7 +1914,8 @@ class GitHubStateStore:
                 self._validate_prepared_root(value)
                 self._validate_prepared(value, loaded.directory, check_payloads=True)
                 progress("publication_pending")  # Durable local disposition BEFORE any mutation.
-                pending = [asset for asset in value["assets"] if _asset_identity(asset["ref"]) not in verified]
+                pending = [asset for asset in value["assets"]
+                           if _asset_identity(asset["ref"]) not in verified | historical_ids]
                 new_assets = {_asset_identity(asset["ref"]) for asset in value["assets"]}
                 cold_prior = [ref for ref in value["index"]["parts"].values()
                               if _asset_identity(ref) not in new_assets and _asset_identity(ref) not in self._verified_parts]
@@ -1861,21 +1925,36 @@ class GitHubStateStore:
                 tags = {asset["ref"]["release_tag"] for asset in pending}
                 required = (2 * len(pending) + 15 * len(tags) + 18 + len(dependencies) +
                             13 * len({ref["release_tag"] for ref in dependencies}) + len(cold_prior) +
-                            13 * len({ref["release_tag"] for ref in cold_prior}) + progress_requests_reserve)
+                            13 * len({ref["release_tag"] for ref in cold_prior}) + len(historical) +
+                            13 * len({ref["release_tag"] for ref in historical}) + progress_requests_reserve)
                 budget = getattr(self.transport, "publication_budget", None)
                 budget_metrics = budget(required) if callable(budget) else {}
                 maximum_download = max([asset["ref"]["ciphertext_bytes"] for asset in pending] +
                                        [ref["ciphertext_bytes"] for ref in dependencies] +
                                        [ref["ciphertext_bytes"] + ref["plaintext_bytes"] +
-                                        (ref["decoded_bytes"] if ref["encoding"] == "xz" else 0) for ref in cold_prior] + [0])
+                                        (ref["decoded_bytes"] if ref["encoding"] == "xz" else 0) for ref in cold_prior] +
+                                       [ref["ciphertext_bytes"] + (0 if _asset_identity(ref) in self._verified_parts else
+                                        ref["plaintext_bytes"] + (ref["decoded_bytes"] if ref["encoding"] == "xz" else 0))
+                                        for ref in historical] + [0])
                 self._preflight_disk(directory=loaded.directory, required=maximum_download,
                                      operation="prepared upload verification")
                 find_asset = getattr(self.transport, "find_asset", None)
-                if pending and not callable(find_asset):
+                if (pending or historical) and not callable(find_asset):
                     raise StateError("Prepared transport must support exact asset reconciliation")
                 with tempfile.TemporaryDirectory(prefix="icsot-prepared-verify-", dir=loaded.directory) as temporary:
                     temporary = Path(temporary)
                     authenticated_prior, prior_metrics = {}, {"reused_parts": 0}
+                    historical_tags = set()
+                    for ref in historical:
+                        remote = find_asset(ref["release_tag"], ref["name"], refresh=ref["release_tag"] not in historical_tags)
+                        historical_tags.add(ref["release_tag"])
+                        if (remote is None or remote.get("name") != ref["name"] or remote.get("state") != "uploaded" or
+                                remote.get("size") != ref["ciphertext_bytes"] or
+                                remote.get("digest") not in (None, "sha256:" + ref["ciphertext_sha256"])):
+                            raise StateError("Historical prepared asset is missing or changed; refusing repair")
+                        self._reuse_part(ref, temporary, authenticated_prior, prior_metrics, fresh=True)
+                        verified.add(_asset_identity(ref))
+                        progress("publication_pending")
                     for ref in cold_prior:
                         self._reuse_part(ref, temporary, authenticated_prior, prior_metrics)
                     for number, ref in enumerate(dependencies):

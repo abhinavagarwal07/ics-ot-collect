@@ -26,6 +26,7 @@ INTERVAL_SECONDS = 21600
 MAX_PARALLEL = 8
 MAX_COLD_BOOTSTRAPS = 8
 MAX_PLAN_BYTES = 1024 * 1024
+EXECUTION_ORDER_POLICY = "slot_seeded_sha256_rank_v1"
 GIB = 1024 ** 3
 DEFAULT_LIMITS = {"job_timeout_minutes": 180, "max_restored_state_plaintext_bytes": 8 * GIB,
                   "max_new_evidence_ciphertext_bytes": 2 * GIB, "max_new_state_ciphertext_bytes": 2 * GIB}
@@ -144,9 +145,19 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
     for row in rows:
         row["cohort_identity_sha256"] = cohort_hash
     selected = [row for row in rows if row["plan_status"] in ("ready_incremental", "fresh_public_bootstrap")]
+    execution_seed = sha256(canonical_json({"policy": EXECUTION_ORDER_POLICY,
+                                          "cohort_identity_sha256": cohort_hash, "slot": slot}))
+    # Vary matrix priority across slots without changing the canonical cohort
+    # or the eligibility and cold-bootstrap rotation decided above.
+    selected.sort(key=lambda row: (sha256(canonical_json({"seed_sha256": execution_seed,
+                                                         "repository_id": row["repository_id"]})),
+                                   row["repository_id"]))
     return {"schema_version": 1, "kind": "icsot_six_hour_incremental_plan", "planned_at": utc_iso(
         datetime.fromtimestamp(now, timezone.utc)), "slot": slot, "interval_seconds": INTERVAL_SECONDS,
         "code_sha": code_sha, **sources, "cohort_identity_sha256": cohort_hash,
+        "execution_order_policy": EXECUTION_ORDER_POLICY, "execution_order_seed_sha256": execution_seed,
+        "execution_order_sha256": sha256(canonical_json([row["repository_id"] for row in selected])),
+        "execution_order_qualification": "Per-slot matrix priority; hosted job start order and six-hour coverage are not guaranteed.",
         "history_profile_readiness": "recent profile pending Git/API validation; full-history selections only",
         "max_parallel": MAX_PARALLEL, "cold_bootstrap_limit": cold_bootstraps,
         "source_quota": "one shared public-read credential; not 8 independent hourly allowances",
@@ -325,6 +336,10 @@ def main(argv=None) -> int:
                   "upload_byte_measurement": "attempted ciphertext bytes including uncertain remote writes",
                   "retained_generation_releases": sorted(transport._releases), "recorded_at": utc_iso()}
         code = 2
+    report.update({key: plan[key] for key in ("execution_order_policy", "execution_order_seed_sha256",
+                                            "execution_order_sha256", "execution_order_qualification") if key in plan})
+    report["planned_execution_position"] = next(index for index, row in enumerate(plan["matrix"]["include"], 1)
+                                                if row["slug"] == entry["slug"])
     write_once(args.output, canonical_json(report))
     print(json.dumps(report, indent=2))
     return code

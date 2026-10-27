@@ -1,6 +1,8 @@
 import copy
 import json
+import os
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,7 +43,8 @@ def test_entire_cohort_plan_selects_ready_state_and_only_bounded_explicit_cold_w
     assert len(result["repositories"]) == 3
     assert len(result["matrix"]["include"]) == 2
     assert result["counts"] == {"ready_incremental": 1, "fresh_public_bootstrap": 1, "bootstrap_pending": 1}
-    ready, cold = result["matrix"]["include"]
+    ready = next(row for row in result["matrix"]["include"] if row["plan_status"] == "ready_incremental")
+    cold = next(row for row in result["matrix"]["include"] if row["plan_status"] == "fresh_public_bootstrap")
     assert ready["allow_bootstrap"] is False and ready["expected_pointer_sha256"]
     assert cold["allow_bootstrap"] is True and cold["expected_pointer_sha256"] is None
     assert result["max_parallel"] == 8
@@ -53,11 +56,92 @@ def test_manual_and_scheduled_retries_share_slot_and_cold_attempts_rotate(tmp_pa
     retry = plan(tmp_path, now=100001, cold_bootstraps=1)
     next_slot = plan(tmp_path, now=100000 + 21600, cold_bootstraps=1)
     assert first["matrix"] == retry["matrix"]
-    assert first["matrix"]["include"][1]["slug"] != next_slot["matrix"]["include"][1]["slug"]
+    cold = lambda result: next(row for row in result["matrix"]["include"] if row["allow_bootstrap"])
+    assert cold(first)["slug"] != cold(next_slot)["slug"]
     assert first["matrix"]["include"][0]["observation_key"] != next_slot["matrix"]["include"][0]["observation_key"]
     assert plan(tmp_path, cold_bootstraps=0)["counts"]["bootstrap_pending"] == 2
     with pytest.raises(ValueError, match="0 through 8"):
         plan(tmp_path, cold_bootstraps=9)
+
+
+@pytest.fixture
+def full_cohort_planner():
+    root = Path(__file__).resolve().parents[2]
+    cfg, sources = load_cohort(root / "icsot-observatory/config.corpus.toml", root / "public_patch_corpus_185.csv")
+    identifiers = {slug: number for number, slug in enumerate(cfg.repositories, 20000)}
+    def build(slot=123456, *, ready_count=185, cold_bootstraps=0, offset_seconds=0):
+        pointers = {repo_id: canonical_json({"repository_id": repo_id, "slug": slug, "generation": "b" * 32})
+                    for slug, repo_id in list(identifiers.items())[:ready_count]}
+        return build_plan(cfg, sources=sources, code_sha=CODE,
+            identity_loader=lambda slug: {"id": identifiers[slug], "private": False, "size": 100},
+            pointer_loader=pointers.get, cold_bootstraps=cold_bootstraps,
+            now=slot * 21600 + offset_seconds)
+    return cfg, sources, identifiers, build
+
+
+@pytest.mark.parametrize("cold_bootstraps", [0, 3])
+def test_shuffled_matrix_preserves_full_canonical_cohort_lock_and_eligibility(full_cohort_planner, cold_bootstraps):
+    cfg, sources, identifiers, build = full_cohort_planner
+    result = build(ready_count=174, cold_bootstraps=cold_bootstraps)
+    rows, selected = result["repositories"], result["matrix"]["include"]
+    assert tuple(row["slug"] for row in rows) == cfg.repositories and len(rows) == 185
+    expected_hash = sha256(canonical_json([{"slug": slug, "repository_id": identifiers[slug]} for slug in cfg.repositories]))
+    assert result["cohort_identity_sha256"] == expected_hash
+    assert {row["slug"] for row in selected} == {
+        row["slug"] for row in rows if row["plan_status"] in ("ready_incremental", "fresh_public_bootstrap")}
+    assert len(selected) == len({row["repository_id"] for row in selected}) == 174 + cold_bootstraps
+    missing = list(cfg.repositories[174:])
+    offset = (result["slot"] * cold_bootstraps) % len(missing)
+    expected_cold = (missing[offset:] + missing[:offset])[:cold_bootstraps]
+    assert {row["slug"] for row in rows if row["allow_bootstrap"]} == set(expected_cold)
+    for row in rows:
+        assert row["repository_id"] == identifiers[row["slug"]]
+        assert row["cohort_identity_sha256"] == expected_hash and row["code_sha"] == CODE
+        assert row["slot"] == result["slot"] and row["observation_key"] == f"six-hour-slot-{result['slot']}"
+        assert all(row[key] == value for key, value in sources.items())
+    for row in selected:
+        assert select_entry(result, row["slug"], config=cfg, sources=sources, code_sha=CODE) == row
+    assert result["execution_order_sha256"] == sha256(canonical_json([row["repository_id"] for row in selected]))
+
+
+def test_execution_priority_replays_within_slot_and_varies_prefix_across_slots(full_cohort_planner):
+    cfg, _, _, build = full_cohort_planner
+    plans = [build(slot=123456 + offset) for offset in range(8)]
+    replay = build(slot=123456, offset_seconds=120)
+    assert replay["repositories"] == plans[0]["repositories"] and replay["matrix"] == plans[0]["matrix"]
+    assert replay["execution_order_seed_sha256"] == plans[0]["execution_order_seed_sha256"]
+    assert len({item["cohort_identity_sha256"] for item in plans}) == 1
+    assert len({item["execution_order_seed_sha256"] for item in plans}) == len(plans)
+    assert len({item["execution_order_sha256"] for item in plans}) == len(plans)
+    prefixes = {tuple(row["slug"] for row in item["matrix"]["include"][:8]) for item in plans}
+    assert len(prefixes) == len(plans)
+    for item in plans:
+        assert {row["slug"] for row in item["matrix"]["include"]} == set(cfg.repositories)
+        assert tuple(row["slug"] for row in item["repositories"]) == cfg.repositories
+        assert tuple(row["slug"] for row in item["matrix"]["include"]) != cfg.repositories
+
+
+def test_execution_priority_is_independent_of_python_hash_seed(tmp_path):
+    script = '''
+import json
+from pathlib import Path
+from icsot_observer.core import Config, canonical_json
+from icsot_observer.recurrence import build_plan
+repositories = tuple(f"sector{number // 37}/repo{number}" for number in range(185))
+config = Config(Path("unused"), repositories, "2026-03-10", "research", "NO_TEST_TOKEN", 5, 1000000, 48, 100)
+identifiers = {slug: number for number, slug in enumerate(repositories, 20000)}
+slugs = {number: slug for slug, number in identifiers.items()}
+plan = build_plan(config, sources={"cohort_count": 185}, code_sha="a" * 40,
+    identity_loader=lambda slug: {"id": identifiers[slug], "private": False, "size": 100},
+    pointer_loader=lambda number: canonical_json({"repository_id": number, "slug": slugs[number], "generation": "b" * 32}),
+    now=123456 * 21600)
+print(json.dumps({"matrix": plan["matrix"], "seed": plan["execution_order_seed_sha256"], "digest": plan["execution_order_sha256"]}, sort_keys=True))
+'''
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    outputs = [subprocess.check_output([sys.executable, "-c", script], cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(source_root), "PYTHONHASHSEED": seed}) for seed in ("1", "987654")]
+    assert outputs[0] == outputs[1]
+    assert len(json.loads(outputs[0])["matrix"]["include"]) == 185
 
 
 def test_shared_source_rate_deferral_pauses_remaining_identity_requests(tmp_path):
@@ -207,6 +291,43 @@ def test_public_outcome_keeps_deferred_api_partial_even_when_git_completed(tmp_p
     report = public_outcome(result, entry)
     assert report["status"] == "partial" and report["pending_jobs"] == 1
     assert report["new_evidence_upload_bytes"] == 4 and report["new_state_upload_bytes"] == 5
+
+
+@pytest.mark.parametrize("outcome", ["complete", "paused", "failed"])
+def test_cli_outcomes_retain_planned_execution_provenance(tmp_path, monkeypatch, outcome):
+    from icsot_observer import recurrence
+    cfg, result = config(tmp_path), plan(tmp_path)
+    entry = result["matrix"]["include"][-1]
+    raw = canonical_json(result)
+    plan_path, output = tmp_path / "plan.json", tmp_path / "outcome.json"
+    plan_path.write_bytes(raw)
+    def capture(*args, **kwargs):
+        if outcome == "paused":
+            raise StateDeferredError("bounded mock deferral", reason="destination_quota_deferred")
+        if outcome == "failed":
+            raise ValueError("arbitrary exception text must stay private")
+        return {"working_state_origin": "resumed_authenticated_state", "new_evidence_upload_bytes": 4,
+                "publication": {"state_uploaded_ciphertext_bytes": 5, "state_referenced_ciphertext_bytes": 6,
+                                "generation": "b" * 32},
+                "collection": {"queue": {"states": {"complete": 2}}, "partial_captures": [],
+                               "runtime": {"completed": 2}}}
+    monkeypatch.setattr(recurrence.subprocess, "check_output", lambda *args, **kwargs: CODE)
+    monkeypatch.setattr(recurrence, "load_cohort", lambda *args: (cfg, SOURCES))
+    monkeypatch.setattr(recurrence, "load_history_settings", lambda *args: {})
+    monkeypatch.setattr(recurrence, "load_resource_limits", lambda *args: {})
+    monkeypatch.setattr(pipeline, "run_github_persistent", capture)
+    code = recurrence.main(["run", "--config", str(tmp_path / "config"), "--csv", str(tmp_path / "csv"),
+        "--code-sha", CODE, "--destination-repository", "owner/collector", "--output", str(output),
+        "--plan", str(plan_path), "--plan-sha256", sha256(raw), "--slug", entry["slug"],
+        "--state-public-key", str(tmp_path / "unused-state-public"),
+        "--state-private-key", str(tmp_path / "unused-state-private"),
+        "--evidence-public-key", str(tmp_path / "unused-evidence-public")])
+    report = json.loads(output.read_bytes())
+    assert report["status"] == outcome and code == {"complete": 0, "paused": 75, "failed": 2}[outcome]
+    for key in ("execution_order_policy", "execution_order_seed_sha256", "execution_order_sha256", "execution_order_qualification"):
+        assert report[key] == result[key]
+    assert report["planned_execution_position"] == len(result["matrix"]["include"])
+    assert "arbitrary exception text" not in output.read_text()
 
 
 @pytest.mark.parametrize("partial", [False, True])

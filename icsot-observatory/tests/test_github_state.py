@@ -1572,3 +1572,116 @@ def test_prepared_publish_rejects_missing_slug_binding_before_upload_or_idempote
     with pytest.raises(StateConflictError, match="no authoritative repository slug binding"):
         store.publish_prepared(prepared, quiescent=True)
     assert len(transport.uploads) == uploads
+
+
+def test_headerless_primary_403_probes_reset_once_and_retains_known_repository_window():
+    calls = []
+    def runner(args, **kwargs):
+        endpoint = args[2]
+        calls.append(endpoint)
+        if endpoint == 'repos/owner/collector':
+            return rate_response(args, {}, remaining=400, reset=5000, limit=1000)
+        if endpoint == 'rate_limit':
+            return rate_response(args, {'resources': {'core': {'remaining': 0, 'reset': 5000, 'limit': 5000}}},
+                                 remaining=0, reset=5000, limit=5000)
+        return subprocess.CompletedProcess(args, 1,
+            b'HTTP/2.0 403 Forbidden\r\n\r\n{"message":"API rate limit exceeded for installation"}',
+            b'HTTP 403: API rate limit exceeded for installation')
+    transport = GhCliStateTransport('owner/collector', runner=runner, clock=lambda: 1000)
+    transport._api('repos/owner/collector')
+    with pytest.raises(StateDeferredError) as failure:
+        transport._api('repos/owner/collector/releases/tags/new-generation')
+    assert failure.value.retry_not_before == 5000
+    assert calls == ['repos/owner/collector', 'repos/owner/collector/releases/tags/new-generation', 'rate_limit']
+    assert any(key[3] == 1000 for key in transport._rate_windows)
+
+
+@pytest.mark.parametrize('probe_failure', ['auth403', 'quota429', 'malformed_json', 'network'])
+def test_failed_emergency_quota_probe_preserves_original_deferral_and_diagnostics(probe_failure):
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if args[2] == 'rate_limit':
+            if probe_failure == 'network':
+                raise OSError('Probe unavailable')
+            if probe_failure == 'malformed_json':
+                return subprocess.CompletedProcess(args, 0, b'HTTP/2.0 200 OK\r\n\r\n{broken', b'')
+            return metadata_response(args, {'message': 'denied'}, status=403 if probe_failure == 'auth403' else 429)
+        return subprocess.CompletedProcess(args, 1,
+            b'HTTP/2.0 403 Forbidden\r\nX-RateLimit-Resource: core\r\n\r\n{"message":"API rate limit exceeded"}', b'HTTP 403')
+    transport = GhCliStateTransport('owner/collector', runner=runner, clock=lambda: 1000)
+    with pytest.raises(StateDeferredError) as failure:
+        transport._api('repos/owner/collector/releases')
+    assert failure.value.retry_not_before == 1060
+    assert failure.value.rate_measurements['destination_github_recovery_rate_probe']['status'] == 'unavailable'
+    assert calls == ['repos/owner/collector/releases', 'rate_limit'] and transport.request_count == 2
+    assert transport._last_response_rate_headers == {'resource': 'core'}
+    with pytest.raises(StateDeferredError):
+        transport._api('repos/owner/collector/releases')
+    assert len(calls) == 2
+
+
+def test_emergency_generic_probe_is_counted_without_primary_debit_or_widening_repository_headroom():
+    def runner(args, **kwargs):
+        return rate_response(args, {'resources': {'core': {'remaining': 4500, 'reset': 6000, 'limit': 5000}}},
+                             remaining=4500, reset=6000, limit=5000)
+    transport = GhCliStateTransport('owner/collector', runner=runner, clock=lambda: 1000)
+    transport._observe_rate({'remaining': 0, 'reset': 7000, 'limit': 1000, 'resource': 'core'}, scope='repository')
+    transport._last_response_rate_headers = {'remaining': 0, 'reset': 7000, 'resource': 'core'}
+    measured = transport._probe_core_quota()
+    assert measured['remaining'] == 4500 and transport.request_count == 1
+    assert (transport.rate_remaining, transport.rate_reset) == (0, 7000)
+    assert transport._last_response_rate_headers == {'remaining': 0, 'reset': 7000, 'resource': 'core'}
+
+
+def test_headerless_primary_reset_never_shortened_by_a_different_larger_generic_bucket():
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if args[2] == 'repos/owner/collector':
+            return rate_response(args, {}, remaining=400, reset=7000, limit=1000)
+        if args[2] == 'rate_limit':
+            return rate_response(args, {'resources': {'core': {'remaining': 4500, 'reset': 6000, 'limit': 5000}}},
+                                 remaining=4500, reset=6000, limit=5000)
+        return subprocess.CompletedProcess(args, 1,
+            b'HTTP/2.0 403 Forbidden\r\n\r\n{"message":"API rate limit exceeded"}', b'HTTP 403')
+    transport = GhCliStateTransport('owner/collector', runner=runner, clock=lambda: 1000)
+    transport._api('repos/owner/collector')
+    with pytest.raises(StateDeferredError) as failure:
+        transport._api('repos/owner/collector/releases')
+    assert failure.value.retry_not_before == 7000 and transport.rate_remaining == 0
+    assert ('repository', 7000.0, 'core', 1000) in transport._rate_windows
+    assert calls[-1] == 'rate_limit'
+
+
+def test_secondary_backoff_is_bounded_but_explicit_retry_after_is_never_capped():
+    now, calls = [1000], []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        header = b'Retry-After: 2000\r\n' if len(calls) == 7 else b''
+        return subprocess.CompletedProcess(args, 1,
+            b'HTTP/2.0 403 Forbidden\r\n' + header + b'\r\n{"message":"secondary rate limit"}', b'HTTP 403')
+    transport = GhCliStateTransport('owner/collector', runner=runner, clock=lambda: now[0])
+    delays = []
+    for _ in range(7):
+        with pytest.raises(StateDeferredError) as failure:
+            transport._api('repos/owner/collector/releases')
+        delays.append(failure.value.retry_not_before - now[0])
+        now[0] = failure.value.retry_not_before
+    assert delays == [60, 120, 240, 480, 900, 900, 2000]
+    assert all(endpoint != 'rate_limit' for endpoint in calls)
+
+
+def test_core_probe_does_not_supply_reset_for_another_rest_resource():
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args[2])
+        if len(calls) == 1:
+            return rate_response(args, {}, remaining=400, reset=7000, resource='search')
+        return subprocess.CompletedProcess(args, 1,
+            b'HTTP/2.0 403 Forbidden\r\nX-RateLimit-Resource: search\r\n\r\n{"message":"API rate limit exceeded"}', b'HTTP 403')
+    transport = GhCliStateTransport('owner/collector', runner=runner, clock=lambda: 1000)
+    transport._api('repos/owner/collector')
+    with pytest.raises(StateDeferredError) as failure:
+        transport._api('repos/owner/collector/releases')
+    assert failure.value.retry_not_before == 7000 and 'rate_limit' not in calls

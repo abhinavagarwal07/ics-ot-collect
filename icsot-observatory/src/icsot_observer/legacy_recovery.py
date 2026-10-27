@@ -12,12 +12,13 @@ import copy
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from .core import canonical_json, sha256, utc_iso
 from .encryption import encrypt_file
 from .github_state import (GitHubStateStore, RecoveryCandidatePool, StateConflictError,
-                           StateDeferredError, StateError, StateSelection)
+                           StateDeferredError, StateError, StateReleaseMissingError, StateSelection)
 from .legacy_bootstrap import (GitHubMigrationLedger, GitHubSourceReader, MigrationError,
     MigrationHelpers, MIGRATION_BRANCH, MAX_METADATA_BYTES, MIGRATION_STATE_CIPHERTEXT_CAP,
     asset_ref, import_legacy_seed, read_verified_json, safe_error_location)
@@ -134,9 +135,15 @@ class RecoveryJournal:
 
 def _available(store, refs):
     """Fresh remote metadata is a candidate filter, never authenticated reuse."""
-    result, refreshed = [], set()
+    result, refreshed, missing = [], set(), set()
     for ref in refs:
-        remote = store.transport.find_asset(ref["release_tag"], ref["name"], refresh=ref["release_tag"] not in refreshed)
+        if ref["release_tag"] in missing:
+            continue
+        try:
+            remote = store.transport.find_asset(ref["release_tag"], ref["name"], refresh=ref["release_tag"] not in refreshed)
+        except StateReleaseMissingError:
+            missing.add(ref["release_tag"])
+            continue  # Only exact authorized release absence is a candidate miss.
         refreshed.add(ref["release_tag"])
         if remote is None or remote.get("state") != "uploaded":
             continue
@@ -169,33 +176,87 @@ def _descriptor(store, attempt, scratch):
     return value, raw
 
 
-def _publish_descriptor(store, prepared, scratch):
+def _seal_descriptor(store, prepared, scratch):
+    """Encrypt once before the retried network operation; retain exact bytes."""
+    encrypted, seal = scratch / "recovery-descriptor.enc", scratch / "recovery-descriptor-seal.json"
+    if seal.exists():
+        value = json.loads(seal.read_bytes())
+        if value.get("prepared_manifest_sha256") != prepared.manifest_sha256:
+            raise StateConflictError("Local recovery descriptor names another preparation")
+        ref = value["ref"]
+    else:
+        if encrypted.exists():
+            raise StateError("Unsealed local recovery descriptor cannot be regenerated")
+        record = encrypt_file(prepared.directory / "prepared.json", encrypted, store.public_key)
+        ref = {**record, "release_tag": f"collector-state-recovery-r{store.repository_id}-g{prepared.generation}",
+               "name": "prepared-descriptor.enc"}
+        store._local_record(seal, {"prepared_manifest_sha256": prepared.manifest_sha256, "ref": ref})
+    if (ref.get("plaintext_sha256") != prepared.manifest_sha256 or
+            ref.get("public_key_fingerprint_sha256") != store.recipient or
+            ref.get("release_tag") != f"collector-state-recovery-r{store.repository_id}-g{prepared.generation}" or
+            ref.get("name") != "prepared-descriptor.enc" or
+            encrypted.stat().st_size != ref["ciphertext_bytes"] or sha256(encrypted.read_bytes()) != ref["ciphertext_sha256"]):
+        raise StateError("Local recovery descriptor ciphertext differs")
+    return ref, encrypted
+
+
+def _publish_descriptor(store, prepared, scratch, *, ref, encrypted):
     budget = getattr(store.transport, "publication_budget", None)
     if callable(budget):
         # Descriptor envelope + release discovery, durable journal, and bounded
         # progress writes are additional destination work beyond state uploads.
         budget(2 + 15 + 8 * (len(prepared.assets) + 5))
-    encrypted = scratch / "recovery-descriptor.enc"
-    record = encrypt_file(prepared.directory / "prepared.json", encrypted, store.public_key)
-    ref = {**record, "release_tag": f"collector-state-recovery-r{store.repository_id}-g{prepared.generation}",
-           "name": "prepared-descriptor.enc"}
     store.transport.ensure_release(ref["release_tag"])
     remote = store.transport.find_asset(ref["release_tag"], ref["name"], refresh=True)
-    if remote is not None:
-        raise StateConflictError("Recovery descriptor identity already exists without its durable journal")
-    store.transport.upload_asset(ref["release_tag"], ref["name"], encrypted)
-    verified = scratch / "descriptor-verified.enc"
-    store._download_verified(ref, verified)
-    verified.unlink()
-    encrypted.unlink()
+    if remote is None:
+        try:
+            store.transport.upload_asset(ref["release_tag"], ref["name"], encrypted)
+        except (StateError, OSError):
+            # A write may succeed before its acknowledgement is lost. Only
+            # exact readback can resolve that ambiguity; never encrypt again.
+            remote = store.transport.find_asset(ref["release_tag"], ref["name"], refresh=True)
+            if remote is None:
+                raise
+    if remote is not None and (remote.get("state") != "uploaded" or remote.get("size") != ref["ciphertext_bytes"] or
+            remote.get("digest") not in (None, "sha256:" + ref["ciphertext_sha256"])):
+        raise StateConflictError("Existing recovery descriptor identity differs")
+    verified, plain = scratch / "descriptor-verified.enc", scratch / "descriptor-verified.json"
+    try:
+        store._download_verified(ref, verified)
+        store._decrypt(ref, verified, plain)
+        if sha256(plain.read_bytes()) != prepared.manifest_sha256:
+            raise StateError("Authenticated recovery descriptor source differs")
+    finally:
+        verified.unlink(missing_ok=True)
+        plain.unlink(missing_ok=True)
     return ref
+
+
+def _retry_frozen(operation, *, deadline, clock, sleeper, cleanup_seconds=120):
+    """Wait only for explicit retry times, keeping the same local seal alive."""
+    for attempt in range(8):
+        if clock() >= deadline - cleanup_seconds:
+            raise StateDeferredError("Recovery cleanup margin reached", reason="recovery_runtime_budget")
+        try:
+            return operation()
+        except StateDeferredError as error:
+            retry = error.retry_not_before
+            if retry is None or retry >= deadline - cleanup_seconds or attempt == 7:
+                raise
+            retry = max(clock() + 1, retry)
+            while clock() < retry:
+                sleeper(min(60, retry - clock()))
 
 
 def recover(manifest: dict, manifest_sha256: str, *, code_sha: str, config, backend,
             ledger, reader, working_root: Path, scratch: Path, operational_private_key_path: Path,
             evidence_public_key_path: Path, helpers=None, journal_factory=RecoveryJournal,
-            attempt_identity: str = "manual") -> dict:
+            attempt_identity: str = "manual", max_runtime_seconds: float = 19800,
+            clock=time.time, sleeper=time.sleep) -> dict:
     """Execute only the frozen legacy pilot. Current state wins before import/write."""
+    if not 120 < max_runtime_seconds <= 19800:
+        raise MigrationError("Recovery requires a bounded runtime and cleanup margin")
+    deadline = clock() + max_runtime_seconds
     if sha256(canonical_json(manifest)) != _hash(manifest_sha256):
         raise MigrationError("Recovery manifest hash differs")
     if (manifest.get("kind") != "icsot_explicit_legacy_recovery_v1" or manifest.get("schema_version") != 1 or
@@ -303,18 +364,22 @@ def recover(manifest: dict, manifest_sha256: str, *, code_sha: str, config, back
                 recovery_candidates=pool, quiescent=True)
             # The encrypted full descriptor is fetched and authenticated first.
             # Only then is its public identity committed before any part upload.
-            descriptor = _publish_descriptor(backend, prepared, scratch)
+            descriptor_ref, descriptor_file = _seal_descriptor(backend, prepared, scratch)
+            descriptor = _retry_frozen(lambda: _publish_descriptor(backend, prepared, scratch,
+                ref=descriptor_ref, encrypted=descriptor_file), deadline=deadline, clock=clock, sleeper=sleeper)
             attempts.append({"generation": generation, "prepared_manifest_sha256": prepared.manifest_sha256,
                 "descriptor": descriptor, "status": "descriptor_published", "verified_assets": [],
                 "source_import_sha256": prepared.source_import_sha256, "previous_recovery_generation": lineage[-1] if lineage else None,
                 "candidate_pool_sha256": sha256(canonical_json(list(pool.parts)))})
-            journal.write({"status": "publication_pending", "attempts": attempts, "updated_at": utc_iso()})
+            initial_progress = {"status": "publication_pending", "attempts": copy.deepcopy(attempts), "updated_at": utc_iso()}
+            _retry_frozen(lambda: journal.write(initial_progress), deadline=deadline, clock=clock, sleeper=sleeper)
         def progress(value):
             attempts[-1].update(status=value["status"], verified_assets=value["verified_assets"],
                                 pointer_commit=value.get("pointer_commit"))
-            journal.write({"status": value["status"], "attempts": attempts, "updated_at": utc_iso()})
-        publication = backend.publish_prepared(prepared, quiescent=True, progress_callback=progress,
-            progress_requests_reserve=8 * (len(prepared.assets) + 3))
+            frozen_progress = {"status": value["status"], "attempts": copy.deepcopy(attempts), "updated_at": utc_iso()}
+            _retry_frozen(lambda: journal.write(frozen_progress), deadline=deadline, clock=clock, sleeper=sleeper)
+        publication = _retry_frozen(lambda: backend.publish_prepared(prepared, quiescent=True, progress_callback=progress,
+            progress_requests_reserve=8 * (len(prepared.assets) + 3)), deadline=deadline, clock=clock, sleeper=sleeper)
         return {"status": "complete", "repository_id": PILOT_ID, "recovery_epoch": manifest["recovery_epoch"],
                 "generation": prepared.generation, "new_observations": 0, "new_evidence_upload_bytes": 0,
                 "publication": publication, "original_hold_preserved": True}
