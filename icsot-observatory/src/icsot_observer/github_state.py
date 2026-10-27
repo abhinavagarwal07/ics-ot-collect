@@ -86,6 +86,26 @@ class StateSelection:
 
 
 @dataclass(frozen=True)
+class RecoveryCandidatePool:
+    """Audited, target-specific candidates; never an authoritative predecessor.
+
+    The containing recovery descriptor pins the source ledger and epoch. Each
+    selected part still needs authenticated decryption and exact decoded-content
+    matching before it can enter a newly sealed generation.
+    """
+
+    destination_repository: str
+    repository_id: int
+    slug: str
+    recipient_spki_sha256: str
+    recovery_epoch: str
+    source_ledger_sha256: str
+    old_generation: str
+    parts: tuple[dict[str, Any], ...]
+    lineage_generations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class PreparedState:
     """Local SHA-pinned bytes for one generation; retain directory until commit."""
 
@@ -104,6 +124,7 @@ class _PreparedSink:
         self.assets: list[dict] = []
         self.index: dict | None = None
         self.source_files: list[dict] = []
+        self.proof_outbox_node: dict | None = None
 
     def capture(self, ref: dict, source: Path) -> None:
         relative = f"assets/{ref['release_tag']}/{ref['name']}"
@@ -484,7 +505,8 @@ class GhCliStateTransport:
     def read_slug_binding(self, head: str, slug: str) -> bytes | None:
         return self._read_git_file(head, _slug_path(slug))
 
-    def commit_pointer(self, parent: str | None, repository_id: int, data: bytes) -> str:
+    def commit_pointer(self, parent: str | None, repository_id: int, data: bytes,
+                       *, proof_outbox_node: bytes | None = None) -> str:
         import base64
         pointer = _json(data, "Git state pointer")
         slug = pointer.get("slug")
@@ -494,6 +516,19 @@ class GhCliStateTransport:
         previous_binding = self.read_slug_binding(parent, slug) if parent else None
         if previous_binding is not None and previous_binding != canonical_json(binding):
             raise StateConflictError("Repository slug is already bound to another numeric ID")
+        outbox = None
+        if proof_outbox_node is not None:
+            node = _json(proof_outbox_node, "public proof outbox node")
+            descriptor = {"sha256": hashlib.sha256(proof_outbox_node).hexdigest(), "bytes": len(proof_outbox_node)}
+            if (len(proof_outbox_node) > 4096 or pointer.get("proof_outbox") != descriptor or
+                    node.get("repository_id") != repository_id or node.get("slug") != slug or
+                    node.get("generation") != pointer.get("generation")):
+                raise StateError("Proof outbox node differs from state pointer")
+            path = f"proof-outbox/{repository_id}/{descriptor['sha256']}.json"
+            old = self._read_git_file(parent, path) if parent else None
+            if old is not None and old != proof_outbox_node:
+                raise StateConflictError("Immutable proof outbox node differs")
+            outbox = {"path": path, "mode": "100644", "type": "blob", "content": proof_outbox_node.decode("utf-8")}
         blob = self._api(f"repos/{self.repository}/git/blobs", method="POST",
                          payload={"content": base64.b64encode(data).decode(), "encoding": "base64"})
         binding_blob = self._api(f"repos/{self.repository}/git/blobs", method="POST", payload={
@@ -502,6 +537,8 @@ class GhCliStateTransport:
                                    "type": "blob", "sha": blob["sha"]},
                                   {"path": _slug_path(slug), "mode": "100644",
                                    "type": "blob", "sha": binding_blob["sha"]}]}
+        if outbox is not None:
+            tree_payload["tree"].append(outbox)
         if parent:
             commit = self._api(f"repos/{self.repository}/git/commits/{parent}")
             tree_payload["base_tree"] = commit["tree"]["sha"]
@@ -773,6 +810,11 @@ class GitHubStateStore:
                 raise StateError("State pointer does not bind the selected repository/root")
         if not isinstance(pointer.get("context_sha256"), str) or not _HASH.fullmatch(pointer["context_sha256"]):
             raise StateError("Invalid state context hash")
+        outbox = pointer.get("proof_outbox")
+        if outbox is not None and (not isinstance(outbox, dict) or set(outbox) != {"sha256", "bytes"} or
+                not isinstance(outbox.get("sha256"), str) or not _HASH.fullmatch(outbox["sha256"]) or
+                type(outbox.get("bytes")) is not int or not 1 <= outbox["bytes"] <= 4096):
+            raise StateError("Invalid public proof outbox pointer")
         for field in ("snapshot_started_at", "snapshot_sealed_at"):
             value = pointer.get(field)
             if not isinstance(value, str) or not _UTC.fullmatch(value):
@@ -807,6 +849,8 @@ class GitHubStateStore:
         for field in ("snapshot_started_at", "snapshot_sealed_at", "clock_source"):
             if context.get(field) != pointer[field]:
                 raise StateError("Decrypted snapshot UTC interval differs from selected Git pointer")
+        if context.get("proof_outbox") != pointer.get("proof_outbox"):
+            raise StateError("Decrypted proof outbox differs from selected Git pointer")
         if hashlib.sha256(canonical_json(context)).hexdigest() != pointer["context_sha256"]:
             raise StateError("Authenticated state context hash differs from Git pointer")
         if (context.get("recipient_spki_sha256") != self.recipient or
@@ -1114,18 +1158,21 @@ class GitHubStateStore:
                           "mode": 0o700 if info.st_mode & 0o111 else 0o600})
         return files
 
-    def _reuse_part(self, existing: dict, directory: Path, parts: dict, metrics: dict) -> str:
+    def _reuse_part(self, existing: dict, directory: Path, parts: dict, metrics: dict,
+                    *, prepared_sink: _PreparedSink | None = None) -> str:
         digest = existing["plaintext_sha256"]
         if digest in parts:
             if parts[digest] != existing:
                 raise StateError("Conflicting immutable snapshot part identities")
             return digest
-        if _asset_identity(existing) not in self._verified_parts:
+        if _asset_identity(existing) not in self._verified_parts or prepared_sink is not None:
             encrypted, plain = directory / (digest + ".verify.enc"), directory / (digest + ".verify")
             self._download_verified(existing, encrypted)
             self._decrypt(existing, encrypted, plain)
             decoded = self._decode_part(existing, plain, directory / (digest + ".verify.decoded"))
             self._verified_parts.add(_asset_identity(existing))
+            if prepared_sink is not None:
+                prepared_sink.capture(existing, encrypted)
             encrypted.unlink()
             if decoded != plain:
                 decoded.unlink()
@@ -1136,11 +1183,12 @@ class GitHubStateStore:
 
     def _part(self, plaintext: Path, kind: str, release: str, prior: dict, directory: Path,
               parts: dict, metrics: dict, *, compress: bool = True,
-              prepared_sink: _PreparedSink | None = None) -> str:
+              prepared_sink: _PreparedSink | None = None, capture_reused: bool = False) -> str:
         decoded_sha256, decoded_bytes = _digest(plaintext), plaintext.stat().st_size
         existing = prior.get((decoded_sha256, decoded_bytes, kind))
         if existing:
-            return self._reuse_part(existing, directory, parts, metrics)
+            return self._reuse_part(existing, directory, parts, metrics,
+                                    prepared_sink=prepared_sink if capture_reused else None)
         encoding = "raw"
         if compress:
             compressed = directory / ("encoded-" + uuid.uuid4().hex + ".xz")
@@ -1252,31 +1300,85 @@ class GitHubStateStore:
         return {"raw": raw, "groups": groups, "reused": reused,
                 "new_small_immutable_files": len(small)}
 
-    def _publication_requests_estimate(self, files: list[dict], prior: dict) -> int:
+    def _publication_requests_estimate(self, files: list[dict], prior: dict,
+                                      recovery_parts: dict | None = None) -> int:
         plan = self._snapshot_plan(files, prior)
         raw_parts = sum(max(1, (item["bytes"] + self.part_bytes - 1) // self.part_bytes) for item in plan["raw"])
         parts = raw_parts + len(plan["groups"])  # Mutable groups conservatively all new.
+        matched = {(part["decoded_sha256"], part["decoded_bytes"], part["kind"]): part
+                   for item in plan["raw"] if item["bytes"] <= self.part_bytes
+                   if (part := (recovery_parts or {}).get((item["sha256"], item["bytes"], "raw"))) is not None}
+        parts -= len(matched)
         releases = max(1, (parts + self.max_assets_per_release - 2) // (self.max_assets_per_release - 1))
         unverified = [part for part in prior["parts"].values()
                       if _asset_identity(part) not in self._verified_parts]
         # A cold authorized draft can need REST tag 404 + numeric ID recheck
         # + up to eleven asset-list pages; GraphQL lookup has its own bucket.
         old_release_reads = 13 * len({part["release_tag"] for part in unverified}) + len(unverified)
-        return 2 * (parts + 1) + 2 * releases + 18 + old_release_reads
+        recovery_reads = [part for part in matched.values() if _asset_identity(part) not in self._verified_parts]
+        return (2 * (parts + 1) + 2 * releases + 18 + old_release_reads + len(recovery_reads) +
+                13 * len({part["release_tag"] for part in recovery_reads}))
+
+    def _recovery_parts(self, pool: RecoveryCandidatePool | None, selection: StateSelection) -> dict:
+        if pool is None:
+            return {}
+        if not isinstance(pool, RecoveryCandidatePool):
+            raise StateError("Explicit frozen recovery candidate pool required")
+        if (not isinstance(pool.parts, tuple) or len(pool.parts) > 20000 or
+                not isinstance(pool.lineage_generations, tuple) or len(pool.lineage_generations) > 16):
+            raise StateError("Invalid bounded recovery candidate pool")
+        if selection.pointer is not None or selection.index is not None:
+            raise StateError("Recovery candidates require an actually missing authoritative state")
+        if (pool.repository_id != self.repository_id or pool.slug != self.slug or
+                pool.recipient_spki_sha256 != self.recipient or
+                pool.destination_repository != getattr(self.transport, "repository", None) or
+                not REPO_RE.fullmatch(pool.destination_repository) or
+                not isinstance(pool.recovery_epoch, str) or not _GENERATION.fullmatch(pool.recovery_epoch) or
+                not isinstance(pool.old_generation, str) or not _GENERATION.fullmatch(pool.old_generation) or
+                not isinstance(pool.source_ledger_sha256, str) or not _HASH.fullmatch(pool.source_ledger_sha256)):
+            raise StateError("Recovery candidate repository/recipient/ledger binding differs")
+        generations = (pool.old_generation, *pool.lineage_generations)
+        if any(not isinstance(value, str) or not _GENERATION.fullmatch(value) for value in generations):
+            raise StateError("Invalid frozen recovery generation lineage")
+        prefixes = [f"collector-state-r{self.repository_id}-g{value}" for value in generations]
+        result = {}
+        for candidate in pool.parts:
+            ref = copy.deepcopy(candidate)
+            _asset_ref(ref)
+            if not any(ref.get("release_tag") == prefix or
+                       re.fullmatch(re.escape(prefix) + r"-p(?:[2-9]|[1-9][0-9]+)", ref["release_tag"])
+                       for prefix in prefixes):
+                raise StateError("Recovery candidate is outside the frozen target generation")
+            if (ref.get("kind") not in ("raw", "tar") or ref.get("encoding") not in ("raw", "xz") or
+                    ref.get("public_key_fingerprint_sha256") != self.recipient or
+                    any(not isinstance(ref.get(field), str) or not _HASH.fullmatch(ref[field])
+                        for field in ("plaintext_sha256", "decoded_sha256")) or
+                    any(type(ref.get(field)) is not int or not 0 <= ref[field] <= self.part_bytes
+                        for field in ("plaintext_bytes", "decoded_bytes")) or
+                    ref["name"] != "part-" + ref["plaintext_sha256"] + ".enc" or
+                    ref["encoding"] == "raw" and (ref["plaintext_sha256"] != ref["decoded_sha256"] or
+                                                  ref["plaintext_bytes"] != ref["decoded_bytes"])):
+                raise StateError("Invalid recovery candidate part binding")
+            key = (ref["decoded_sha256"], ref["decoded_bytes"], ref["kind"])
+            if key in result:
+                raise StateError("Ambiguous duplicate recovery candidate content")
+            result[key] = ref
+        return result
 
     def publish(self, selection: StateSelection, *, dependencies: list[dict] | tuple = (),
                 code_hashes: dict | None = None, config_hashes: dict | None = None,
                 lane_heads: dict | None = None, evidence_heads: dict | None = None,
-                quiescent: bool = False) -> dict:
+                quiescent: bool = False, proof_catalog: dict | None = None) -> dict:
         return self._build_publication(selection, dependencies=dependencies, code_hashes=code_hashes,
                                        config_hashes=config_hashes, lane_heads=lane_heads,
-                                       evidence_heads=evidence_heads, quiescent=quiescent)
+                                       evidence_heads=evidence_heads, quiescent=quiescent, proof_catalog=proof_catalog)
 
     def _build_publication(self, selection: StateSelection, *, dependencies: list[dict] | tuple = (),
                 code_hashes: dict | None = None, config_hashes: dict | None = None,
                 lane_heads: dict | None = None, evidence_heads: dict | None = None,
                 quiescent: bool = False, generation: str | None = None,
-                prepared_sink: _PreparedSink | None = None) -> dict:
+                prepared_sink: _PreparedSink | None = None,
+                recovery_candidates: RecoveryCandidatePool | None = None, proof_catalog: dict | None = None) -> dict:
         request_start = getattr(self.transport, "request_count", 0)
         graphql_start = getattr(self.transport, "graphql_request_count", 0)
         if not quiescent:
@@ -1288,6 +1390,9 @@ class GitHubStateStore:
         elif selection.index is not None:
             raise StateError("Index without authoritative pointer")
         prior = selection.index or {"parts": {}, "dependencies": []}
+        recovery_parts = self._recovery_parts(recovery_candidates, selection)
+        if recovery_candidates is not None and prepared_sink is None:
+            raise StateError("Recovery requires a durably prepared publication")
         generation = generation or uuid.uuid4().hex
         if not _GENERATION.fullmatch(generation):
             raise ValueError("A prepared generation must be 32 lowercase hexadecimal characters")
@@ -1342,7 +1447,7 @@ class GitHubStateStore:
             files = self._snapshot_files(staging)
             if prepared_sink is not None:
                 prepared_sink.source_files = copy.deepcopy(files)
-            estimate = self._publication_requests_estimate(files, prior)
+            estimate = self._publication_requests_estimate(files, prior, recovery_parts)
             budget = getattr(self.transport, "publication_budget", None)
             if callable(budget):
                 metrics.update(budget(estimate))
@@ -1351,6 +1456,7 @@ class GitHubStateStore:
             parts = {}
             prior_parts = {(part["decoded_sha256"], part["decoded_bytes"], part["kind"]): part
                            for part in prior["parts"].values()}
+            prior_parts.update(recovery_parts)
             if prepared_sink is None:
                 self.transport.ensure_release(release)
             else:
@@ -1386,7 +1492,8 @@ class GitHubStateStore:
                             chunk.unlink()
                             break
                         digest = self._part(chunk, "raw", release, prior_parts, directory, parts, metrics,
-                                            compress=not already_compressed, prepared_sink=prepared_sink)
+                                            compress=not already_compressed, prepared_sink=prepared_sink,
+                                            capture_reused=recovery_candidates is not None)
                         item["segments"].append({"part": digest})
                         count = chunk.stat().st_size
                         chunk.unlink()
@@ -1403,7 +1510,7 @@ class GitHubStateStore:
                 if archive_path.stat().st_size > self.part_bytes:
                     raise StateError("Grouped snapshot exceeds plaintext part limit")
                 part_id = self._part(archive_path, "tar", release, prior_parts, directory, parts, metrics,
-                                     prepared_sink=prepared_sink)
+                                     prepared_sink=prepared_sink, capture_reused=recovery_candidates is not None)
                 for item in members:
                     item["segments"] = [{"part": part_id, "member": item["path"]}]
                 archive_path.unlink()
@@ -1415,6 +1522,33 @@ class GitHubStateStore:
                        "dependencies_sha256": hashlib.sha256(canonical_json(all_dependencies)).hexdigest(),
                        "code_hashes": code_hashes or {}, "config_hashes": config_hashes or {},
                        "lane_heads": lane_heads or {}, "evidence_heads": evidence_heads or {}}
+            proof_node = None
+            proof_head = (selection.pointer or {}).get("proof_outbox")
+            if proof_catalog is not None:
+                if (not isinstance(proof_catalog, dict) or
+                        set(proof_catalog) != {"release_tag", "name", "sha256", "bytes"} or
+                        proof_catalog.get("name") != "metadata-catalog.json" or
+                        not isinstance(proof_catalog.get("release_tag"), str) or
+                        not re.fullmatch(f"collector-observations-r{self.repository_id}-g[0-9a-f]{{32}}", proof_catalog["release_tag"]) or
+                        not isinstance(proof_catalog.get("sha256"), str) or not _HASH.fullmatch(proof_catalog["sha256"]) or
+                        type(proof_catalog.get("bytes")) is not int or not 1 <= proof_catalog["bytes"] <= 8 * 1024 * 1024):
+                    raise StateError("Invalid verified public proof catalog descriptor")
+                marker = next((ref for ref in all_dependencies
+                    if ref.get("release_tag") == proof_catalog["release_tag"] and ref.get("name") == proof_catalog["name"] and
+                    ref.get("ciphertext_sha256") == proof_catalog["sha256"] and
+                    ref.get("ciphertext_bytes") == proof_catalog["bytes"]), None)
+                if marker is None or _asset_identity(marker) not in self._verified_downloads:
+                    raise StateError("Public proof outbox requires a remotely verified marker dependency")
+                proof_node = {"schema_version": 1, "kind": "icsot_public_proof_outbox",
+                              "repository_id": self.repository_id, "slug": self.slug, "generation": generation,
+                              "created_at": snapshot_times["snapshot_sealed_at"], "catalog": copy.deepcopy(proof_catalog),
+                              "previous": copy.deepcopy(proof_head)}
+                raw_node = canonical_json(proof_node)
+                if len(raw_node) > 4096:
+                    raise StateError("Public proof outbox node exceeds bounded metadata size")
+                proof_head = {"sha256": hashlib.sha256(raw_node).hexdigest(), "bytes": len(raw_node)}
+            if proof_head is not None:
+                context["proof_outbox"] = proof_head
             index = {"context": context, "files": files, "parts": parts,
                      "dependencies": all_dependencies}
             plaintext, encrypted = directory / "index.json", directory / "index.enc"
@@ -1425,14 +1559,18 @@ class GitHubStateStore:
             ref = {**record, "release_tag": release, "name": "index.enc"}
             pointer = {**self._binding(generation, predecessor), **snapshot_times, "index": ref,
                        "context_sha256": hashlib.sha256(canonical_json(context)).hexdigest()}
+            if proof_head is not None:
+                pointer["proof_outbox"] = proof_head
             self._check_index(pointer, index)
             if prepared_sink is None:
                 self.transport.upload_asset(release, ref["name"], encrypted)
                 self._download_verified(ref, directory / "verified-index.enc")
-                commit = self._advance(selection, pointer)
+                commit = self._advance(selection, pointer,
+                                       proof_outbox_node=canonical_json(proof_node) if proof_node else None)
             else:
                 prepared_sink.capture(ref, encrypted)
                 prepared_sink.index = copy.deepcopy(index)
+                prepared_sink.proof_outbox_node = copy.deepcopy(proof_node)
                 commit = None
             metrics["state_uploaded_ciphertext_bytes"] += ref["ciphertext_bytes"]
         state_release_count = len(metrics.pop("_releases"))
@@ -1500,7 +1638,8 @@ class GitHubStateStore:
                 source_import_sha256: str, dependencies: list[dict] | tuple = (),
                 code_hashes: dict | None = None, config_hashes: dict | None = None,
                 lane_heads: dict | None = None, evidence_heads: dict | None = None,
-                quiescent: bool = False) -> PreparedState:
+                quiescent: bool = False,
+                recovery_candidates: RecoveryCandidatePool | None = None, proof_catalog: dict | None = None) -> PreparedState:
         """Freeze local bytes without uploading or committing any GitHub state.
 
         Record the returned generation, manifest hash and asset references in
@@ -1523,6 +1662,17 @@ class GitHubStateStore:
         if heads.get("source_import_sha256", source_import_sha256) != source_import_sha256:
             raise StateError("Source import binding differs from evidence heads")
         heads["source_import_sha256"] = source_import_sha256
+        if recovery_candidates is not None:
+            self._recovery_parts(recovery_candidates, selection)
+            recovery = {"recovery_epoch": recovery_candidates.recovery_epoch,
+                        "source_ledger_sha256": recovery_candidates.source_ledger_sha256,
+                        "old_generation": recovery_candidates.old_generation,
+                        "lineage_generations": list(recovery_candidates.lineage_generations),
+                        "candidate_pool_sha256": hashlib.sha256(canonical_json(list(recovery_candidates.parts))).hexdigest(),
+                        "expected_pointer": None, "expected_slug_binding": None}
+            if heads.get("recovery", recovery) != recovery:
+                raise StateError("Recovery lineage differs from evidence heads")
+            heads["recovery"] = recovery
         with self._lock():
             _, actual = self._authoritative_pointer()
             expected = canonical_json(selection.pointer) if selection.pointer else None
@@ -1532,9 +1682,15 @@ class GitHubStateStore:
             metrics = self._build_publication(selection, dependencies=dependencies,
                                              code_hashes=code_hashes, config_hashes=config_hashes,
                                              lane_heads=lane_heads, evidence_heads=heads, quiescent=True,
-                                             generation=generation, prepared_sink=sink)
+                                             generation=generation, prepared_sink=sink,
+                                             recovery_candidates=recovery_candidates, proof_catalog=proof_catalog)
             assert sink.index is not None
-            metrics["state_prepared_ciphertext_bytes"] = metrics["state_uploaded_ciphertext_bytes"]
+            metrics["state_generation_new_ciphertext_bytes"] = metrics["state_uploaded_ciphertext_bytes"]
+            metrics["state_reused_referenced_ciphertext_bytes"] = sum(
+                ref["ciphertext_bytes"] for ref in sink.index["parts"].values()
+                if ref["release_tag"] != f"collector-state-r{self.repository_id}-g{generation}" and
+                not ref["release_tag"].startswith(f"collector-state-r{self.repository_id}-g{generation}-p"))
+            metrics["state_prepared_ciphertext_bytes"] = sum(asset["ref"]["ciphertext_bytes"] for asset in sink.assets)
             metrics["state_uploaded_ciphertext_bytes"] = 0
             metrics["status"] = "prepared_locally"
             value = {"schema_version": 1, "kind": "icsot_prepared_state_v1",
@@ -1545,6 +1701,8 @@ class GitHubStateStore:
                      "expected_pointer_sha256": hashlib.sha256(canonical_json(selection.pointer)).hexdigest(),
                      "pointer": metrics["pointer"], "index": sink.index, "source_files": sink.source_files,
                      "assets": sink.assets, "metrics": metrics}
+            if sink.proof_outbox_node is not None:
+                value["proof_outbox_node"] = sink.proof_outbox_node
             self._local_record(directory / "prepared.json", value)
             digest = _digest(directory / "prepared.json")
         return self.load_prepared(directory, digest)
@@ -1594,6 +1752,23 @@ class GitHubStateStore:
         predecessor = selection.pointer["index"]["ciphertext_sha256"] if selection.pointer else None
         if pointer["predecessor_index_sha256"] != predecessor:
             raise StateError("Prepared predecessor lineage differs")
+        node = value.get("proof_outbox_node")
+        previous_outbox = (selection.pointer or {}).get("proof_outbox")
+        if node is not None:
+            raw_node = canonical_json(node)
+            catalog = node.get("catalog")
+            marker_matches = isinstance(catalog, dict) and any(
+                ref.get("release_tag") == catalog.get("release_tag") and ref.get("name") == catalog.get("name") and
+                ref.get("ciphertext_sha256") == catalog.get("sha256") and ref.get("ciphertext_bytes") == catalog.get("bytes")
+                for ref in index["dependencies"])
+            if (node.get("schema_version") != 1 or node.get("kind") != "icsot_public_proof_outbox" or
+                    node.get("repository_id") != self.repository_id or node.get("slug") != self.slug or
+                    node.get("generation") != generation or node.get("previous") != previous_outbox or
+                    node.get("created_at") != pointer["snapshot_sealed_at"] or len(raw_node) > 4096 or not marker_matches or
+                    pointer.get("proof_outbox") != {"sha256": hashlib.sha256(raw_node).hexdigest(), "bytes": len(raw_node)}):
+                raise StateError("Prepared proof outbox lineage differs")
+        elif pointer.get("proof_outbox") != previous_outbox:
+            raise StateError("Prepared proof outbox lacks its immutable node")
         source_files = [{key: item[key] for key in ("path", "bytes", "sha256", "mode")} for item in index["files"]]
         if value.get("source_files") != source_files:
             raise StateError("Prepared source file map differs from encrypted index")
@@ -1631,12 +1806,15 @@ class GitHubStateStore:
             raise StateError("Quiescent working root changed after preparation")
 
     def publish_prepared(self, prepared: PreparedState, *, source_import_sha256: str | None = None,
-                         quiescent: bool = False) -> dict:
+                         quiescent: bool = False, progress_callback: Callable[[dict], None] | None = None,
+                         progress_requests_reserve: int = 0) -> dict:
         """Upload one frozen generation; caller controls bounded reset-aware retries."""
         if not quiescent:
             raise StateError("Prepared publication requires joined callbacks")
         if not isinstance(prepared, PreparedState):
             raise TypeError("A SHA-pinned PreparedState is required")
+        if type(progress_requests_reserve) is not int or not 0 <= progress_requests_reserve <= 100000:
+            raise ValueError("Bounded durable progress request reserve required")
         loaded = self.load_prepared(prepared.directory, prepared.manifest_sha256)
         if (loaded.generation != prepared.generation or loaded.source_import_sha256 != prepared.source_import_sha256 or
                 source_import_sha256 is not None and source_import_sha256 != loaded.source_import_sha256):
@@ -1646,15 +1824,22 @@ class GitHubStateStore:
         request_start = getattr(self.transport, "request_count", 0)
         graphql_start = getattr(self.transport, "graphql_request_count", 0)
         verified = self._prepared_verified.setdefault(loaded.manifest_sha256, set())
+        # Authenticated candidates captured by this preparation already exist
+        # remotely. Count them as verified reuse, not new upload requests.
+        verified.update(_asset_identity(asset["ref"]) for asset in value["assets"]
+                        if _asset_identity(asset["ref"]) in self._verified_parts)
         acknowledged_upload_bytes = 0
         def progress(status: str, *, pointer_commit: str | None = None) -> None:
-            self._local_record(loaded.directory / "progress.json", {
+            record = {
                 "schema_version": 1, "status": status, "generation": loaded.generation,
                 "prepared_manifest_sha256": loaded.manifest_sha256,
                 "source_import_sha256": loaded.source_import_sha256,
                 "release_tags": list(loaded.release_tags), "pointer": loaded.pointer,
                 "verified_assets": [asset["ref"] for asset in value["assets"] if _asset_identity(asset["ref"]) in verified],
-                "pointer_commit": pointer_commit}, replace=True)
+                "pointer_commit": pointer_commit}
+            self._local_record(loaded.directory / "progress.json", record, replace=True)
+            if progress_callback is not None:
+                progress_callback(copy.deepcopy(record))
         with self._lock():
             head, actual = self._authoritative_pointer()
             desired = canonical_json(value["pointer"])
@@ -1676,7 +1861,7 @@ class GitHubStateStore:
                 tags = {asset["ref"]["release_tag"] for asset in pending}
                 required = (2 * len(pending) + 15 * len(tags) + 18 + len(dependencies) +
                             13 * len({ref["release_tag"] for ref in dependencies}) + len(cold_prior) +
-                            13 * len({ref["release_tag"] for ref in cold_prior}))
+                            13 * len({ref["release_tag"] for ref in cold_prior}) + progress_requests_reserve)
                 budget = getattr(self.transport, "publication_budget", None)
                 budget_metrics = budget(required) if callable(budget) else {}
                 maximum_download = max([asset["ref"]["ciphertext_bytes"] for asset in pending] +
@@ -1721,10 +1906,16 @@ class GitHubStateStore:
                         verified.add(_asset_identity(ref))
                         progress("publication_pending")
                 self._validate_prepared_root(value)
+                # Every ciphertext asset and prerequisite has now been fetched
+                # and verified. A durable callback may advertise remote closure
+                # only at this point; earlier progress is a partial generation.
+                progress("remote_prepared")
                 _, current = self._authoritative_pointer()
                 if current != old and current != desired:
                     raise StateConflictError("State pointer changed before prepared commit")
-                head = self._advance(selection, value["pointer"]) if current != desired else self.transport.branch_head()
+                head = self._advance(selection, value["pointer"], proof_outbox_node=(
+                    canonical_json(value["proof_outbox_node"]) if value.get("proof_outbox_node") else None)
+                    ) if current != desired else self.transport.branch_head()
                 progress("complete", pointer_commit=head)
             else:
                 budget_metrics = {}
@@ -1737,8 +1928,10 @@ class GitHubStateStore:
                       prepared_manifest_sha256=loaded.manifest_sha256,
                       source_import_sha256=loaded.source_import_sha256,
                       state_prepared_ciphertext_bytes=sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"]),
-                      state_generation_new_ciphertext_bytes=sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"]),
-                      state_uploaded_ciphertext_bytes=0 if already_committed else sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"]),
+                      state_generation_new_ciphertext_bytes=value["metrics"].get("state_generation_new_ciphertext_bytes",
+                          sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"])),
+                      state_uploaded_ciphertext_bytes=0 if already_committed else value["metrics"].get(
+                          "state_generation_new_ciphertext_bytes", sum(asset["ref"]["ciphertext_bytes"] for asset in value["assets"])),
                       state_upload_bytes_acknowledged_this_attempt=acknowledged_upload_bytes,
                       destination_github_api_requests_total=request_total,
                       destination_github_api_requests_for_publish=request_total - request_start,
@@ -1748,7 +1941,7 @@ class GitHubStateStore:
                       destination_github_rest_api_requests_for_publish=request_total - request_start - (graphql_total - graphql_start))
         return report
 
-    def _advance(self, selection: StateSelection, pointer: dict) -> str:
+    def _advance(self, selection: StateSelection, pointer: dict, *, proof_outbox_node: bytes | None = None) -> str:
         expected, old = selection.head, canonical_json(selection.pointer) if selection.pointer else None
         raw = canonical_json(pointer)
         for _ in range(8):
@@ -1758,7 +1951,8 @@ class GitHubStateStore:
                 raise StateConflictError("Repository slug binding exists but its state pointer is missing")
             if current != old:
                 raise StateConflictError("Selected repository state pointer changed")
-            commit = self.transport.commit_pointer(expected, self.repository_id, raw)
+            commit = (self.transport.commit_pointer(expected, self.repository_id, raw, proof_outbox_node=proof_outbox_node)
+                      if proof_outbox_node is not None else self.transport.commit_pointer(expected, self.repository_id, raw))
             try:
                 advanced = self.transport.advance_branch(expected, commit)
             except StateDeferredError:

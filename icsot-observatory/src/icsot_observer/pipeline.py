@@ -1169,6 +1169,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
 
         dependencies, uploaded_evidence_bytes = [], 0
         proof_registration = None
+        proof_catalog = None
         uploaded_assets: dict[str, dict] = {}
         publication_observations = []
         known = {entry["index"]["manifest_sha256"] for entry in catalog["exports"]}
@@ -1228,10 +1229,12 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
             if (_file_sha256(verified_marker) != marker_ref["ciphertext_sha256"] or
                     verified_marker.stat().st_size != marker_ref["ciphertext_bytes"]):
                 raise RuntimeError("Public metadata catalog differs from the uploaded completion marker")
-            # Import only after all immutable public evidence is remotely
-            # available. Failure keeps the previous working-state pointer.
-            from .proof_maintenance import register_catalog
-            proof_registration = publish_call(register_catalog, transport, _public_asset_ref(marker_ref))
+            # Validate all public proof bindings before publication, independent
+            # of the daily proof-attempt queue. The SAME state-pointer CAS adds
+            # this immutable marker to a durable public registration outbox.
+            from .proof_maintenance import validate_catalog
+            proof_catalog = _public_asset_ref(marker_ref)
+            proof_registration = publish_call(validate_catalog, transport, proof_catalog)
         raw_catalog = canonical_json(catalog)
         temporary_catalog = root / (".transfer-catalog-" + uuid.uuid4().hex + ".tmp")
         try:
@@ -1260,6 +1263,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
         code_hashes = {path.name: _file_sha256(path) for path in source_dir.glob("*.py")}
         code_hashes["collector_commit"] = code_sha
         publication_options = dict(dependencies=dependencies, quiescent=True,
+                                      proof_catalog=proof_catalog,
                                       code_hashes=code_hashes,
                                       config_hashes={"source_sha256": config_source_sha256,
                                                      "selected_public_config_sha256": sha256(canonical_json(_public_config(config))),

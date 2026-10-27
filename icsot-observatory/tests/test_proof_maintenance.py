@@ -15,6 +15,7 @@ from icsot_observer.core import canonical_json, sha256
 from icsot_observer.github_state import GhCliStateTransport, StateConflictError, StateDeferredError
 from icsot_observer.proof_maintenance import (
     BitcoinCoreVerifier, OtsClient, ProofTransport, empty_state, refresh, register_catalog, requeue_catalog,
+    validate_catalog,
 )
 
 SUBJECT = hashlib.sha256(b"controlled public collector manifest\n").hexdigest()
@@ -106,6 +107,32 @@ class ControlledClient:
         return self.data
 
 
+class OutboxGitHub(FakeGitHub):
+    def __init__(self):
+        super().__init__()
+        self.source_heads, self.nodes = {}, {}
+
+    def append_outbox(self, catalog, *, repository_id=123, slug="one/repository"):
+        previous = self.source_heads.get(repository_id, (slug, None))[1]
+        raw = canonical_json({"schema_version": 1, "kind": "icsot_public_proof_outbox",
+            "repository_id": repository_id, "slug": slug, "generation": f"{len(self.nodes) + 1:032x}",
+            "created_at": FINISH, "catalog": catalog, "previous": previous})
+        ref = {"sha256": sha256(raw), "bytes": len(raw)}
+        self.nodes[repository_id, ref["sha256"]] = raw
+        self.source_heads[repository_id] = slug, ref
+        return ref
+
+    def outbox_repositories(self):
+        self.frozen_heads = copy.deepcopy(self.source_heads)
+        return "frozen-public-state-head", sorted(self.frozen_heads)
+
+    def outbox_head(self, head, repository_id):
+        return self.frozen_heads[repository_id]
+
+    def outbox_node(self, head, repository_id, ref):
+        return self.nodes[repository_id, ref["sha256"]]
+
+
 def observation(tmp_path, github, *, tag=TAG, subject=SUBJECT):
     directory = tmp_path / tag
     directory.mkdir()
@@ -137,6 +164,181 @@ def test_registration_is_durable_idempotent_and_cas_retries(tmp_path):
     saves = github.saves
     assert register_catalog(github, ref)["status"] == "already_registered"
     assert github.state == snapshot and github.saves == saves
+
+
+def test_catalog_validation_has_no_queue_access_or_capacity_dependency(tmp_path):
+    github = FakeGitHub()
+    ref, evidence = observation(tmp_path, github)
+    github.state["pending"] = {f"{n:064x}": {} for n in range(4096)}
+    def forbidden_load():
+        raise AssertionError("Validation must not read the attempt queue")
+    github.load = forbidden_load
+    assert validate_catalog(github, ref)["status"] == "registration_pending"
+    assert github.saves == 0 and github.files == {}
+    github.assets[TAG, evidence["proof_asset"]["name"]] = b"tampered initial receipt"
+    with pytest.raises(ValueError, match="tampered asset"):
+        validate_catalog(github, ref)
+    assert github.saves == 0 and github.files == {}
+
+
+def test_full_attempt_queue_keeps_outbox_and_still_drains_then_registers(tmp_path):
+    github = OutboxGitHub()
+    old_ref, old_evidence = observation(tmp_path, github)
+    register_catalog(github, old_ref)
+    original = github.assets[TAG, old_evidence["proof_asset"]["name"]]
+    for number in range(4095):
+        github.state["pending"][f"{number:064x}"] = {"next_attempt_after": 10**12}
+    subject = sha256(b"new manifest while proof queue full")
+    tag = "collector-observations-r123-g" + "b" * 32
+    new_ref, _ = observation(tmp_path, github, tag=tag, subject=subject)
+    outbox_head = github.append_outbox(new_ref)
+    first = refresh(github, client=ControlledClient(), max_proofs=1, clock=lambda: 10000)
+    assert first["outbox_registration_paused_at_capacity"] is True
+    assert first["proofs_changed"] == 1 and first["pending_proofs"] == 4095
+    row = github.state["discovery"]["proof_outbox"]["repositories"]["123"]
+    assert row["cursor"] == outbox_head and row["last_error"] == "proof_attempt_queue_full"
+    assert f"catalogs/{new_ref['sha256']}.json" not in github.files
+    assert first["oldest_inspected_pending_outbox_at"] == FINISH
+    restarted = copy.deepcopy(github)
+    second = refresh(restarted, client=ControlledClient(data=receipt(subject=subject, bitcoin=True)),
+                     max_proofs=1, clock=lambda: 20000)
+    assert second["outbox_nodes_registered"] == 1 and second["proofs_changed"] == 1
+    assert restarted.state["discovery"]["proof_outbox"]["repositories"]["123"]["completed_head"] == outbox_head
+    assert f"catalogs/{new_ref['sha256']}.json" in restarted.files
+    assert restarted.assets[TAG, old_evidence["proof_asset"]["name"]] == original
+    assert second["proofs_verified"] == 0
+
+
+def test_outbox_snapshot_finishes_older_chain_despite_new_heads_and_restart(tmp_path):
+    github, catalogs, heads = OutboxGitHub(), [], []
+    for number in range(1, 4):
+        tag = "collector-observations-r123-g" + f"{number:032x}"
+        ref, _ = observation(tmp_path, github, tag=tag, subject=sha256(str(number).encode()))
+        catalogs.append(ref)
+        heads.append(github.append_outbox(ref))
+    first = refresh(github, client=ControlledClient(fail=True), max_markers=1, max_proofs=1, clock=lambda: 10000)
+    assert first["outbox_nodes_registered"] == 1
+    row = github.state["discovery"]["proof_outbox"]["repositories"]["123"]
+    assert row["cursor"] == heads[1] and row["target"] == heads[2]
+    ref, _ = observation(tmp_path, github, tag="collector-observations-r123-g" + "4" * 32,
+                         subject=sha256(b"new head after first daily checkpoint"))
+    newest = github.append_outbox(ref)
+    catalogs.append(ref)
+    restarted = copy.deepcopy(github)
+    for day in range(2, 5):
+        report = refresh(restarted, client=ControlledClient(fail=True), max_markers=1, max_proofs=1,
+                         clock=lambda day=day: day * 10000)
+        assert report["outbox_nodes_registered"] == 1
+        if day == 3:
+            row = restarted.state["discovery"]["proof_outbox"]["repositories"]["123"]
+            assert row["completed_head"] == heads[2] and row["cursor"] is None
+    row = restarted.state["discovery"]["proof_outbox"]["repositories"]["123"]
+    assert row["completed_head"] == newest and row["cursor"] is None
+    assert all(f"catalogs/{ref['sha256']}.json" in restarted.files for ref in catalogs)
+    for tag, name in restarted.assets:
+        if name.endswith(".attestation.json"):
+            metadata = json.loads(restarted.assets[tag, name])
+            assert metadata["observation_interval"]["started_at"] == START
+            assert metadata["observation_interval"]["finished_at"] == FINISH
+
+
+def test_outbox_cursor_and_registration_are_one_cas(tmp_path):
+    github = OutboxGitHub()
+    ref, _ = observation(tmp_path, github)
+    outbox_head = github.append_outbox(ref)
+    github.conflicts = 1
+    first = refresh(github, client=ControlledClient(fail=True), clock=lambda: 10000)
+    assert first["status"] == "conflict"
+    assert github.files == {} and "proof_outbox" not in github.state["discovery"]
+    second = refresh(github, client=ControlledClient(fail=True), clock=lambda: 20000)
+    assert second["outbox_nodes_registered"] == 1
+    assert github.state["discovery"]["proof_outbox"]["repositories"]["123"]["completed_head"] == outbox_head
+
+
+def test_malformed_later_outbox_checkpoint_rolls_back_earlier_batch_registration(tmp_path):
+    github = OutboxGitHub()
+    ref, _ = observation(tmp_path, github)
+    github.append_outbox(ref)
+    github.source_heads[456] = ("other/repository", None)
+    github.state["discovery"]["proof_outbox"] = {"repositories": {"456": []}, "last_repository_id": 0}
+    before = copy.deepcopy(github.state)
+    report = refresh(github, client=ControlledClient(fail=True), max_markers=2, clock=lambda: 10000)
+    assert report["outbox_invalid_registrations"] == 1 and report["outbox_nodes_registered"] == 0
+    assert github.state["discovery"]["proof_outbox"] == before["discovery"]["proof_outbox"]
+    assert github.state["pending"] == before["pending"] and github.files == {}
+
+
+def test_invalid_outbox_metadata_is_unacknowledged_while_old_proof_drains(tmp_path):
+    github = OutboxGitHub()
+    old_ref, _ = observation(tmp_path, github)
+    register_catalog(github, old_ref)
+    ref, evidence = observation(tmp_path, github, tag="collector-observations-r123-g" + "b" * 32,
+                                subject=sha256(b"invalid later public metadata"))
+    outbox_head = github.append_outbox(ref)
+    github.assets[ref["release_tag"], evidence["metadata_asset"]["name"]] = b"{}"
+    report = refresh(github, client=ControlledClient(), clock=lambda: 10000)
+    assert report["outbox_invalid_registrations"] == 1 and report["proofs_changed"] == 1
+    row = github.state["discovery"]["proof_outbox"]["repositories"]["123"]
+    assert row["cursor"] == outbox_head and row["completed_head"] is None
+    assert f"catalogs/{ref['sha256']}.json" not in github.files
+
+
+def test_outbox_repository_rotation_is_bounded_and_fair():
+    github = OutboxGitHub()
+    for identifier in range(1, 6):
+        tag = f"collector-observations-r{identifier}-g" + "a" * 32
+        raw = canonical_json({"schema_version": 1, "kind": "icsot_evidence_metadata_catalog",
+                              "generation_release": tag, "observations": []})
+        ref = {"release_tag": tag, "name": "metadata-catalog.json", "sha256": sha256(raw), "bytes": len(raw)}
+        github.assets[tag, ref["name"]] = raw
+        github.append_outbox(ref, repository_id=identifier, slug=f"owner/repo{identifier}")
+    for turn, expected in enumerate((2, 4, 5), start=1):
+        report = refresh(github, max_markers=2, clock=lambda turn=turn: turn * 10000)
+        assert report["outbox_repositories_inspected"] == 2
+        assert len([path for path in github.files if path.startswith("catalogs/")]) == expected
+    # Carried heads are acknowledged without resurrecting already registered work.
+    assert refresh(github, max_markers=2, clock=lambda: 40000)["outbox_nodes_registered"] == 0
+
+
+@pytest.mark.parametrize("truncated_path", ["root", "pointers", None])
+def test_public_outbox_inventory_uses_only_complete_nonrecursive_pointer_trees(truncated_path):
+    transport, calls = ProofTransport("owner/repository"), []
+    transport.branch_head = lambda: "frozen-state-head"
+    def api(path):
+        calls.append(path)
+        if path.endswith("/git/trees/frozen-state-head"):
+            return {"truncated": truncated_path == "root", "tree": [
+                {"path": "repos", "type": "tree", "sha": "pointer-tree"},
+                {"path": "proof-outbox", "type": "tree", "sha": "never-enumerated-history"}]}
+        assert path.endswith("/git/trees/pointer-tree")
+        return {"truncated": truncated_path == "pointers", "tree": [
+            {"path": "123.json", "type": "blob"}, {"path": "456.json", "type": "blob"}]}
+    transport._api = api
+    if truncated_path:
+        with pytest.raises(ValueError, match="Incomplete public state"):
+            transport.outbox_repositories()
+    else:
+        assert transport.outbox_repositories() == ("frozen-state-head", [123, 456])
+    assert not any("recursive" in path or "never-enumerated-history" in path for path in calls)
+
+
+def test_public_outbox_reader_checks_slug_and_exact_immutable_node():
+    from icsot_observer.github_state import _slug_binding
+    transport = ProofTransport("owner/repository")
+    raw = canonical_json({"controlled": "immutable node"})
+    ref = {"sha256": sha256(raw), "bytes": len(raw)}
+    transport.read_pointer = lambda head, identifier: canonical_json({
+        "repository_id": 123, "slug": "one/repo", "proof_outbox": ref})
+    transport.read_slug_binding = lambda head, slug: canonical_json(_slug_binding(slug, 123))
+    assert transport.outbox_head("frozen", 123) == ("one/repo", ref)
+    transport._read_git_file = lambda head, path: raw
+    assert transport.outbox_node("frozen", 123, ref) == raw
+    transport._read_git_file = lambda head, path: raw + b" "
+    with pytest.raises(ValueError, match="missing or differs"):
+        transport.outbox_node("frozen", 123, ref)
+    transport.read_slug_binding = lambda head, slug: canonical_json(_slug_binding(slug, 456))
+    with pytest.raises(ValueError, match="slug binding differs"):
+        transport.outbox_head("frozen", 123)
 
 
 def test_upgrade_publishes_bound_assets_and_keeps_presence_unverified(tmp_path):

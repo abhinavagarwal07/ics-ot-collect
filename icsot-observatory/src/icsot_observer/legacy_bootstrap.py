@@ -20,6 +20,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -260,6 +261,12 @@ class GitHubMigrationLedger:
     def read(self, identifier: str, repo_id: int):
         return self._read(self._head(), self._path(identifier, repo_id))
 
+    def read_many(self, identifier: str, repo_ids):
+        """Read dispositions at one frozen branch head, without per-row ref reads."""
+        paths = {repo_id: self._path(identifier, repo_id) for repo_id in repo_ids}
+        head = self._head()
+        return {repo_id: self._read(head, path) for repo_id, path in paths.items()}
+
     def active_plan(self):
         return self._read(self._head(), "active-plan.json")
 
@@ -309,24 +316,71 @@ class GitHubMigrationLedger:
         return self._write("active-plan.json", plan_ref)
 
 
-def backlog_matrix(plan: dict, *, pointer_loader, ledger) -> dict:
-    """Every unfinished eligible source remains selected; no cold-wave limit."""
-    selected = []
+def _blocked_reason_codes(record: dict) -> list[str]:
+    reasons = []
+    if record.get("external_recovery_required"):
+        reasons.append("external_recovery_required")
+    if record.get("prepared_generation"):
+        reasons.append("prepared_generation_requires_reviewed_recovery")
+    if record.get("fresh_capture_attempt_started") or record.get("fresh_capture_publication_started"):
+        reasons.append("fresh_capture_requires_reviewed_recovery")
+    if record.get("disposition") == "source_repair_pending":
+        reasons.append("source_repair_pending")
+    code = record.get("reason_code")
+    if reasons and isinstance(code, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,95}", code):
+        reasons.append(code)
+    return list(dict.fromkeys(reasons))
+
+
+def backlog_plan(plan: dict, *, pointer_loader, ledger) -> dict:
+    """Keep every target visible while admitting only work with a safe next step."""
+    selected, rows, missing = [], [], []
     for row in plan["repositories"]:
-        if row["disposition"] == "source_repair_pending":
-            continue
-        raw = pointer_loader(row["repository_id"])
+        outcome = {"slug": row["slug"], "repository_id": row["repository_id"]}
+        rows.append(outcome)
+        raw = pointer_loader(row["repository_id"]) if row["repository_id"] is not None else None
         if raw is not None:
             pointer = json.loads(raw)
-            if pointer.get("repository_id") != row["repository_id"] or pointer.get("slug") != row["slug"]:
+            if (pointer.get("repository_id") != row["repository_id"] or pointer.get("slug") != row["slug"] or
+                    canonical_json(pointer) != raw):
                 raise MigrationError("Operational pointer identity differs from migration plan")
+            outcome.update(status="already_operational", reason_codes=["authoritative_state_present"])
             continue
-        record = ledger.read(plan["migration_id"], row["repository_id"])
-        if record and record.get("disposition") == "source_repair_pending":
+        if row["repository_id"] is None or row["disposition"] == "source_repair_pending":
+            reasons = [reason for reason in row.get("reason_codes", [])
+                       if isinstance(reason, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,95}", reason)]
+            outcome.update(status="blocked", reason_codes=list(dict.fromkeys(["source_repair_pending", *reasons])))
+            continue
+        missing.append((row, outcome))
+    identifiers = [row["repository_id"] for row, _ in missing]
+    records = (ledger.read_many(plan["migration_id"], identifiers) if identifiers and hasattr(ledger, "read_many") else
+               {repo_id: ledger.read(plan["migration_id"], repo_id) for repo_id in identifiers})
+    for row, outcome in missing:
+        record = records[row["repository_id"]]
+        reasons = _blocked_reason_codes(record or {})
+        if record and record.get("disposition") == "state_published":
+            reasons.append("authoritative_state_missing")
+        if reasons:
+            outcome.update(status="blocked", reason_codes=list(dict.fromkeys(reasons)))
             continue
         if row.get("strategy") == "fresh_repair" or row.get("parts") and row.get("source_manifest"):
             selected.append({"slug": row["slug"], "repository_id": row["repository_id"]})
-    return {"include": selected}
+            outcome.update(status="eligible", reason_codes=[])
+        else:
+            outcome.update(status="blocked", reason_codes=["source_material_unavailable"])
+    counts = dict(Counter(row["status"] for row in rows))
+    blocked = counts.get("blocked", 0)
+    complete = counts.get("already_operational", 0) == len(rows)
+    return {"schema_version": 1, "kind": "icsot_legacy_migration_backlog", "migration_id": plan["migration_id"],
+            "status": "complete" if complete else "blocked" if not selected else "work_available",
+            "migration_complete": complete, "cohort_count": len(rows), "counts": counts,
+            "blocked_count": blocked, "blocked_reason_counts": dict(Counter(
+                reason for row in rows if row["status"] == "blocked" for reason in row["reason_codes"])),
+            "repositories": rows, "matrix": {"include": selected}}
+
+
+def backlog_matrix(plan: dict, *, pointer_loader, ledger) -> dict:
+    return backlog_plan(plan, pointer_loader=pointer_loader, ledger=ledger)["matrix"]
 
 
 def _record(plan: dict, entry: dict, prior: dict | None, disposition: str, **details):
@@ -612,7 +666,7 @@ def _resource_pause_reason(error: Exception):
 def safe_error_location(error: Exception):
     """Return reviewed code coordinates, never exception text or local paths."""
     modules = {"legacy_bootstrap.py", "legacy_archive.py", "archive_reader.py", "legacy_capsules.py",
-               "legacy_git.py", "legacy_api.py", "github_state.py", "pipeline.py", "runtime.py"}
+               "legacy_git.py", "legacy_api.py", "legacy_seed_catalog.py", "github_state.py", "pipeline.py", "runtime.py"}
     location, frame = None, error.__traceback__
     while frame is not None:
         code = frame.tb_frame.f_code
@@ -877,7 +931,10 @@ def _initialize_fresh_repair(plan, entry, *, config, code_sha, destination_repos
             if selection.pointer is not None:
                 return record("state_published", reason_code="already_operational", new_observations=0,
                               new_evidence_upload_bytes=0, state_uploaded_ciphertext_bytes=0)
-            if prior and (prior.get("fresh_capture_attempt_started") or prior.get("prepared_generation")):
+            if prior and prior.get("external_recovery_required"):
+                return prior
+            if prior and (prior.get("fresh_capture_attempt_started") or prior.get("fresh_capture_publication_started") or
+                          prior.get("prepared_generation")):
                 return record("deferred", reason_code="fresh_publication_recovery_required", external_recovery_required=True)
         if config.history_profile != "full_history":
             raise StateDeferredError("Fresh repair history profile remains gated", reason="history_profile_requires_independent_baseline")
@@ -923,6 +980,133 @@ def _initialize_fresh_repair(plan, entry, *, config, code_sha, destination_repos
         return record("deferred" if resource else "source_repair_pending", _best_effort=True,
                       reason_code=resource or type(error).__name__, resource_review_required=bool(resource),
                       error_location=safe_error_location(error))
+
+
+def import_legacy_seed(plan: dict, entry: dict, *, code_sha: str, config: Config,
+                       working_root: Path, scratch: Path, reader,
+                       operational_private_key_path: Path, evidence_public_key_path: Path,
+                       imported_at: str, helpers: MigrationHelpers | None = None) -> dict | None:
+    """Authenticate and derive the exact historical seed under the caller's lock.
+
+    The caller supplies an empty working root and original import time. This
+    helper neither changes migration holds nor publishes operational pointers.
+    """
+    slug = entry["slug"]
+    index_raw = reader.metadata(entry["source_index"])
+    index = json.loads(index_raw)
+    migration_raw = reader.metadata(entry["migration_index"]) if entry.get("migration_index") else None
+    from .legacy_archive import LegacyPartRef
+    parts = [LegacyPartRef(part["binding"], reader.metadata(part["capsule"], limit=MAX_CAPSULE_BYTES))
+             for part in entry["parts"]]
+    helpers = helpers or MigrationHelpers.production()
+    authenticated_owner = None
+    if helpers.capsule_inspect:
+        contexts = [helpers.capsule_inspect(part.capsule)["context"] for part in parts]
+        owners = {context["owner_key_fingerprint_sha256"] for context in contexts}
+        if len(owners) != 1 or any(context["operational_key_fingerprint_sha256"] !=
+                plan["operational_recipient_spki_sha256"] for context in contexts):
+            raise MigrationError("Ordered capsule recipients differ from the sealed selected policy")
+        authenticated_owner = owners.pop()
+        if entry.get("owner_recipient_spki_sha256", authenticated_owner) != authenticated_owner:
+            raise MigrationError("Declared legacy owner recipient differs from authenticated capsule context")
+    aliases = {part["transport_alias"]["plaintext"]["name"]: part["transport_alias"]
+               for part in entry["parts"] if part.get("transport_alias")}
+    (scratch / "archive").mkdir()
+    (scratch / "parts").mkdir()
+    limits, restore_admission = admit_restore_limits(entry, index, scratch)
+    def open_part(part):
+        value = part.binding
+        return reader.open({"release_repository": value["release_repository"], "release_tag": value["release_tag"],
+            "release_id": value["release_id"], "asset_id": value["asset_id"], "name": value["asset_name"],
+            "sha256": value["ciphertext_sha256"], "bytes": value["ciphertext_bytes"]})
+    imported = helpers.archive_import(index_raw, parts, expected_index_sha256=entry["source_index"]["sha256"],
+        expected_repository=slug, expected_repository_id=entry["repository_id"],
+        expected_manifest_sha256=entry["source_manifest"]["sha256"], output_root=scratch / "archive",
+        staging_root=scratch / "parts", open_part=open_part, operational_private_key_path=operational_private_key_path,
+        limits=limits, transport_overrides=aliases or None)
+    if any(path.name != ".collector.lock" for path in working_root.iterdir()):
+        raise MigrationError("Migration requires an empty destination working root")
+    for child in imported.evidence_root.iterdir():
+        if child.name in ("runtime.sqlite3", "runtime.sqlite3-wal", "runtime.sqlite3-shm", "checkpoints", "transfer-catalog.json"):
+            raise MigrationError("Source archive contains operational state that cannot be adopted as historical jobs")
+        shutil.move(str(child), working_root / child.name)
+    # The importer has authenticated the complete archive closure.
+    # Provisional reports/staging are not another retained working copy.
+    shutil.rmtree(scratch / "archive")
+    source_home = working_root / "imports" / "legacy-source"
+    _create_identical(source_home / "index.json", index_raw)
+    if migration_raw is not None:
+        _create_identical(source_home / "migration-index.json", migration_raw)
+    manifest_path = working_root / entry["source_manifest"]["path"]
+    manifest_raw = manifest_path.read_bytes()
+    git_proof = None
+    git_error = None
+    try:
+        git_proof = helpers.git_import(working_root, manifest_raw, index_raw,
+            expected_manifest_sha256=entry["source_manifest"]["sha256"],
+            expected_index_sha256=entry["source_index"]["sha256"], source_context=_source_context(entry),
+            importer_code_sha=code_sha, imported_at_utc=imported_at)
+    except (ValueError, RuntimeError) as error:
+        git_error = type(error).__name__
+        # Only this provisional copy is removed; historical archives are
+        # untouched, and a future live Git capture starts in an empty mirror.
+        if (working_root / "git").exists():
+            shutil.rmtree(working_root / "git")
+    api_proof = helpers.api_validate(working_root, manifest_path,
+        expected_manifest_sha256=entry["source_manifest"]["sha256"], source_index_path=source_home / "index.json",
+        expected_index_sha256=entry["source_index"]["sha256"], repository_id=entry["repository_id"],
+        slug=slug, api_version=config.api_version, history_policy=None)
+    if not git_proof and not api_proof["eligible_watermarks"]:
+        return None
+    original = json.loads(manifest_raw)
+    receipt = {"schema_version": 1, "kind": "icsot_legacy_state_import_receipt",
+        "migration_id": plan["migration_id"], "repository_id": entry["repository_id"], "slug": slug,
+        "imported_at": imported_at, "importer_code_sha": code_sha,
+        "source_index": entry["source_index"], "source_manifest_sha256": sha256(manifest_raw),
+        "source_observation_interval": {"started_at": original["started_at"], "finished_at": original["finished_at"]},
+        "source_status": original["status"], "source_mode": original["mode"],
+        "authenticated_parts": imported.parts, "archive_members_sha256": sha256(canonical_json(imported.files)),
+        "cas_inventory_sha256": sha256(canonical_json(imported.cas)),
+        "git_seed_proof": git_proof, "git_repair_reason": git_error, "api_seed_proof": api_proof,
+        "observation_claim": "verified_migration_of_original_evidence_not_a_new_observation"}
+    receipt["derived_artifacts"] = []
+    receipt["derived_artifacts"].append({"path": (source_home / "index.json").relative_to(working_root).as_posix(),
+        "sha256": sha256(index_raw), "bytes": len(index_raw)})
+    if git_proof:
+        descriptor = ObjectStore(working_root).location(_digest(git_proof["descriptor_sha256"]))
+        if _file_digest(descriptor) != git_proof["descriptor_sha256"]:
+            raise MigrationError("Derived Git archive descriptor differs from verified import")
+        receipt["derived_artifacts"].append({"path": descriptor.relative_to(working_root).as_posix(),
+            "sha256": git_proof["descriptor_sha256"], "bytes": descriptor.stat().st_size})
+        for key in ("receipt", "index"):
+            relative = git_proof.get(key + "_path_relative")
+            if relative:
+                artifact = working_root / relative
+                receipt["derived_artifacts"].append({"path": relative, "sha256": sha256(artifact.read_bytes()),
+                                                    "bytes": artifact.stat().st_size})
+    if migration_raw is not None:
+        receipt["derived_artifacts"].append({"path": (source_home / "migration-index.json").relative_to(working_root).as_posix(),
+            "sha256": sha256(migration_raw), "bytes": len(migration_raw)})
+    receipt_path = working_root / "imports" / "legacy-bootstrap" / (plan["migration_id"] + ".json")
+    _create_identical(receipt_path, canonical_json(receipt))
+    receipt_digest = sha256(receipt_path.read_bytes())
+    queue = PersistentQueue(working_root)
+    commit_legacy_watermarks(queue, receipt_path=receipt_path, root=working_root,
+        manifest_path=manifest_path, source_index_path=source_home / "index.json", entry=entry,
+        api_version=config.api_version, validator=helpers.api_validate)
+    seed = helpers.seed_seal(_seed_fields(entry, imported, receipt_path, working_root, receipt_digest, authenticated_owner))
+    helpers.seed_validate(seed, repository_id=entry["repository_id"], slug=slug, root=working_root,
+                          source_index=index_raw, migration_index=migration_raw)
+    from .encryption import public_key_fingerprint
+    if public_key_fingerprint(evidence_public_key_path) != seed["owner_recipient_spki_sha256"]:
+        raise StateDeferredError("Legacy evidence recipient differs from configured evidence recipient", reason="evidence_recipient_mismatch")
+    catalog = {"schema_version": 1, "repository_id": entry["repository_id"], "slug": slug,
+        "evidence_recipient_spki_sha256": seed["owner_recipient_spki_sha256"], "exports": [],
+        "legacy_seed_packages": [seed]}
+    _create_identical(working_root / "transfer-catalog.json", canonical_json(catalog))
+    return {"receipt_digest": receipt_digest, "seed": seed, "manifest_raw": manifest_raw,
+            "original": original, "git_proof": git_proof, "api_proof": api_proof,
+            "imported": imported, "restore_admission": restore_admission}
 
 
 def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Config,
@@ -1016,6 +1200,8 @@ def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Confi
                               storage_qualification="existing operational state wins; this migration uploads no working copy")
             if prior and prior["disposition"] == "state_published":
                 return record("source_repair_pending", reason_code="authoritative_state_missing")
+            if prior and prior.get("external_recovery_required"):
+                return prior
             if prior and prior.get("prepared_generation"):
                 return record("deferred", reason_code="prepared_state_unavailable_after_runner_loss",
                               external_recovery_required=True)
@@ -1024,118 +1210,15 @@ def initialize_repository(plan: dict, slug: str, *, code_sha: str, config: Confi
             record("queued")
             preflight = _retry_destination(lambda: _publication_preflight(transport, entry),
                                           deadline=deadline, clock=clock, sleeper=sleeper)
-            index_raw = reader.metadata(entry["source_index"])
-            index = json.loads(index_raw)
-            migration_raw = reader.metadata(entry["migration_index"]) if entry.get("migration_index") else None
-            from .legacy_archive import LegacyPartRef
-            parts = [LegacyPartRef(part["binding"], reader.metadata(part["capsule"], limit=MAX_CAPSULE_BYTES))
-                     for part in entry["parts"]]
-            helpers = helpers or MigrationHelpers.production()
-            authenticated_owner = None
-            if helpers.capsule_inspect:
-                contexts = [helpers.capsule_inspect(part.capsule)["context"] for part in parts]
-                owners = {context["owner_key_fingerprint_sha256"] for context in contexts}
-                if len(owners) != 1 or any(context["operational_key_fingerprint_sha256"] !=
-                        plan["operational_recipient_spki_sha256"] for context in contexts):
-                    raise MigrationError("Ordered capsule recipients differ from the sealed selected policy")
-                authenticated_owner = owners.pop()
-                if entry.get("owner_recipient_spki_sha256", authenticated_owner) != authenticated_owner:
-                    raise MigrationError("Declared legacy owner recipient differs from authenticated capsule context")
-            aliases = {part["transport_alias"]["plaintext"]["name"]: part["transport_alias"]
-                       for part in entry["parts"] if part.get("transport_alias")}
-            (scratch / "archive").mkdir()
-            (scratch / "parts").mkdir()
-            limits, restore_admission = admit_restore_limits(entry, index, scratch)
-            def open_part(part):
-                value = part.binding
-                return reader.open({"release_repository": value["release_repository"], "release_tag": value["release_tag"],
-                    "release_id": value["release_id"], "asset_id": value["asset_id"], "name": value["asset_name"],
-                    "sha256": value["ciphertext_sha256"], "bytes": value["ciphertext_bytes"]})
-            imported = helpers.archive_import(index_raw, parts, expected_index_sha256=entry["source_index"]["sha256"],
-                expected_repository=slug, expected_repository_id=entry["repository_id"],
-                expected_manifest_sha256=entry["source_manifest"]["sha256"], output_root=scratch / "archive",
-                staging_root=scratch / "parts", open_part=open_part, operational_private_key_path=operational_private_key_path,
-                limits=limits, transport_overrides=aliases or None)
-            if any(path.name != ".collector.lock" for path in working_root.iterdir()):
-                raise MigrationError("Migration requires an empty destination working root")
-            for child in imported.evidence_root.iterdir():
-                if child.name in ("runtime.sqlite3", "runtime.sqlite3-wal", "runtime.sqlite3-shm", "checkpoints", "transfer-catalog.json"):
-                    raise MigrationError("Source archive contains operational state that cannot be adopted as historical jobs")
-                shutil.move(str(child), working_root / child.name)
-            # The importer has authenticated the complete archive closure.
-            # Provisional reports/staging are not another retained working copy.
-            shutil.rmtree(scratch / "archive")
-            source_home = working_root / "imports" / "legacy-source"
-            _create_identical(source_home / "index.json", index_raw)
-            if migration_raw is not None:
-                _create_identical(source_home / "migration-index.json", migration_raw)
-            manifest_path = working_root / entry["source_manifest"]["path"]
-            manifest_raw = manifest_path.read_bytes()
-            git_proof = None
-            git_error = None
-            try:
-                git_proof = helpers.git_import(working_root, manifest_raw, index_raw,
-                    expected_manifest_sha256=entry["source_manifest"]["sha256"],
-                    expected_index_sha256=entry["source_index"]["sha256"], source_context=_source_context(entry),
-                    importer_code_sha=code_sha, imported_at_utc=prior["created_at"])
-            except (ValueError, RuntimeError) as error:
-                git_error = type(error).__name__
-                # Only this provisional copy is removed; historical archives are
-                # untouched, and a future live Git capture starts in an empty mirror.
-                if (working_root / "git").exists():
-                    shutil.rmtree(working_root / "git")
-            api_proof = helpers.api_validate(working_root, manifest_path,
-                expected_manifest_sha256=entry["source_manifest"]["sha256"], source_index_path=source_home / "index.json",
-                expected_index_sha256=entry["source_index"]["sha256"], repository_id=entry["repository_id"],
-                slug=slug, api_version=config.api_version, history_policy=None)
-            if not git_proof and not api_proof["eligible_watermarks"]:
+            imported_seed = import_legacy_seed(plan, entry, code_sha=code_sha, config=config,
+                working_root=working_root, scratch=scratch, reader=reader, helpers=helpers,
+                operational_private_key_path=operational_private_key_path,
+                evidence_public_key_path=evidence_public_key_path, imported_at=prior["created_at"])
+            if imported_seed is None:
                 return record("source_repair_pending", reason_code="no_independently_proven_seed_capability")
-            original = json.loads(manifest_raw)
-            receipt = {"schema_version": 1, "kind": "icsot_legacy_state_import_receipt",
-                "migration_id": plan["migration_id"], "repository_id": entry["repository_id"], "slug": slug,
-                "imported_at": prior["created_at"], "importer_code_sha": code_sha,
-                "source_index": entry["source_index"], "source_manifest_sha256": sha256(manifest_raw),
-                "source_observation_interval": {"started_at": original["started_at"], "finished_at": original["finished_at"]},
-                "source_status": original["status"], "source_mode": original["mode"],
-                "authenticated_parts": imported.parts, "archive_members_sha256": sha256(canonical_json(imported.files)),
-                "cas_inventory_sha256": sha256(canonical_json(imported.cas)),
-                "git_seed_proof": git_proof, "git_repair_reason": git_error, "api_seed_proof": api_proof,
-                "observation_claim": "verified_migration_of_original_evidence_not_a_new_observation"}
-            receipt["derived_artifacts"] = []
-            receipt["derived_artifacts"].append({"path": (source_home / "index.json").relative_to(working_root).as_posix(),
-                "sha256": sha256(index_raw), "bytes": len(index_raw)})
-            if git_proof:
-                descriptor = ObjectStore(working_root).location(_digest(git_proof["descriptor_sha256"]))
-                if _file_digest(descriptor) != git_proof["descriptor_sha256"]:
-                    raise MigrationError("Derived Git archive descriptor differs from verified import")
-                receipt["derived_artifacts"].append({"path": descriptor.relative_to(working_root).as_posix(),
-                    "sha256": git_proof["descriptor_sha256"], "bytes": descriptor.stat().st_size})
-                for key in ("receipt", "index"):
-                    relative = git_proof.get(key + "_path_relative")
-                    if relative:
-                        artifact = working_root / relative
-                        receipt["derived_artifacts"].append({"path": relative, "sha256": sha256(artifact.read_bytes()),
-                                                            "bytes": artifact.stat().st_size})
-            if migration_raw is not None:
-                receipt["derived_artifacts"].append({"path": (source_home / "migration-index.json").relative_to(working_root).as_posix(),
-                    "sha256": sha256(migration_raw), "bytes": len(migration_raw)})
-            receipt_path = working_root / "imports" / "legacy-bootstrap" / (plan["migration_id"] + ".json")
-            _create_identical(receipt_path, canonical_json(receipt))
-            receipt_digest = sha256(receipt_path.read_bytes())
-            queue = PersistentQueue(working_root)
-            commit_legacy_watermarks(queue, receipt_path=receipt_path, root=working_root,
-                manifest_path=manifest_path, source_index_path=source_home / "index.json", entry=entry,
-                api_version=config.api_version, validator=helpers.api_validate)
-            seed = helpers.seed_seal(_seed_fields(entry, imported, receipt_path, working_root, receipt_digest, authenticated_owner))
-            helpers.seed_validate(seed, repository_id=entry["repository_id"], slug=slug, root=working_root,
-                                  source_index=index_raw, migration_index=migration_raw)
-            from .encryption import public_key_fingerprint
-            if public_key_fingerprint(evidence_public_key_path) != seed["owner_recipient_spki_sha256"]:
-                raise StateDeferredError("Legacy evidence recipient differs from configured evidence recipient", reason="evidence_recipient_mismatch")
-            catalog = {"schema_version": 1, "repository_id": entry["repository_id"], "slug": slug,
-                "evidence_recipient_spki_sha256": seed["owner_recipient_spki_sha256"], "exports": [],
-                "legacy_seed_packages": [seed]}
-            _create_identical(working_root / "transfer-catalog.json", canonical_json(catalog))
+            receipt_digest, seed, manifest_raw, original, git_proof, api_proof, imported, restore_admission = (
+                imported_seed[key] for key in ("receipt_digest", "seed", "manifest_raw", "original", "git_proof",
+                                               "api_proof", "imported", "restore_admission"))
             generation = sha256(canonical_json({"migration_id": plan["migration_id"], "repository_id": entry["repository_id"],
                                                "receipt_sha256": receipt_digest}))[:32]
             record("seed_verified", migration_receipt_sha256=receipt_digest, seed_sha256=seed["seed_sha256"])
@@ -1215,11 +1298,19 @@ def operational_pointer_loader(transport):
     head = transport.branch_head()
     if head is None:
         return lambda _: None
-    tree = transport._api(f"repos/{transport.repository}/git/trees/{head}?recursive=1")
+    tree = transport._api(f"repos/{transport.repository}/git/trees/{head}")
     if tree.get("truncated") is not False:
         raise MigrationError("Operational pointer tree is incomplete")
-    present = {item["path"] for item in tree["tree"] if item.get("type") == "blob"}
-    return lambda repo_id: transport.read_pointer(head, repo_id) if f"repos/{repo_id}.json" in present else None
+    subtrees = [item for item in tree["tree"] if item.get("path") == "repos"]
+    if not subtrees:
+        return lambda _: None
+    if len(subtrees) != 1 or subtrees[0].get("type") != "tree":
+        raise MigrationError("Operational pointer subtree is invalid")
+    pointers = transport._api(f"repos/{transport.repository}/git/trees/{subtrees[0]['sha']}")
+    if pointers.get("truncated") is not False:
+        raise MigrationError("Operational pointer subtree is incomplete")
+    present = {item["path"] for item in pointers["tree"] if item.get("type") == "blob"}
+    return lambda repo_id: transport.read_pointer(head, repo_id) if f"{repo_id}.json" in present else None
 
 
 def _publish_plan(transport, ledger, plan: dict, path: Path) -> dict:
@@ -1268,7 +1359,22 @@ def main(argv=None):
             child.add_argument("--rfc3161-chain", type=Path)
     args = parser.parse_args(argv)
     config, sources = load_cohort(args.config, args.csv)
-    transport = GhCliStateTransport(args.destination_repository)
+    limits = DEFAULT_LIMITS
+    if args.command == "run":
+        if not 0 < args.max_runtime_seconds <= 19800:
+            raise MigrationError("Migration runtime must fit the bounded six-hour hosted job")
+        if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != args.code_sha:
+            raise MigrationError("Importer checkout differs from reviewed code commit")
+        plan = read_verified_json(args.plan, args.plan_sha256)
+        if any(plan.get(key) != value for key, value in sources.items()):
+            raise MigrationError("Migration source configuration/CSV changed after planning")
+        entries = [row for row in plan["repositories"] if row["slug"] == args.slug]
+        if len(entries) != 1:
+            raise MigrationError("Select exactly one declared migration source")
+        entry = entries[0]
+        limits = entry.get("repair_resource_limits", entry.get("resource_limits", DEFAULT_LIMITS))
+    transport = BoundedStateTransport(args.destination_repository,
+        evidence_bytes=limits["max_new_evidence_ciphertext_bytes"], state_bytes=MIGRATION_STATE_CIPHERTEXT_CAP)
     reader, ledger = GitHubSourceReader(), GitHubMigrationLedger(transport)
     if args.command == "plan":
         if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != args.code_sha:
@@ -1296,34 +1402,44 @@ def main(argv=None):
             _create_identical(args.output, raw)
         else:
             plan, plan_ref = None, None
-        matrix = backlog_matrix(plan, pointer_loader=operational_pointer_loader(transport), ledger=ledger) if plan else {"include": []}
+        summary = (backlog_plan(plan, pointer_loader=operational_pointer_loader(transport), ledger=ledger) if plan else
+                   {"status": "no_active_migration", "migration_complete": False, "cohort_count": len(config.repositories),
+                    "counts": {}, "blocked_count": 0, "blocked_reason_counts": {}, "repositories": [], "matrix": {"include": []}})
+        matrix = summary["matrix"]
+        _create_identical(args.output.with_suffix(".backlog.json"), canonical_json(summary))
         outputs = {"matrix": json.dumps(matrix, separators=(",", ":")), "planned_count": len(matrix["include"]),
                    "plan_sha256": plan_ref["sha256"] if plan_ref else "", "plan_ref": json.dumps(plan_ref, separators=(",", ":")),
-                   "code_sha": plan["code_sha"] if plan else args.code_sha}
+                   "code_sha": plan["code_sha"] if plan else args.code_sha,
+                   "blocked_count": summary["blocked_count"], "planning_status": summary["status"]}
         if args.github_output:
             with args.github_output.open("a") as output:
                 for key, value in outputs.items():
                     output.write(f"{key}={value}\n")
-        print(json.dumps({"status": "planned" if plan else "no_active_migration", "selected": outputs["planned_count"],
-                          "cohort_count": len(config.repositories), "cold_bootstrap_throttle": None}, indent=2))
+        public_summary = {key: summary[key] for key in ("status", "migration_complete", "cohort_count", "counts",
+                                                       "blocked_count", "blocked_reason_counts")}
+        public_summary.update(selected=outputs["planned_count"], cold_bootstrap_throttle=None,
+                              destination_github_api_requests_total=transport.request_count,
+                              destination_github_graphql_api_requests_total=transport.graphql_request_count,
+                              destination_accounting_scope="this_process_shared_destination_transport_only")
+        rendered = json.dumps(public_summary, indent=2)
+        print(rendered)
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+                output.write("\nMigration planning summary\n\n```json\n" + rendered + "\n```\n")
         return 0
-    if not 0 < args.max_runtime_seconds <= 19800:
-        raise MigrationError("Migration runtime must fit the bounded six-hour hosted job")
-    if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != args.code_sha:
-        raise MigrationError("Importer checkout differs from reviewed code commit")
-    plan = read_verified_json(args.plan, args.plan_sha256)
-    if any(plan.get(key) != value for key, value in sources.items()):
-        raise MigrationError("Migration source configuration/CSV changed after planning")
-    entry = next(row for row in plan["repositories"] if row["slug"] == args.slug)
     with tempfile.TemporaryDirectory(prefix=f"icsot-legacy-import-{entry['repository_id']}-") as temporary:
         result = initialize_repository(plan, args.slug, code_sha=args.code_sha, config=config,
             destination_repository=args.destination_repository, operational_private_key_path=args.state_private_key,
             state_public_key_path=args.state_public_key, evidence_public_key_path=args.evidence_public_key,
             working_root=Path(f"/tmp/icsot-persistent-state/{entry['repository_id']}").resolve(),
-            scratch=Path(temporary), reader=reader, ledger=ledger,
+            scratch=Path(temporary), reader=reader, ledger=ledger, transport=transport,
             max_runtime_seconds=args.max_runtime_seconds,
             rfc3161_options={"rfc3161_url": args.rfc3161_url, "rfc3161_ca": args.rfc3161_ca,
                              "rfc3161_chain": args.rfc3161_chain})
+    result.update(destination_github_api_requests_total=transport.request_count,
+                  destination_github_graphql_api_requests_total=transport.graphql_request_count,
+                  destination_github_rest_api_requests_total=transport.request_count - transport.graphql_request_count,
+                  destination_accounting_scope="this_process_shared_destination_transport_only")
     _create_identical(args.output, canonical_json(result))
     print(json.dumps(result, indent=2))
     return 0 if result["disposition"] == "state_published" else 75 if result["disposition"] == "deferred" else 2

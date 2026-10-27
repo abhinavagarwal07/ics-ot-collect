@@ -89,7 +89,7 @@ class FakeGitHub:
         contents = self.assets.get((tag, name))
         if contents is None:
             return None
-        return {"id": 1, "name": name, "size": len(contents),
+        return {"id": 1, "name": name, "size": len(contents), "state": "uploaded",
                 "digest": "sha256:" + hashlib.sha256(contents).hexdigest()}
 
 

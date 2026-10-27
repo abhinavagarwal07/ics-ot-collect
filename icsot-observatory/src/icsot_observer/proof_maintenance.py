@@ -1,7 +1,9 @@
 """Bounded public OTS refresh, independent of collection and encrypted state.
 
-``collector-attestations:state.json`` stores the discovery cursor and pending
-queue; per-catalog/per-proof Git files retain metadata history. Immutable Release assets are uploaded before
+``collector-state`` atomically retains immutable registration-outbox nodes with
+each published state pointer. ``collector-attestations:state.json`` stores their
+bounded traversal cursors and pending attempt queue; per-catalog/per-proof Git
+files retain metadata history. Immutable Release assets are uploaded before
 a non-forced branch CAS; failed CAS attempts leave safe, reusable orphan assets.
 Release ordering and numeric IDs are not used as an exclusion high-water mark:
 page one plus a durable, bounded rolling scan eventually finds older-positioned
@@ -28,17 +30,33 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .attestations import MAX_RECEIPT_BYTES, inspect_ots_receipt, publish_ots_attestation
-from .core import canonical_json, sha256, utc_iso
-from .github_state import GhCliStateTransport, StateConflictError, StateDeferredError, StateError
+from .core import REPO_RE, canonical_json, sha256, utc_iso
+from .github_state import GhCliStateTransport, StateConflictError, StateDeferredError, StateError, _slug_binding
 
 BRANCH = "collector-attestations"
 MARKER = "metadata-catalog.json"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_INCOMPLETE_RELEASES = 4096
+MAX_PENDING_PROOFS = 4096
+MAX_OUTBOX_NODE_BYTES = 4096
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\Z")
 OBSERVATION = re.compile(
     r"(?:collector-observations-r[1-9][0-9]*-g[0-9a-f]{32}|corpus-baseline-[0-9]+-[0-9]+)\Z")
+
+
+class ProofQueueCapacityError(ValueError):
+    """Valid registration remains in its durable outbox until attempts drain."""
+
+
+def _outbox_ref(value: Any) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"sha256", "bytes"} or \
+            not isinstance(value.get("sha256"), str) or not HASH.fullmatch(value["sha256"]) or \
+            type(value.get("bytes")) is not int or not 0 < value["bytes"] <= MAX_OUTBOX_NODE_BYTES:
+        raise ValueError("Invalid public proof outbox reference")
+    return dict(value)
 
 
 def _json(raw: bytes) -> dict:
@@ -84,6 +102,55 @@ class ProofTransport(GhCliStateTransport):
         if not re.fullmatch(r"(?:catalogs|proofs)/[0-9a-f]{64}\.json", path):
             raise ValueError("Invalid public proof record path")
         return self._read_git_file(head, path) if head else None
+
+    def outbox_repositories(self) -> tuple[str | None, list[int]]:
+        """Freeze public state and list only its bounded pointer directory.
+
+        Never recursively enumerate the append-only outbox history. A truncated
+        Git tree is an error, not permission to forget unlisted repositories.
+        """
+        head = self.branch_head()
+        if head is None:
+            return None, []
+        root = self._api(f"repos/{self.repository}/git/trees/{head}")
+        if root.get("truncated") is not False or not isinstance(root.get("tree"), list):
+            raise ValueError("Incomplete public state root tree")
+        matches = [entry for entry in root["tree"] if entry.get("path") == "repos"]
+        if not matches:
+            return head, []
+        if len(matches) != 1 or matches[0].get("type") != "tree":
+            raise ValueError("Invalid public state pointer directory")
+        tree = self._api(f"repos/{self.repository}/git/trees/{matches[0]['sha']}")
+        if tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
+            raise ValueError("Incomplete public state pointer tree")
+        identifiers = []
+        for entry in tree["tree"]:
+            if entry.get("type") != "blob" or not re.fullmatch(r"[1-9][0-9]*\.json", entry.get("path", "")):
+                raise ValueError("Invalid public state pointer path")
+            identifiers.append(int(entry["path"][:-5]))
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("Duplicate public state pointer")
+        return head, sorted(identifiers)
+
+    def outbox_head(self, head: str, repository_id: int) -> tuple[str, dict | None]:
+        raw = self.read_pointer(head, repository_id)
+        if raw is None:
+            raise ValueError("Public state pointer disappeared at frozen head")
+        pointer = _json(raw)
+        slug = pointer.get("slug")
+        if type(pointer.get("repository_id")) is not int or pointer["repository_id"] != repository_id or \
+                not isinstance(slug, str) or not REPO_RE.fullmatch(slug):
+            raise ValueError("Public proof outbox source identity differs")
+        if self.read_slug_binding(head, slug) != canonical_json(_slug_binding(slug, repository_id)):
+            raise ValueError("Public proof outbox source slug binding differs")
+        return slug, _outbox_ref(pointer.get("proof_outbox"))
+
+    def outbox_node(self, head: str, repository_id: int, ref: dict) -> bytes:
+        ref = _outbox_ref(ref)
+        raw = self._read_git_file(head, f"proof-outbox/{repository_id}/{ref['sha256']}.json")
+        if raw is None or len(raw) != ref["bytes"] or sha256(raw) != ref["sha256"]:
+            raise ValueError("Public proof outbox node is missing or differs")
+        return raw
 
     def save(self, parent: str | None, state: dict, records: dict[str, bytes] | None = None) -> str:
         raw = canonical_json(state)
@@ -320,13 +387,12 @@ class BitcoinCoreVerifier:
         raise RuntimeError("No Bitcoin attestation was verified by trusted RPC")
 
 
-def _enqueue_marker(state: dict, marker: dict, tag: str, transport: Any, now: str,
-                    head: str | None) -> tuple[dict[str, bytes], list[str]]:
+def _marker_entries(marker: dict, tag: str, transport: Any) -> list[dict]:
+    """Validate public bindings without reading or mutating either queue."""
     if marker.get("schema_version") != 1 or marker.get("kind") != "icsot_evidence_metadata_catalog" or \
             marker.get("generation_release") != tag or not isinstance(marker.get("observations"), list):
         raise ValueError("Invalid observation completion marker")
-    records = {}
-    proof_keys = []
+    entries = []
     for observation in marker["observations"]:
         index_ref = _ref(observation["index"])
         if index_ref["release_tag"] != tag or not index_ref["name"].endswith(".index.json"):
@@ -344,6 +410,18 @@ def _enqueue_marker(state: dict, marker: dict, tag: str, transport: Any, now: st
         if metadata != evidence["metadata"] or metadata.get("subject_sha256") != subject or \
                 any(metadata.get("receipt", {}).get(k) != proof_ref[k] for k in ("name", "sha256", "bytes")):
             raise ValueError("Public proof metadata subject or receipt differs from index")
+        inspect_ots_receipt(transport.fetch(proof_ref), subject)
+        entries.append({"subject_sha256": subject, "proof": proof_ref, "metadata": metadata_ref,
+                        "status": metadata["status"]})
+    return entries
+
+
+def _enqueue_marker(state: dict, marker: dict, tag: str, transport: Any, now: str,
+                    head: str | None) -> tuple[dict[str, bytes], list[str]]:
+    entries = _marker_entries(marker, tag, transport)
+    records, proof_keys = {}, []
+    for entry in entries:
+        subject, metadata_ref, proof_ref = entry["subject_sha256"], entry["metadata"], entry["proof"]
         key = metadata_ref["sha256"]
         proof_keys.append(key)
         prior = transport.record(head, f"proofs/{key}.json")
@@ -357,13 +435,40 @@ def _enqueue_marker(state: dict, marker: dict, tag: str, transport: Any, now: st
             continue
         # Initial public metadata never substitutes for our configured RPC check.
         if key not in state["pending"]:
-            state["pending"][key] = {"subject_sha256": subject, "proof": proof_ref, "metadata": metadata_ref,
-                "status": metadata["status"], "discovered_at": now, "attempts": 0, "next_attempt_after": 0}
+            state["pending"][key] = {**entry, "discovered_at": now, "attempts": 0, "next_attempt_after": 0}
         records[f"proofs/{key}.json"] = canonical_json({"schema_version": 1, "subject_sha256": subject,
-            "history": [{"proof": proof_ref, "metadata": metadata_ref, "status": metadata["status"]}]})
-    if len(state["pending"]) > 4096:
-        raise ValueError("Public proof queue capacity reached; registration must be retried")
+            "history": [{"proof": proof_ref, "metadata": metadata_ref, "status": entry["status"]}]})
+    if len(state["pending"]) > MAX_PENDING_PROOFS:
+        raise ProofQueueCapacityError("Public proof queue capacity reached; registration must be retried")
     return records, sorted(set(proof_keys))
+
+
+def validate_catalog(transport: Any, ref: dict) -> dict:
+    """Validate immutable public evidence independently of proof queue capacity.
+
+    The caller must atomically publish the returned descriptor to its public
+    state outbox. This read-only result is neither registration nor verification.
+    """
+    original_transport = None
+    if isinstance(transport, GhCliStateTransport) and not isinstance(transport, ProofTransport):
+        original_transport = transport
+        transport = ProofTransport(transport.repository, runner=transport.runner,
+            rate_reserve=transport.rate_reserve, transient_retries=transport.transient_retries,
+            clock=transport.clock)
+        original_transport.copy_runtime_state_to(transport)
+    try:
+        ref = _ref(ref)
+        if ref["name"] != MARKER or not OBSERVATION.fullmatch(ref["release_tag"]):
+            raise ValueError("Invalid public proof completion marker descriptor")
+        raw = transport.fetch(ref)
+        if len(raw) != ref["bytes"] or sha256(raw) != ref["sha256"]:
+            raise ValueError("Catalog validation bytes differ from verified descriptor")
+        entries = _marker_entries(_json(raw), ref["release_tag"], transport)
+        return {"status": "registration_pending", "catalog_key": ref["sha256"],
+                "proofs_in_catalog": len({entry["metadata"]["sha256"] for entry in entries})}
+    finally:
+        if original_transport is not None:
+            transport.copy_runtime_state_to(original_transport)
 
 
 def _register_loaded(transport: Any, head: str | None, state: dict, ref: dict,
@@ -388,12 +493,13 @@ def _register_loaded(transport: Any, head: str | None, state: dict, ref: dict,
 
 
 def register_catalog(transport: Any, ref: dict) -> dict:
-    """Durably register a remotely verified completion marker before state CAS.
+    """Durably register a remotely verified completion marker for maintenance.
 
     Accept a normal ``GhCliStateTransport`` or ``ProofTransport`` and a public
     descriptor {release_tag,name,sha256,bytes}. No encrypted state is inspected.
     Registration is idempotent, retries only branch conflicts (at most three),
-    and raises on rate deferral so the collector keeps its old selected state.
+    and raises on rate deferral. Capture uses the atomic public state outbox
+    instead; daily discovery checkpoints this registration with its cursor.
     """
     original_transport = None
     if isinstance(transport, GhCliStateTransport) and not isinstance(transport, ProofTransport):
@@ -463,6 +569,89 @@ def requeue_catalog(transport: Any, catalog_sha256: str, *, max_proofs: int = 12
             "next_after_proof_key": selected[-1] if len(keys) > len(selected) else None}
 
 
+def _discover_outbox(transport: Any, head: str | None, state: dict, report: dict,
+                     *, max_nodes: int, started: float, runtime_seconds: float, clock: Callable) -> dict[str, bytes]:
+    """Walk immutable snapshot chains fairly; CAS their cursors with registrations.
+
+    One bounded inspection per repository turn prevents a growing repository
+    from starving its peers. Finish the captured chain before selecting a newer
+    head, so continued captures cannot continually displace older registrations.
+    """
+    if not hasattr(transport, "outbox_repositories"):
+        return {}
+    source_head, identifiers = transport.outbox_repositories()
+    report["outbox_repositories_total"] = len(identifiers)
+    discovery = state["discovery"].setdefault("proof_outbox", {"repositories": {}, "last_repository_id": 0})
+    rows = discovery["repositories"]
+    last = discovery["last_repository_id"]
+    if not isinstance(rows, dict) or type(last) is not int or last < 0:
+        raise ValueError("Invalid public proof outbox discovery checkpoint")
+    ordered = [identifier for identifier in identifiers if identifier > last] + [
+        identifier for identifier in identifiers if identifier <= last]
+    records = {}
+    for repository_id in ordered[:max_nodes]:
+        if clock() - started >= runtime_seconds:
+            break
+        discovery["last_repository_id"] = repository_id
+        report["outbox_repositories_inspected"] += 1
+        row = rows.setdefault(str(repository_id), {"completed_head": None, "cursor": None})
+        if not isinstance(row, dict):
+            raise ValueError("Invalid public proof outbox repository checkpoint")
+        try:
+            slug, latest = transport.outbox_head(source_head, repository_id)
+            if row.get("slug", slug) != slug:
+                raise ValueError("Public proof outbox repository slug changed")
+            row["slug"] = slug
+            if row["cursor"] is None:
+                if latest is None or latest == row["completed_head"]:
+                    continue
+                row.update(target=latest, stop=row["completed_head"], cursor=latest)
+            cursor = _outbox_ref(row["cursor"])
+            raw = transport.outbox_node(source_head, repository_id, cursor)
+            if len(raw) != cursor["bytes"] or sha256(raw) != cursor["sha256"]:
+                raise ValueError("Public proof outbox node digest or size differs")
+            node = _json(raw)
+            if node.get("schema_version") != 1 or node.get("kind") != "icsot_public_proof_outbox" or \
+                    type(node.get("repository_id")) is not int or node["repository_id"] != repository_id or \
+                    node.get("slug") != slug or \
+                    not isinstance(node.get("generation"), str) or not re.fullmatch(r"[0-9a-f]{32}", node["generation"]):
+                raise ValueError("Public proof outbox node source identity differs")
+            created_at = node.get("created_at")
+            if not isinstance(created_at, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", created_at):
+                raise ValueError("Public proof outbox node requires original UTC creation time")
+            datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            row["pending_node_created_at"] = created_at
+            previous = _outbox_ref(node.get("previous"))
+            if previous == cursor or (previous is None and row["stop"] is not None):
+                raise ValueError("Public proof outbox chain does not reach its checkpoint")
+            catalog = _ref(node.get("catalog"))
+            if catalog["name"] != MARKER or not re.fullmatch(
+                    rf"collector-observations-r{repository_id}-g[0-9a-f]{{32}}", catalog["release_tag"]):
+                raise ValueError("Public proof outbox catalog source identity differs")
+            registered, _ = _register_loaded(transport, head, state, catalog)
+            records.update(registered)
+            report["outbox_nodes_registered"] += 1
+            row["cursor"] = previous
+            row.pop("pending_node_created_at", None)
+            row.pop("last_error", None)
+            if previous == row["stop"]:
+                row["completed_head"] = row.pop("target")
+                row.pop("stop")
+                row["cursor"] = None
+        except StateDeferredError:
+            raise
+        except ProofQueueCapacityError:
+            row["last_error"] = "proof_attempt_queue_full"
+            report["outbox_registration_paused_at_capacity"] = True
+        except (ValueError, KeyError, TypeError, StateError):
+            # A malformed/missing node is never acknowledged. Preserve its
+            # cursor and continue draining valid, already queued receipts.
+            row["last_error"] = "invalid_public_outbox_or_metadata"
+            report["outbox_invalid_registrations"] += 1
+    report["outbox_repositories_uninspected"] = len(identifiers) - report["outbox_repositories_inspected"]
+    return records
+
+
 def refresh(transport: Any, *, client: OtsClient | None = None, verifier: BitcoinCoreVerifier | None = None,
             max_proofs: int = 128, max_pages: int = 2, page_size: int = 30, max_markers: int = 12,
             runtime_seconds: float = 1200, clock: Callable = time.time) -> dict:
@@ -474,18 +663,34 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
     started = clock()
     report = {"schema_version": 1, "status": "complete", "proofs_attempted": 0, "proofs_changed": 0,
               "proofs_verified": 0, "proofs_deferred": 0, "discovery_pages": 0, "markers_processed": 0,
-              "proofs_awaiting_trusted_rpc_archived": 0, "discovery_paused_at_capacity": False}
+              "proofs_awaiting_trusted_rpc_archived": 0, "discovery_paused_at_capacity": False,
+              "outbox_repositories_inspected": 0, "outbox_nodes_registered": 0,
+              "outbox_repositories_total": None, "outbox_repositories_uninspected": None,
+              "outbox_invalid_registrations": 0, "outbox_registration_paused_at_capacity": False,
+              "outbox_inspection_limit": max_markers, "legacy_marker_inspection_limit": max_markers}
     head, state = transport.load()
     committed_state = copy.deepcopy(state)
     try:
         if hasattr(transport, "publication_budget"):
-            transport.publication_budget(30 + max_markers * 8 + min(max_proofs, 8) * 22)
+            transport.publication_budget(30 + max_markers * 20 + min(max_proofs, 8) * 22)
         original = canonical_json(state)
         discovery = state["discovery"]
+        outbox_trial = copy.deepcopy(state)
+        try:
+            registration_records = _discover_outbox(transport, head, outbox_trial, report, max_nodes=max_markers,
+                started=started, runtime_seconds=runtime_seconds, clock=clock)
+        except StateDeferredError:
+            raise
+        except (ValueError, KeyError, TypeError, StateError):
+            registration_records = {}
+            report["outbox_nodes_registered"] = 0
+            report["outbox_invalid_registrations"] += 1
+        else:
+            state = outbox_trial
+            discovery = state["discovery"]
         # A recent page plus a persistent rolling historical cursor. IDs dedupe,
         # but never determine whether subsequent pages may contain new releases.
         seen = set(discovery["recent_release_ids"])
-        registration_records = {}
         queued = {item["id"] for item in discovery["incomplete_releases"]}
         for step in range(max_pages):
             if clock() - started >= runtime_seconds:
@@ -528,6 +733,11 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
             except StateDeferredError:
                 discovery["incomplete_releases"].insert(0, candidate)
                 raise
+            except ProofQueueCapacityError:
+                candidate["last_error"] = "proof_attempt_queue_full"
+                discovery["incomplete_releases"].append(candidate)
+                report["discovery_paused_at_capacity"] = True
+                continue
             except (ValueError, KeyError, TypeError):
                 candidate["last_error"] = "invalid_public_metadata"
                 discovery["incomplete_releases"].append(candidate)
@@ -651,8 +861,23 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
                   github_requests=getattr(transport, "request_count", 0))
     report["due_proofs"] = sum(item["next_attempt_after"] <= clock() for item in state["pending"].values())
     report["runtime_seconds"] = round(max(0, clock() - started), 3)
-    report["discovery_coverage"] = "recent_page_plus_bounded_rolling_history; direct_registration_is_primary"
-    if report["status"] == "complete" and (report["pending_proofs"] or report["incomplete_releases"]):
+    checkpoint = state["discovery"].get("proof_outbox", {})
+    outboxes = checkpoint.get("repositories", {}) if isinstance(checkpoint, dict) else {}
+    outboxes = {key: row for key, row in outboxes.items() if isinstance(row, dict)} if isinstance(outboxes, dict) else {}
+    report["outbox_pending_catalogs_lower_bound"] = sum(row.get("cursor") is not None for row in outboxes.values())
+    report["outbox_backlog_count_complete"] = False
+    pending_dates = [row["pending_node_created_at"] for row in outboxes.values()
+                     if isinstance(row.get("pending_node_created_at"), str)]
+    report["oldest_inspected_pending_outbox_at"] = min(pending_dates, default=None)
+    report["outbox_backlog_age_complete"] = False
+    report["oldest_pending_proof_discovered_at"] = min(
+        (item.get("discovered_at") for item in state["pending"].values() if item.get("discovered_at")), default=None)
+    report["discovery_coverage"] = "atomic_state_outbox_with_bounded_checkpoint_walk; rolling_release_scan_for_legacy_and_orphans"
+    report["maintenance_cadence"] = "daily; bounded attempts do not guarantee proof completion within 24 hours"
+    if report["status"] == "complete" and (report["pending_proofs"] or report["incomplete_releases"] or
+                                            report["outbox_pending_catalogs_lower_bound"] or
+                                            report["outbox_repositories_uninspected"] or
+                                            report["outbox_invalid_registrations"]):
         report["status"] = "backlog"
     return report
 

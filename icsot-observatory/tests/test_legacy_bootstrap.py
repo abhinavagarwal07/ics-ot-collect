@@ -1,4 +1,5 @@
 import copy
+import base64
 import errno
 import json
 import subprocess
@@ -13,7 +14,7 @@ from icsot_observer.core import Config, canonical_json, sha256, write_once
 from icsot_observer.github_state import StateDeferredError
 from icsot_observer.legacy_api import validate_legacy_api_seed
 from icsot_observer.legacy_bootstrap import (
-    MigrationError, MigrationHelpers, backlog_matrix, build_migration_plan,
+    GitHubMigrationLedger, MigrationError, MigrationHelpers, backlog_matrix, backlog_plan, build_migration_plan,
     commit_legacy_watermarks, initialize_repository, migration_id, validate_catalog,
 )
 from icsot_observer.legacy_seed_catalog import seal_legacy_seed, validate_legacy_seed
@@ -167,6 +168,241 @@ def test_backlog_keeps_every_unfinished_source_and_does_not_reapply_cold_two(tmp
     assert {row["repository_id"] for row in matrix["include"]} == set(range(2, 21)) - {3}
 
 
+def test_backlog_holds_survive_repeated_planning_and_current_pointers_win(tmp_path):
+    cfg = config(tmp_path, 185)
+    plan, ledger = plan_for(cfg), Ledger()
+    holds = {
+        1: {"external_recovery_required": True, "reason_code": "prepared_state_unavailable_after_runner_loss"},
+        2: {"prepared_generation": "a" * 32},
+        3: {"fresh_capture_attempt_started": True},
+        4: {"disposition": "source_repair_pending", "reason_code": "LegacySeedError"},
+        5: {"disposition": "state_published"},
+        6: {"fresh_capture_publication_started": True},
+    }
+    for repo_id, fields in holds.items():
+        ledger.write({"migration_id": plan["migration_id"], "repository_id": repo_id,
+                      "disposition": "deferred", **fields})
+    plan["repositories"][6]["disposition"] = "source_repair_pending"
+    before = copy.deepcopy(ledger.records)
+    def pointers(repo_id):
+        return canonical_json({"repository_id": repo_id, "slug": cfg.repositories[repo_id - 1]}) if repo_id in (3, 7) else None
+    first = backlog_plan(plan, pointer_loader=pointers, ledger=ledger)
+    second = backlog_plan(plan, pointer_loader=pointers, ledger=ledger)
+    assert first == second and ledger.records == before and len(ledger.writes) == len(holds)
+    assert first["cohort_count"] == len(first["repositories"]) == 185
+    assert first["counts"] == {"blocked": 5, "already_operational": 2, "eligible": 178}
+    assert first["blocked_count"] == 5 and first["migration_complete"] is False
+    assert first["blocked_reason_counts"]["authoritative_state_missing"] == 1
+    assert first["blocked_reason_counts"]["LegacySeedError"] == 1
+    assert {row["repository_id"] for row in first["matrix"]["include"]} == set(range(8, 186))
+
+
+def test_all_blocked_targets_are_reported_as_incomplete_with_no_jobs(tmp_path):
+    cfg = config(tmp_path, 3)
+    plan, ledger = plan_for(cfg), Ledger()
+    for repo_id in range(1, 4):
+        ledger.write({"migration_id": plan["migration_id"], "repository_id": repo_id,
+                      "disposition": "deferred", "prepared_generation": "a" * 32})
+    result = backlog_plan(plan, pointer_loader=lambda _: None, ledger=ledger)
+    assert result["status"] == "blocked" and result["migration_complete"] is False
+    assert result["matrix"] == {"include": []} and result["blocked_count"] == 3
+    assert result["blocked_reason_counts"] == {"prepared_generation_requires_reviewed_recovery": 3}
+
+
+def test_ledger_batch_freezes_one_head_while_later_head_changes():
+    class MovingTransport:
+        repository = "owner/collector"
+        def __init__(self):
+            self.calls, self.head_reads = [], 0
+        def _api(self, endpoint, **options):
+            self.calls.append(endpoint)
+            if "/git/ref/" in endpoint:
+                self.head_reads += 1
+                return {"object": {"sha": str(self.head_reads) * 40}}
+            repo_id = int(endpoint.split("/repos/")[-1].split(".json")[0])
+            raw = canonical_json({"repository_id": repo_id, "snapshot": endpoint.split("?ref=")[1]})
+            return {"type": "file", "encoding": "base64", "content": base64.b64encode(raw).decode()}
+    transport = MovingTransport()
+    ledger = GitHubMigrationLedger(transport)
+    records = ledger.read_many("a" * 64, range(1, 186))
+    assert len(records) == 185 and transport.head_reads == 1
+    assert {row["snapshot"] for row in records.values()} == {"1" * 40}
+    assert ledger.read("a" * 64, 1)["snapshot"] == "2" * 40
+
+
+def test_backlog_reads_only_missing_pointer_dispositions_in_one_batch(tmp_path):
+    cfg = config(tmp_path, 185)
+    plan = plan_for(cfg)
+    class BatchLedger:
+        def __init__(self):
+            self.batches = []
+        def read(self, *args):
+            pytest.fail("Planner performed a per-row mutable-head ledger read")
+        def read_many(self, identifier, repo_ids):
+            self.batches.append((identifier, tuple(repo_ids)))
+            return {repo_id: {"disposition": "deferred", "external_recovery_required": True} for repo_id in repo_ids}
+    ledger = BatchLedger()
+    def pointers(repo_id):
+        return canonical_json({"repository_id": repo_id, "slug": cfg.repositories[repo_id - 1]}) if repo_id <= 174 else None
+    result = backlog_plan(plan, pointer_loader=pointers, ledger=ledger)
+    assert ledger.batches == [(plan["migration_id"], tuple(range(175, 186)))]
+    assert result["counts"] == {"already_operational": 174, "blocked": 11}
+    assert result["status"] == "blocked" and result["migration_complete"] is False
+
+
+def test_seed_error_reports_exact_inner_predicate_without_exception_text():
+    from icsot_observer.legacy_bootstrap import safe_error_location
+    from icsot_observer.legacy_seed_catalog import LegacySeedError, _asset
+    with pytest.raises(LegacySeedError) as caught:
+        _asset({"name": "proof", "bytes": 1, "sha256": "PRIVATE_ARBITRARY_TEXT"})
+    location = safe_error_location(caught.value)
+    assert location["module"] == "legacy_seed_catalog.py" and location["function"] == "_hash"
+    assert type(location["line"]) is int and location["line"] > 0
+    assert set(location) == {"module", "function", "line"}
+    assert "PRIVATE_ARBITRARY_TEXT" not in canonical_json(location).decode()
+
+
+@pytest.mark.parametrize("strategy", ["legacy_seed", "fresh_repair"])
+def test_cli_shares_bounded_destination_transport_and_counts_ledger_requests(tmp_path, monkeypatch, strategy):
+    from icsot_observer import legacy_bootstrap
+    from icsot_observer.recurrence import BoundedStateTransport
+    cfg = config(tmp_path / "working", 1)
+    plan = plan_for(cfg)
+    entry = plan["repositories"][0]
+    entry.update(strategy=strategy, **{("repair_resource_limits" if strategy == "fresh_repair" else "resource_limits"):
+                                     {"max_new_evidence_ciphertext_bytes": 123456}})
+    plan_raw = canonical_json(plan)
+    plan_path, outcome = tmp_path / "plan.json", tmp_path / "outcome.json"
+    plan_path.write_bytes(plan_raw)
+    commands, transports = [], []
+    source_reader = object()
+    def runner(command, **options):
+        commands.append(command)
+        endpoint = command[2]
+        if "/git/ref/" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=canonical_json({"object": {"sha": "a" * 40}}), stderr=b"")
+        if "/contents/" in endpoint:
+            return SimpleNamespace(returncode=1, stdout=b"HTTP/2 404 Not Found\r\n\r\n{}", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"{}", stderr=b"")
+    def transport_factory(repository, **options):
+        value = BoundedStateTransport(repository, runner=runner, **options)
+        transports.append(value)
+        return value
+    def initialize(*args, **options):
+        destination = options["transport"]
+        assert options["ledger"].transport is destination
+        assert options["reader"] is source_reader
+        assert destination.upload_limits == {"evidence": 123456, "state": 8 * 1024 ** 3}
+        assert options["ledger"].read(plan["migration_id"], 1) is None
+        destination._api("repos/owner/collector/releases")
+        return {"disposition": "deferred", "reason_code": "explicit_mocked_destination_failure"}
+    monkeypatch.setattr(legacy_bootstrap, "load_cohort", lambda *args: (cfg, sources(1)))
+    monkeypatch.setattr(legacy_bootstrap.subprocess, "check_output", lambda *args, **options: CODE)
+    monkeypatch.setattr(legacy_bootstrap, "BoundedStateTransport", transport_factory)
+    monkeypatch.setattr(legacy_bootstrap, "GitHubSourceReader", lambda: source_reader)
+    monkeypatch.setattr(legacy_bootstrap, "initialize_repository", initialize)
+    result = legacy_bootstrap.main(["run", "--config", str(tmp_path / "config"), "--csv", str(tmp_path / "csv"),
+        "--destination-repository", "owner/collector", "--output", str(outcome), "--plan", str(plan_path),
+        "--plan-sha256", sha256(plan_raw), "--slug", cfg.repositories[0], "--code-sha", CODE,
+        "--state-private-key", str(tmp_path / "unused-private"), "--state-public-key", str(tmp_path / "unused-public"),
+        "--evidence-public-key", str(tmp_path / "unused-evidence")])
+    value = json.loads(outcome.read_bytes())
+    assert result == 75 and len(transports) == 1 and len(commands) == 3
+    assert value["destination_github_api_requests_total"] == value["destination_github_rest_api_requests_total"] == 3
+    assert value["destination_github_graphql_api_requests_total"] == 0
+    assert value["destination_accounting_scope"] == "this_process_shared_destination_transport_only"
+
+
+def test_manual_initializer_queues_with_recurring_collection_under_shared_worker_limit():
+    root = Path(__file__).resolve().parents[2]
+    initializer = (root / ".github/workflows/baseline-state-initialize.yml").read_text()
+    recurring = (root / ".github/workflows/corpus-incremental.yml").read_text()
+    pilot = (root / ".github/workflows/persistent-selected.yml").read_text()
+    assert "  schedule:" not in initializer and "  workflow_dispatch:" in initializer
+    assert "cron: '17 */6 * * *'" in recurring
+    for workflow in (initializer, recurring, pilot):
+        concurrency = workflow.split("\nconcurrency:\n", 1)[1].split("\ndefaults:\n", 1)[0]
+        assert "  group: persistent-collection\n" in concurrency
+        assert "  cancel-in-progress: false\n" in concurrency and "  queue: max\n" in concurrency
+    for workflow in (initializer, recurring):
+        assert "      max-parallel: 8\n" in workflow
+    assert "${{ steps.plan.outputs.blocked_count }}" in initializer
+    assert "${{ steps.plan.outputs.planning_status }}" in initializer
+
+
+def test_planner_cli_reports_blocked_cohort_without_false_completion(tmp_path, monkeypatch, capsys):
+    from icsot_observer import legacy_bootstrap
+    cfg = config(tmp_path / "working", 185)
+    plan = plan_for(cfg)
+    raw = canonical_json(plan)
+    destination = SimpleNamespace(request_count=0, graphql_request_count=0)
+    class HeldLedger:
+        def __init__(self, transport):
+            assert transport is destination
+        def active_plan(self):
+            destination.request_count += 1
+            return {"plan": ref("plan.json", raw)}
+        def read_many(self, identifier, repo_ids):
+            destination.request_count += len(repo_ids) + 1
+            return {repo_id: {"disposition": "deferred", "prepared_generation": "a" * 32} for repo_id in repo_ids}
+        def write(self, *args):
+            pytest.fail("Planning rewrote an unchanged recovery hold")
+    class Reader:
+        def metadata(self, reference):
+            assert reference["sha256"] == sha256(raw)
+            return raw
+    plan_path, outputs, summary = tmp_path / "migration.json", tmp_path / "outputs", tmp_path / "summary"
+    monkeypatch.setattr(legacy_bootstrap, "load_cohort", lambda *args: (cfg, sources(185)))
+    monkeypatch.setattr(legacy_bootstrap.subprocess, "check_output", lambda *args, **options: CODE)
+    monkeypatch.setattr(legacy_bootstrap, "BoundedStateTransport", lambda *args, **options: destination)
+    monkeypatch.setattr(legacy_bootstrap, "GitHubMigrationLedger", HeldLedger)
+    monkeypatch.setattr(legacy_bootstrap, "GitHubSourceReader", Reader)
+    monkeypatch.setattr(legacy_bootstrap, "operational_pointer_loader", lambda transport: lambda _: None)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert legacy_bootstrap.main(["plan", "--config", str(tmp_path / "config"), "--csv", str(tmp_path / "csv"),
+        "--destination-repository", "owner/collector", "--code-sha", CODE,
+        "--output", str(plan_path), "--github-output", str(outputs)]) == 0
+    public = json.loads(capsys.readouterr().out)
+    assert public["status"] == "blocked" and public["migration_complete"] is False
+    assert public["selected"] == 0 and public["blocked_count"] == public["cohort_count"] == 185
+    assert "planned_count=0\n" in outputs.read_text() and "blocked_count=185\n" in outputs.read_text()
+    assert "planning_status=blocked\n" in outputs.read_text() and '"migration_complete": false' in summary.read_text()
+    assert len(json.loads(plan_path.with_suffix(".backlog.json").read_bytes())["repositories"]) == 185
+
+
+@pytest.mark.parametrize("truncated", [None, "root", "repos"])
+def test_pointer_inventory_uses_only_frozen_nonrecursive_repos_subtree(truncated):
+    from icsot_observer.legacy_bootstrap import operational_pointer_loader
+    class Transport:
+        repository = "owner/collector"
+        def __init__(self):
+            self.calls, self.pointer_reads = [], []
+        def branch_head(self):
+            return "a" * 40
+        def _api(self, endpoint):
+            self.calls.append(endpoint)
+            assert "recursive" not in endpoint
+            if endpoint.endswith("a" * 40):
+                return {"truncated": truncated == "root", "tree": [
+                    {"path": "proof-outbox", "type": "tree", "sha": "c" * 40},
+                    {"path": "repos", "type": "tree", "sha": "b" * 40}]}
+            assert endpoint.endswith("b" * 40)
+            return {"truncated": truncated == "repos", "tree": [{"path": "1.json", "type": "blob"}]}
+        def read_pointer(self, head, repo_id):
+            self.pointer_reads.append((head, repo_id))
+            return b"frozen-pointer"
+    transport = Transport()
+    if truncated:
+        with pytest.raises(MigrationError, match="incomplete"):
+            operational_pointer_loader(transport)
+        assert transport.pointer_reads == []
+    else:
+        loader = operational_pointer_loader(transport)
+        assert loader(1) == b"frozen-pointer" and loader(2) is None
+        assert transport.pointer_reads == [("a" * 40, 1)]
+    assert len(transport.calls) == (1 if truncated == "root" else 2)
+
+
 def test_active_migration_suppresses_fresh_recollection_but_keeps_ready_targets(tmp_path):
     cfg = config(tmp_path)
     pointer = canonical_json({"repository_id": 1, "slug": cfg.repositories[0], "generation": "a" * 32})
@@ -245,7 +481,8 @@ def engine(tmp_path, monkeypatch):
 
 def test_import_preserves_original_times_fresh_queue_and_prepared_publication_order(engine):
     result = engine.run()
-    assert result["disposition"] == "state_published", result
+    assert result["disposition"] == "state_published", {
+        key: result.get(key) for key in ("disposition", "reason_code", "error_location")}
     assert result["new_observations"] == result["fresh_queue_jobs"] == 0
     assert result["original_source_status"] == "partial"
     assert result["existing_main_ciphertext_bytes"] == 1000 and result["state_uploaded_ciphertext_bytes"] == 100
@@ -288,6 +525,15 @@ def test_lost_prepared_bytes_are_held_without_new_uuid_reencryption_or_transfer(
     result = engine.run()
     assert result["disposition"] == "deferred" and result["external_recovery_required"]
     assert result["reason_code"] == "prepared_state_unavailable_after_runner_loss"
+
+
+def test_unchanged_external_hold_is_not_rewritten_or_reimported(engine):
+    held = {"migration_id": engine.plan["migration_id"], "repository_id": 1, "disposition": "deferred",
+            "external_recovery_required": True, "reason_code": "reviewed_recovery_required", "created_at": "original"}
+    engine.ledger.write(held)
+    assert engine.run() == held and engine.run() == held
+    assert engine.ledger.writes == [held]
+    assert "archive_import" not in engine.events and "prepare" not in engine.events
     assert not engine.events
 
 
@@ -450,7 +696,7 @@ def test_public_failure_location_contains_only_reviewed_source_coordinates(engin
     assert result["reason_code"] == "ArchiveError"
     location = result["error_location"]
     assert set(location) == {"module", "function", "line"}
-    assert location["module"] == "legacy_bootstrap.py" and location["function"] == "initialize_repository"
+    assert location["module"] == "legacy_bootstrap.py" and location["function"] == "import_legacy_seed"
     assert type(location["line"]) is int
     assert sentinel not in json.dumps(engine.ledger.writes)
 
@@ -513,7 +759,7 @@ def test_current_public_identity_is_checked_before_frozen_fresh_repair(tmp_path)
             repair_identity_loader=lambda _: {"id": 999, "private": False})
 
 
-@pytest.mark.parametrize("defer_phase", ["proof_registration", "prepared_state", "uncertain_evidence_upload", "prepare_preflight", "retry_telemetry"])
+@pytest.mark.parametrize("defer_phase", ["prepared_state", "uncertain_evidence_upload", "prepare_preflight", "retry_telemetry"])
 def test_fresh_repair_collects_once_and_reuses_main_and_prepared_bytes_across_quota_reset(
         tmp_path, monkeypatch, defer_phase):
     from icsot_observer import pipeline
@@ -547,11 +793,6 @@ def test_fresh_repair_collects_once_and_reuses_main_and_prepared_bytes_across_qu
             if not self.deferred and defer_phase == "uncertain_evidence_upload" and not is_state:
                 self.deferred = True
                 raise StateDeferredError("uncertain response after successful immutable write", reason="rate_limit", retry_not_before=1120.)
-        def save(self, *args, **kwargs):
-            if not self.deferred and defer_phase == "proof_registration":
-                self.deferred = True
-                raise StateDeferredError("quota after main upload", reason="rate_limit", retry_not_before=1120.)
-            return super().save(*args, **kwargs)
     destination = Destination()
     def capture(config, job, queue):
         captures.append(job.lane)
@@ -586,7 +827,8 @@ def test_fresh_repair_collects_once_and_reuses_main_and_prepared_bytes_across_qu
         working_root=cfg.root, scratch=tmp_path / "scratch", transport=destination, ledger=ledger,
         backend=check_backend, repair_runner=runner, repair_identity_loader=lambda _: {"id": 27193779, "private": False},
         clock=lambda: now[0], sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds))
-    assert result["disposition"] == "state_published", result
+    assert result["disposition"] == "state_published", {
+        key: result.get(key) for key in ("disposition", "reason_code", "error_location")}
     assert sorted(captures) == ["api", "git"] and len(prepared) == 1
     assert all(value is prepared[0] for value in publication_objects)
     assert len(publication_objects) == (2 if defer_phase in ("prepared_state", "retry_telemetry") else 1)

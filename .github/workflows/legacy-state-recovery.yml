@@ -1,0 +1,103 @@
+name: Recover one explicitly frozen legacy state
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_manifest_json:
+        description: 'Reviewed canonical FFmpeg recovery manifest from legacy_recovery freeze; metadata only'
+        required: true
+        type: string
+      recovery_manifest_sha256:
+        description: 'SHA-256 of the canonical manifest including its final newline'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: persistent-collection
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: persistent-selected-id-1614410
+      cancel-in-progress: false
+    steps:
+      - name: Check out the dispatched recovery revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Pin reviewed metadata and materialize the existing operational key
+        env:
+          RECOVERY_MANIFEST_JSON: ${{ inputs.recovery_manifest_json }}
+          RECOVERY_MANIFEST_SHA256: ${{ inputs.recovery_manifest_sha256 }}
+          COLLECTOR_STATE_PRIVATE_KEY: ${{ secrets.COLLECTOR_STATE_PRIVATE_KEY }}
+        run: |
+          set +x
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from icsot_observer.core import canonical_json
+          raw = canonical_json(json.loads(os.environ['RECOVERY_MANIFEST_JSON']))
+          if len(raw) > 60000 or hashlib.sha256(raw).hexdigest() != os.environ['RECOVERY_MANIFEST_SHA256']:
+              raise SystemExit('Recovery manifest SHA-256 or metadata bound differs')
+          key = os.environ.get('COLLECTOR_STATE_PRIVATE_KEY', '')
+          if not key.strip():
+              raise SystemExit('The existing operational state key is required')
+          for name, data in [('legacy-recovery-manifest.json', raw), ('legacy-operational-private.pem', key.encode())]:
+              path = Path(os.environ['RUNNER_TEMP']) / name
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, 'wb') as output:
+                  output.write(data)
+                  output.flush()
+                  os.fsync(output.fileno())
+          PY
+      - name: Revalidate the original source and publish bounded linked recovery state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          RECOVERY_MANIFEST_SHA256: ${{ inputs.recovery_manifest_sha256 }}
+        run: |
+          set +x
+          trap 'rm -f "$RUNNER_TEMP/legacy-operational-private.pem"' EXIT
+          python -m icsot_observer.legacy_recovery run \
+            --manifest "$RUNNER_TEMP/legacy-recovery-manifest.json" \
+            --manifest-sha256 "$RECOVERY_MANIFEST_SHA256" --code-sha "$GITHUB_SHA" \
+            --config config.corpus.toml --csv ../public_patch_corpus_185.csv \
+            --destination-repository "$GITHUB_REPOSITORY" \
+            --state-public-key keys/working-state-rsa-public.pem \
+            --state-private-key "$RUNNER_TEMP/legacy-operational-private.pem" \
+            --evidence-public-key keys/results-rsa-public.pem \
+            --scratch "$RUNNER_TEMP/legacy-recovery" \
+            --attempt-identity "run${GITHUB_RUN_ID}-attempt${GITHUB_RUN_ATTEMPT}" \
+            --output "analysis/legacy-recovery/outcome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+      - name: Preserve bounded recovery outcome metadata
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legacy-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: icsot-observatory/analysis/legacy-recovery/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove runner operational key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/legacy-operational-private.pem"
