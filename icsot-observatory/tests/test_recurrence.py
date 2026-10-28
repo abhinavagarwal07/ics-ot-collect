@@ -1,8 +1,10 @@
 import copy
+import io
 import json
 import os
 import subprocess
 import sys
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 from icsot_observer import pipeline
-from icsot_observer.core import Config, canonical_json, sha256
-from icsot_observer.github import APIRequestDeferred
+from icsot_observer.core import Config, ObjectStore, canonical_json, sha256
+from icsot_observer.github import APIRequestDeferred, GitHubAPI
 from icsot_observer.github_state import GhCliStateTransport, GitHubStateStore, StateConflictError, StateDeferredError, StateError
 from icsot_observer.recurrence import BoundedStateTransport, build_plan, load_cohort, load_resource_limits, public_outcome, select_entry
 from test_github_runner_integration import MemoryGitHub, keys
@@ -144,17 +146,111 @@ print(json.dumps({"matrix": plan["matrix"], "seed": plan["execution_order_seed_s
     assert len(json.loads(outputs[0])["matrix"]["include"]) == 185
 
 
-def test_shared_source_rate_deferral_pauses_remaining_identity_requests(tmp_path):
+@pytest.mark.parametrize("category", ["secondary_rate_limit", None])
+def test_shared_or_unclassified_source_rate_deferral_pauses_remaining_identity_requests(tmp_path, category):
     called = []
 
     def identity(slug):
         called.append(slug)
-        raise APIRequestDeferred(200000, "shared primary quota")
+        error = APIRequestDeferred(200000, "potentially shared throttling")
+        error.diagnostic_category = category
+        raise error
 
     result = plan(tmp_path, identity_loader=identity)
     assert called == ["one/repo"]
     assert result["matrix"]["include"] == []
     assert result["counts"] == {"paused_identity": 3}
+    assert result["repositories"][0]["retry_not_before"] == 200000
+    assert result["repositories"][1]["reason_code"] == "shared_source_rate_deferred"
+
+
+@pytest.mark.parametrize("category", ["primary_reserve_future_reset", "primary_reserve_wait_budget", "primary_rate_limit"])
+def test_primary_account_deferral_does_not_suppress_later_identity_requests(tmp_path, category):
+    called = []
+
+    def identity(slug):
+        called.append(slug)
+        if slug == "one/repo":
+            error = APIRequestDeferred(200000, "primary allowance exhausted")
+            error.diagnostic_category = category
+            raise error
+        return {"id": 18 if slug == "two/repo" else 19, "private": False, "size": 100}
+
+    result = plan(tmp_path, identity_loader=identity, cold_bootstraps=0)
+    assert called == list(config(tmp_path).repositories)
+    assert result["counts"] == {"paused_identity": 1, "bootstrap_pending": 2}
+    assert result["repositories"][0]["retry_not_before"] == 200000
+
+
+@pytest.mark.parametrize("exhausted_slot", [0, 1])
+def test_initialized_plan_keeps_healthy_fixed_credential_slot_after_primary_reserve(tmp_path, monkeypatch, exhausted_slot):
+    from test_source_tokens import Reply
+    repositories = ("test/alpha", "test/beta", "test/gamma", "test/delta", "test/zeta", "test/epsilon")
+    cfg = replace(config(tmp_path), repositories=repositories, token_env="GITHUB_TOKEN", primary_rate_reserve=40,
+                  primary_rate_wait_seconds=0)
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-primary")
+    monkeypatch.setenv("COLLECTOR_READ_TOKEN_SECONDARY", "synthetic-secondary")
+    monkeypatch.setattr("icsot_observer.github.time.time", lambda: 1000)
+    api = GitHubAPI(cfg, ObjectStore(cfg.root), [], defer_on_rate=True)
+    slots = dict(zip(repositories, (0, 1, 0, 1, 0, 1)))
+    identifiers = {slug: number for number, slug in enumerate(repositories, 17)}
+    requests, identities, pointers = [], [], []
+
+    def opened(request, timeout):
+        slug = request.full_url.removeprefix("https://api.github.com/repos/")
+        requests.append((slug, request.get_header("Authorization")))
+        return Reply(canonical_json({"id": identifiers[slug], "private": False, "size": 100}),
+                     {"X-RateLimit-Remaining": "39" if slots[slug] == exhausted_slot else "4999",
+                      "X-RateLimit-Reset": "1060"})
+
+    monkeypatch.setattr(api.opener, "open", opened)
+    # A real response primes only its assigned account's reserve observation.
+    api.get_json("/repos/" + repositories[exhausted_slot], "repository_identity")
+
+    def identity(slug):
+        identities.append(slug)
+        return api.get_json("/repos/" + slug, "repository_identity")
+
+    def pointer(repo_id):
+        pointers.append(repo_id)
+        slug = next(slug for slug in repositories if identifiers[slug] == repo_id)
+        return canonical_json({"repository_id": repo_id, "slug": slug, "generation": "a" * 32})
+
+    result = build_plan(cfg, sources={**SOURCES, "cohort_count": 6}, code_sha=CODE,
+                        identity_loader=identity, pointer_loader=pointer, now=1000)
+    healthy = {slug for slug in repositories if slots[slug] != exhausted_slot}
+    assert identities == list(repositories)
+    assert {row["slug"] for row in result["matrix"]["include"]} == healthy
+    assert set(pointers) == {identifiers[slug] for slug in healthy}
+    assert result["counts"] == {"paused_identity": 3, "ready_incremental": 3}
+    assert all(row["expected_pointer_sha256"] and not row["allow_bootstrap"] for row in result["matrix"]["include"])
+    assert all(row["retry_not_before"] == 1061 for row in result["repositories"] if row["slug"] not in healthy)
+    assert len(requests) == 4  # Warmup, then only the healthy account's three identities.
+    assert all(auth == "Bearer " + ("synthetic-primary" if slots[slug] == 0 else "synthetic-secondary")
+               for slug, auth in requests)
+
+
+def test_real_secondary_deferral_stops_plan_before_other_account_identity_or_pointer(tmp_path, monkeypatch):
+    cfg = replace(config(tmp_path), repositories=("test/alpha", "test/beta"), token_env="GITHUB_TOKEN")
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-primary")
+    monkeypatch.setenv("COLLECTOR_READ_TOKEN_SECONDARY", "synthetic-secondary")
+    api = GitHubAPI(cfg, ObjectStore(cfg.root), [], defer_on_rate=True)
+    requests, identities = [], []
+
+    def opened(request, timeout):
+        requests.append(request.get_header("Authorization"))
+        raise urllib.error.HTTPError(request.full_url, 429, "limited", {"Retry-After": "120"}, io.BytesIO(b"{}"))
+
+    def identity(slug):
+        identities.append(slug)
+        return api.get_json("/repos/" + slug, "repository_identity")
+
+    monkeypatch.setattr(api.opener, "open", opened)
+    result = build_plan(cfg, sources=SOURCES, code_sha=CODE, identity_loader=identity,
+                        pointer_loader=lambda repo_id: pytest.fail("no identity was admitted"), now=1000)
+    assert identities == ["test/alpha"] and requests == ["Bearer synthetic-primary"]
+    assert result["matrix"]["include"] == [] and result["counts"] == {"paused_identity": 2}
+    assert result["repositories"][1]["reason_code"] == "shared_source_rate_deferred"
 
 
 def test_identity_reuse_and_invalid_pointer_never_become_fresh_bootstrap(tmp_path):
@@ -291,6 +387,77 @@ def test_public_outcome_keeps_deferred_api_partial_even_when_git_completed(tmp_p
     report = public_outcome(result, entry)
     assert report["status"] == "partial" and report["pending_jobs"] == 1
     assert report["new_evidence_upload_bytes"] == 4 and report["new_state_upload_bytes"] == 5
+
+
+@pytest.mark.parametrize("ots_status", ["pending_bitcoin_completion", "bitcoin_attestation_unverified"])
+def test_complete_coverage_preserves_failed_freetsa_pending_registration_and_unverified_ots(tmp_path, ots_status):
+    entry = plan(tmp_path)["matrix"]["include"][0]
+    result = {"working_state_origin": "resumed_authenticated_state", "new_evidence_upload_bytes": 4,
+              "publication": {"state_uploaded_ciphertext_bytes": 5, "state_referenced_ciphertext_bytes": 6, "generation": "a" * 32},
+              "proof_maintenance_registration": {"status": "registration_pending", "catalog_key": "c" * 64, "proofs_in_catalog": 6},
+              "collection": {"queue": {"states": {"complete": 2}}, "partial_captures": [], "runtime": {"completed": 2},
+                             "current_observation": {"status": "complete", "lane_outcomes": [
+                                 {"capture_id": lane + "-capture", "lane": lane, "status": "complete"} for lane in ("api", "git")]}}}
+    result["lane_publication_outcomes"] = [{
+        "capture_id": lane + "-capture", "lane": lane, "manifest_sha256": "a" * 64, "index_sha256": "b" * 64,
+        "verification": {"raw_response_objects_verified": 2, "raw_response_bytes_verified": 100,
+                         "portable_git_restore": "passed_into_empty_repository", "unknown": "private-body-marker"},
+        "archive_status": "complete", "encryption_status": "encrypted", "transfer_status": "uploaded_dependency_verified",
+        "timestamp_provider_outcomes": {
+            "rfc3161": {"provider": "digicert", "status": "verified_chain_and_imprint", "verification": {
+                "nonce_and_query_verified": True, "certificate_chain_verified": True, "subject_imprint_verified": True}},
+            "freetsa": {"status": "failed", "message": "private-body-marker"},
+            "opentimestamps": {"status": ots_status, "verification": {"bitcoin_verified": False}, "body": "private-body-marker"}},
+        "response_body": "private-body-marker"} for lane in ("api", "git")]
+    report = public_outcome(result, entry)
+    assert report["status"] == "complete" and report["status_scope"] == "collection_coverage"
+    assert report["proof_maintenance_registration"] == result["proof_maintenance_registration"]
+    assert "private-body-marker" not in json.dumps(report)
+    assert len(report["lane_publication_outcomes"]) == 2
+    for lane in report["lane_publication_outcomes"]:
+        assert lane["manifest_sha256"] == "a" * 64 and lane["index_sha256"] == "b" * 64
+        assert lane["verification"]["raw_response_objects_verified"] == 2
+        providers = lane["timestamp_provider_outcomes"]
+        assert providers["rfc3161"]["provider"] == "digicert"
+        assert providers["rfc3161"]["verification"]["certificate_chain_verified"] is True
+        assert providers["freetsa"]["status"] == "failed"
+        assert providers["opentimestamps"]["status"] == ots_status
+        assert providers["opentimestamps"]["verification"]["bitcoin_verified"] is False
+    unsafe = copy.deepcopy(result)
+    detail = unsafe["lane_publication_outcomes"][0]
+    detail.update(archive_status="private-body-marker", index_sha256="abcd1234", manifest_sha256=17)
+    detail["verification"]["git_mirror_fsck"] = "private-body-marker"
+    detail["timestamp_provider_outcomes"]["opentimestamps"].update(status="private-body-marker", retry="private-body-marker")
+    unsafe["proof_maintenance_registration"].update(status="private-body-marker", catalog_key=17)
+    sanitized = public_outcome(unsafe, entry)
+    assert "private-body-marker" not in json.dumps(sanitized)
+    assert sanitized["lane_publication_outcomes"][0]["archive_status"] == "unknown"
+    assert "index_sha256" not in sanitized["lane_publication_outcomes"][0]
+    assert "manifest_sha256" not in sanitized["lane_publication_outcomes"][0]
+    assert sanitized["lane_publication_outcomes"][0]["timestamp_provider_outcomes"]["opentimestamps"]["status"] == "unknown"
+    assert sanitized["proof_maintenance_registration"]["status"] == "unknown"
+
+
+def test_public_lane_outcomes_distinguish_missing_current_capture_from_completed_older_capture(tmp_path):
+    entry = plan(tmp_path)["matrix"]["include"][0]
+    result = {"working_state_origin": "resumed_authenticated_state", "new_evidence_upload_bytes": 0,
+              "publication": {"state_uploaded_ciphertext_bytes": 5, "state_referenced_ciphertext_bytes": 6, "generation": "a" * 32},
+              "collection": {"queue": {"states": {"complete": 1, "queued": 1}}, "partial_captures": [], "runtime": {"completed": 1},
+                             "current_observation": {"status": "partial", "lane_outcomes": [
+                                 {"capture_id": "current-git", "lane": "git", "status": "queued"}],
+                                 "missing_lanes": [{"slug": entry["slug"], "lane": "api"}]},
+                             "resumed_older_captures": [{"capture_id": "older-api", "lane": "api", "status": "complete"}]},
+              "lane_publication_outcomes": [{"capture_id": "older-api", "lane": "api", "manifest_sha256": "a" * 64,
+                  "index_sha256": "b" * 64, "verification": {"raw_response_objects_verified": 3},
+                  "archive_status": "complete", "encryption_status": "encrypted", "transfer_status": "retained_authenticated_catalog"}]}
+    report = public_outcome(result, entry)
+    current_git, missing_api, older_api = report["lane_publication_outcomes"]
+    assert report["status"] == "partial"
+    assert current_git["collection_status"] == "queued" and current_git["archive_status"] == "not_run"
+    assert missing_api["collection_status"] == "not_collected" and missing_api["verification"] == {}
+    assert missing_api["timestamp_provider_outcomes"]["opentimestamps"]["status"] == "not_recorded"
+    assert older_api["observation"] == "resumed_older" and older_api["collection_status"] == "complete"
+    assert older_api["transfer_status"] == "retained_authenticated_catalog" and older_api["index_sha256"] == "b" * 64
 
 
 @pytest.mark.parametrize("outcome", ["complete", "paused", "failed"])

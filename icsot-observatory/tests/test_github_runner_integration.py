@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from icsot_observer import pipeline
 from icsot_observer.core import Config, ObjectStore, canonical_json, sha256
+from test_git_incremental import incremental_source
 
 
 class MemoryGitHub:
@@ -120,7 +121,7 @@ def keys(tmp_path, prefix):
     return public, private
 
 
-@pytest.mark.parametrize("stamp,rfc,free", [(False, False, False), (True, False, False), (False, True, False), (True, True, False), (False, True, True)])
+@pytest.mark.parametrize("stamp,rfc,free", [(False, False, False), (True, False, False), (False, True, False), (True, True, False), (False, True, True), (True, True, "failed")])
 def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_cipher_redownload(tmp_path, monkeypatch, stamp, rfc, free):
     if stamp:
         pytest.importorskip("opentimestamps.core.timestamp")
@@ -159,7 +160,7 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
         ca, chain = tmp_path / "tsa-root.pem", tmp_path / "tsa-chain.pem"
         ca.write_bytes(b"shared explicit TSA root fixture")
         chain.write_bytes(b"shared explicit TSA intermediate fixture")
-        rfc_options = {"rfc3161_url": "http://tsa.example.invalid", "rfc3161_ca": ca, "rfc3161_chain": chain}
+        rfc_options = {"rfc3161_url": "http://timestamp.digicert.com", "rfc3161_ca": ca, "rfc3161_chain": chain}
         if free:
             rfc_options["freetsa"] = True
 
@@ -167,6 +168,8 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
             output_dir.mkdir(parents=True, exist_ok=True)
             digest = options["manifest_sha256"]
             provider = "-free" if options["endpoint"] == "https://freetsa.org/tsr" else ""
+            if provider and free == "failed":
+                raise RuntimeError("sensitive-provider-error-must-not-reach-summary")
 
             def asset(name, contents):
                 path = output_dir / name
@@ -179,7 +182,9 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
             roots = [asset(f"rfc3161-trust-root-{sha256(ca.read_bytes())}.pem", ca.read_bytes()),
                      asset(f"rfc3161-untrusted-{sha256(chain.read_bytes())}.pem", chain.read_bytes())]
             metadata = {"method": "rfc3161", "status": "verified_chain_and_imprint", "subject_sha256": digest,
-                        "request_asset": request, "receipt": proof, "trust_assets": roots}
+                        "request_asset": request, "receipt": proof, "trust_assets": roots,
+                        "verification": {"nonce_and_query_verified": True, "subject_imprint_verified": True,
+                                         "certificate_chain_verified": True}}
             sidecar = asset(f"rfc3161-{digest}{provider}.attestation.json", canonical_json(metadata))
             return {"metadata": metadata, "request_asset": request, "proof_asset": proof, "details_asset": details,
                     "trust_assets": roots, "metadata_asset": sidecar}
@@ -205,10 +210,36 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
                    stamp=stamp, transport=transport, logical_root=root)
     options.update(rfc_options)
     first = pipeline.run_github_persistent(config, observation_key="first", **options)
-    assert first["collection"]["runtime"]["completed"] == 2
+    if first["collection"]["runtime"]["completed"] != 2:
+        pytest.fail(json.dumps(first["collection"]["runtime"]["errors"], indent=2))
     assert first["monthly_cap_enforced"] is False
     assert first["publication"]["state_uploaded_ciphertext_bytes"] > 0
     assert first["proof_maintenance_registration"]["status"] == "registration_pending"
+    from icsot_observer.recurrence import public_outcome
+    report = public_outcome(first, {"slug": "test/repo", "repository_id": 17, "slot": 123})
+    assert report["status"] == "complete" and report["status_scope"] == "collection_coverage"
+    assert report["proof_maintenance_registration"]["status"] == "registration_pending"
+    assert {item["lane"] for item in report["lane_publication_outcomes"]} == {"api", "git"}
+    assert "sensitive-provider-error" not in json.dumps(report)
+    for item in report["lane_publication_outcomes"]:
+        assert item["verification"]["raw_response_objects_verified"] == 1
+        assert item["verification"]["raw_response_bytes_verified"] == len(body)
+        assert item["archive_status"] == "complete" and item["encryption_status"] == "encrypted"
+        assert item["transfer_status"] == "uploaded_dependency_verified"
+        assert any(sha256(raw) == item["index_sha256"] for (tag, name), raw in transport.assets.items()
+                   if name.endswith(".index.json"))
+        providers = item["timestamp_provider_outcomes"]
+        assert providers["opentimestamps"]["status"] == ("pending_bitcoin_completion" if stamp else "not_collected")
+        if stamp:
+            assert providers["opentimestamps"]["verification"]["bitcoin_verified"] is False
+        assert providers["rfc3161"]["status"] == ("verified_chain_and_imprint" if rfc else "not_configured")
+        if rfc:
+            assert providers["rfc3161"]["provider"] == "digicert"
+            assert providers["rfc3161"]["verification"]["nonce_and_query_verified"] is True
+        assert providers["freetsa"]["status"] == ("failed" if free == "failed" else
+                                                  "verified_chain_and_imprint" if free else "not_configured")
+        if free == "failed":
+            assert providers["freetsa"]["retry"] == "not_scheduled"
     assert transport.proof_saves == 0
     first_pointer = json.loads(transport.read_pointer(transport.head, 17))
     assert first_pointer["snapshot_sealed_at"] == first["publication"]["snapshot_sealed_at"]
@@ -242,13 +273,16 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
                 assert sha256(contents) == sidecar["sha256"]
         if rfc:
             assert index["timestamp_evidence"]["rfc3161"]["metadata"]["status"] == "verified_chain_and_imprint"
-        if free:
+        if free and free != "failed":
             evidence = index["timestamp_evidence"]["additional_rfc3161"]["providers"]["freetsa"]
             assert evidence["metadata"]["subject_sha256"] == index["manifest_sha256"]
             assert evidence["metadata"]["status"] == "verified_chain_and_imprint"
             for sidecar in (evidence["request_asset"], evidence["proof_asset"], evidence["metadata_asset"], *evidence["trust_assets"]):
                 ref = next(ref for ref in entry["assets"] if ref["name"] == sidecar["name"])
                 assert sha256(transport.assets[ref["release_tag"], ref["name"]]) == sidecar["sha256"]
+        elif free == "failed":
+            evidence = index["timestamp_evidence"]["additional_rfc3161"]["providers"]["freetsa"]
+            assert evidence["status"] == "failed" and evidence["retry"] == "not_scheduled"
     from icsot_observer.github_state import GitHubStateStore
     selected = GitHubStateStore(transport, repository_id=17, slug="test/repo", public_key=state_public,
                                 private_key=state_private, logical_root=root).read()
@@ -275,7 +309,7 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
         assert {entry["lane"] for entry in marker["observations"]} == {"api", "git"}
         for ref in marker["indexes"]:
             assert sha256(transport.assets[release, ref["name"]]) == ref["sha256"]
-        if free:
+        if free and free != "failed":
             for observation in marker["observations"]:
                 evidence = observation["timestamp_evidence"]["additional_rfc3161"]["providers"]["freetsa"]
                 assert evidence["metadata"]["subject_sha256"] == observation["manifest_sha256"]
@@ -349,6 +383,17 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
         assert register_catalog(transport, marker_ref)["status"] == "already_registered"
         assert len(calls) == captures_after_refusal
         assert transport.read_pointer(old_head, 17) == old_pointer
+    captures_before_replay = len(calls)
+    shutil.rmtree(root)
+    replay = pipeline.run_github_persistent(config, observation_key="second", **options)
+    assert len(calls) == captures_before_replay and replay["collection"]["runtime"]["completed"] == 0
+    replay_report = public_outcome(replay, {"slug": "test/repo", "repository_id": 17, "slot": 123})
+    assert replay_report["status"] == "complete"
+    assert replay_report["proof_maintenance_registration"]["status"] == "no_new_catalog"
+    assert len(replay_report["lane_publication_outcomes"]) == 2
+    assert all(item["transfer_status"] == "retained_authenticated_catalog" for item in replay_report["lane_publication_outcomes"])
+    assert {item["capture_id"] for item in replay_report["lane_publication_outcomes"]} == {
+        item["capture_id"] for item in second["lane_publication_outcomes"]}
 
 
 def test_github_cli_deferral_reports_retry_utc_without_implying_capture_success(tmp_path, monkeypatch, capsys):
@@ -370,3 +415,76 @@ def test_github_cli_deferral_reports_retry_utc_without_implying_capture_success(
     assert report["retry_not_before"] == "1970-01-01T00:16:40.000000Z"
     assert report["destination_github_api_requests"] == 7
     assert report["capture_completeness"] == "not_implied_by_destination_api_deferral"
+
+
+def test_hosted_summary_reports_real_offline_git_restore_and_cas_verification(incremental_source, tmp_path, monkeypatch):
+    from icsot_observer.gitstore import collect_git
+    from icsot_observer.recurrence import public_outcome
+    root, _ = incremental_source
+    config = Config(tmp_path / "unused", ("test/repo",), "2026-03-10", "research", "NO_TEST_TOKEN", 5, 1000000, 48, 100)
+    state_public, state_private = keys(tmp_path, "state")
+    evidence_public, _ = keys(tmp_path, "evidence")
+    transport = MemoryGitHub()
+
+    def capture(config, job, queue):
+        pipeline._bind_identity(config, job.slug, {"id": 17, "private": False}, "2026-10-20T00:00:00Z")
+        raw = b'{"id":17,"private":false}'
+        return {"capture_id": job.capture_id, "slug": job.slug, "repository_id": 17, "lane": job.lane,
+                "requested_mode": "delta", "mode": "delta", "failures": [],
+                "started_at": "2026-10-20T00:00:00.000000Z", "finished_at": "2026-10-20T00:00:01.000000Z",
+                "responses": [{"body_sha256": ObjectStore(config.root).put(raw), "body_bytes": len(raw)}],
+                **({"git": collect_git(config.root, job.slug, 17, job.capture_id, archive_mode="incremental")}
+                   if job.lane == "git" else {})}
+
+    monkeypatch.setattr(pipeline, "capture_lane", capture)
+    result = pipeline.run_github_persistent(config, slug="test/repo", repository_id=17,
+        destination_repository="owner/collector", state_public_key=state_public, state_private_key=state_private,
+        evidence_public_key=evidence_public, code_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        config_source_sha256="0" * 64, stamp=False, transport=transport, logical_root=root, observation_key="offline-git")
+    report = public_outcome(result, {"slug": "test/repo", "repository_id": 17, "slot": 123})
+    assert report["status"] == "complete"
+    git = next(item for item in report["lane_publication_outcomes"] if item["lane"] == "git")
+    assert git["verification"]["git_refs_verified"] >= 2
+    assert git["verification"]["portable_git_restore"] == "passed_into_empty_repository"
+    assert git["verification"]["git_namespace"] == "matches_captured_inventory"
+    assert git["verification"]["git_mirror_fsck"] == "passed"
+    assert git["verification"]["raw_response_objects_verified"] == 1
+    assert git["transfer_status"] == "uploaded_dependency_verified"
+
+
+def test_export_retains_published_rfc_proofs_and_ignores_disappearing_dot_scratch(tmp_path, monkeypatch):
+    root = tmp_path / "working"
+    config = Config(root, ("test/repo",), "2026-03-10", "research", "NO_TEST_TOKEN", 5, 1000000, 48, 100)
+    public, _ = keys(tmp_path, "evidence")
+    info = pipeline.append_capture_manifest(config, {
+        "capture_id": "api-with-published-proof", "lane": "api", "slug": "test/repo", "repository_id": 17,
+        "mode": "delta", "requested_mode": "delta", "responses": [], "failures": [],
+        "started_at": "2026-10-20T00:00:00.000000Z", "finished_at": "2026-10-20T00:00:01.000000Z"})
+    rfc_home = root / "proofs" / "rfc3161" / info["manifest_sha256"]
+    rfc_home.mkdir(parents=True)
+    published = rfc_home / ("rfc3161-" + info["manifest_sha256"] + ".tsr")
+    published.write_bytes(b"published immutable RFC receipt")
+    scratch = rfc_home / ".freetsa-failure.json.atomic-write.tmp"
+    scratch.write_bytes(b"unpublished partial failure metadata")
+    scratch_directory = rfc_home / ".rfc3161-pending-response"
+    (scratch_directory / "nested").mkdir(parents=True)
+    (scratch_directory / "nested" / "response.tsr").write_bytes(b"unpublished partial response")
+    original_rglob = Path.rglob
+
+    def disappearing_scratch(path, pattern):
+        yield from list(original_rglob(path, pattern))
+        if path == rfc_home:
+            # The original exporter selects these paths while they exist, then
+            # fails when constructing members after the atomic writer finishes.
+            scratch.unlink()
+            shutil.rmtree(scratch_directory)
+
+    monkeypatch.setattr(Path, "rglob", disappearing_scratch)
+    index = pipeline.CaptureExporter(root, tmp_path / "exports", public).export(info)
+    members = {item["path"]: item for item in index["members"]}
+    relative = published.relative_to(root).as_posix()
+    assert members[relative]["sha256"] == sha256(b"published immutable RFC receipt")
+    assert members[relative]["bytes"] == len(b"published immutable RFC receipt")
+    assert not any(part.startswith(".") for item in members for part in Path(item).parts)
+    assert not scratch.exists() and not scratch_directory.exists()
+    assert sha256(Path(info["manifest"]).read_bytes()) == info["manifest_sha256"]

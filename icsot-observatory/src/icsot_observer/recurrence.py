@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .core import Config, ObjectStore, REPO_RE, canonical_json, sha256, utc_iso, write_once
+from .diagnostics import safe_fields
 from .github import APIRequestDeferred, GitHubAPI
 from .github_state import GhCliStateTransport, StateConflictError, StateDeferredError, StateError
 from .history import FULL_HISTORY, load_history_settings, repository_history_policy
@@ -108,9 +109,15 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
                 overrides=history_settings.get("overrides"))
             row["history_policy_sha256"] = sha256(canonical_json(row["history_policy"]))
         except Exception as error:
-            source_deferred = isinstance(error, APIRequestDeferred)
+            # Primary observations belong to the repository's fixed credential
+            # slot. Keep planning other repositories; GitHubAPI itself refuses
+            # further requests for that exhausted slot. Secondary (or unknown)
+            # throttling can be shared across accounts and stops this plan.
+            deferred = isinstance(error, APIRequestDeferred)
+            source_deferred = deferred and getattr(error, "diagnostic_category", None) not in (
+                "primary_reserve_future_reset", "primary_reserve_wait_budget", "primary_rate_limit")
             row["reason_code"] = type(error).__name__
-            if source_deferred:
+            if deferred:
                 row["retry_not_before"] = error.retry_not_before
             continue
         try:
@@ -217,9 +224,75 @@ def select_entry(plan: dict, slug: str, *, config: Config, sources: dict, code_s
     return entry
 
 
+def _public_lane_outcomes(result: dict) -> list[dict]:
+    """Project retained facts without treating coverage as proof verification."""
+    collection = result["collection"]
+    current = collection.get("current_observation", {})
+    captures = [("current", item) for item in current.get("lane_outcomes", [])]
+    captures += [("current", {**item, "status": "not_collected"}) for item in current.get("missing_lanes", [])]
+    if not captures:
+        captures = [("current", {"lane": lane, "status": "not_recorded"}) for lane in ("api", "git")]
+    captures += [("resumed_older", item) for item in collection.get("resumed_older_captures", [])]
+    details = {(item.get("capture_id"), item.get("lane")): item
+               for item in result.get("lane_publication_outcomes", [])}
+    outcomes = []
+    for observation, capture in captures:
+        if capture.get("lane") not in ("api", "git"):
+            continue
+        detail = details.get((capture.get("capture_id"), capture["lane"]), {})
+        outcome = {"lane": capture["lane"], "observation": observation,
+                   "collection_status": capture.get("status") if capture.get("status") in (
+                       "complete", "partial", "queued", "capturing", "finalize_pending", "finalizing",
+                       "not_collected", "not_recorded") else "unknown",
+                   **safe_fields({"capture_id": capture.get("capture_id")}),
+                   "verification": {}}
+        for key in ("manifest_sha256", "index_sha256"):
+            if isinstance(detail.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", detail[key]):
+                outcome[key] = detail[key]
+        facts = detail.get("verification", {})
+        for key in ("raw_response_objects_verified", "raw_response_bytes_verified", "git_refs_verified"):
+            if type(facts.get(key)) is int and 0 <= facts[key] <= 10**15:
+                outcome["verification"][key] = facts[key]
+        for key, expected in (("portable_git_restore", "passed_into_empty_repository"),
+                              ("git_namespace", "matches_captured_inventory"), ("git_mirror_fsck", "passed")):
+            if key in facts:
+                outcome["verification"][key] = expected if facts[key] == expected else "unknown"
+        for key, allowed in (("archive_status", ("complete", "not_run")),
+                             ("encryption_status", ("encrypted", "not_run")),
+                             ("transfer_status", ("uploaded_dependency_verified", "retained_authenticated_catalog", "not_run"))):
+            outcome[key] = detail.get(key, "not_run") if detail.get(key, "not_run") in allowed else "unknown"
+        providers = {}
+        for provider in ("rfc3161", "freetsa", "opentimestamps"):
+            evidence = detail.get("timestamp_provider_outcomes", {}).get(provider, {})
+            status = evidence.get("status", "not_recorded")
+            providers[provider] = {"status": status if status in (
+                "not_configured", "not_collected", "not_recorded", "failed", "verified_chain_and_imprint",
+                "pending_bitcoin_completion", "bitcoin_attestation_unverified", "unrecognized_attestation_unverified") else "unknown"}
+            verification = evidence.get("verification", {})
+            providers[provider]["verification"] = {key: verification[key] for key in (
+                "bitcoin_verified", "nonce_and_query_verified", "subject_imprint_verified", "certificate_chain_verified")
+                if type(verification.get(key)) is bool}
+            if evidence.get("retry") == "not_scheduled":
+                providers[provider]["retry"] = "not_scheduled"
+            if provider == "rfc3161":
+                providers[provider]["provider"] = evidence.get("provider") if evidence.get("provider") in (
+                    "digicert", "configured_rfc3161", "not_configured") else "unknown"
+        outcome["timestamp_provider_outcomes"] = providers
+        outcomes.append(outcome)
+    return outcomes
+
+
 def public_outcome(result: dict, entry: dict) -> dict:
     collection = result["collection"]
     pending = sum(count for state, count in collection["queue"]["states"].items() if state != "complete")
+    registration = result.get("proof_maintenance_registration", {})
+    registration_status = registration.get("status", "not_recorded")
+    proof_registration = {"status": registration_status if registration_status in (
+        "registration_pending", "no_new_catalog", "registered", "already_registered", "not_recorded") else "unknown"}
+    if isinstance(registration.get("catalog_key"), str) and re.fullmatch(r"[0-9a-f]{64}", registration["catalog_key"]):
+        proof_registration["catalog_key"] = registration["catalog_key"]
+    if type(registration.get("proofs_in_catalog")) is int and 0 <= registration["proofs_in_catalog"] <= 10**15:
+        proof_registration["proofs_in_catalog"] = registration["proofs_in_catalog"]
     return {"schema_version": 1, "kind": "icsot_recurring_outcome", "slug": entry["slug"],
             "repository_id": entry["repository_id"], "slot": entry["slot"],
             "status": "partial" if pending or collection["partial_captures"] or
@@ -229,6 +302,10 @@ def public_outcome(result: dict, entry: dict) -> dict:
             "partial_capture_count": len(collection["partial_captures"]),
             "current_observation": collection.get("current_observation"),
             "resumed_older_captures": collection.get("resumed_older_captures", []),
+            "status_scope": "collection_coverage",
+            "lane_publication_outcomes": _public_lane_outcomes(result),
+            "proof_maintenance_registration": proof_registration,
+            "verification_qualification": "Collection completion is separate from proof verification. Retained authenticated catalog references do not establish fresh payload availability; pending OpenTimestamps receipts are not verified Bitcoin evidence.",
             "resource_limits": entry.get("resource_limits"),
             "history_policy": entry.get("history_policy"),
             "new_evidence_upload_bytes": result["new_evidence_upload_bytes"],

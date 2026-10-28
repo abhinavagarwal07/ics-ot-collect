@@ -2,6 +2,7 @@ import io
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -186,7 +187,12 @@ def test_diagnostic_pagination_projection_preserves_preexisting_boolean(old, new
     assert check["matches"] is expected
 
 
-def test_explicit_env_in_actual_subprocess_preserves_stdout_and_redacts_api(tmp_path):
+@pytest.mark.parametrize("workflow", ["corpus-incremental.yml", "persistent-selected.yml", "baseline-state-initialize.yml"])
+def test_production_workflow_env_in_actual_subprocess_preserves_stdout_and_redacts_api(tmp_path, workflow):
+    root = Path(__file__).resolve().parents[2]
+    text = (root / ".github/workflows" / workflow).read_text()
+    activation = re.search(r"^env:\n(?:  [^\n]*\n)*?  ICSOT_DEBUG: ['\"]?(1|true|yes)['\"]?\n", text, re.M)
+    assert activation, "Production workflow must enable the process-wide bounded diagnostic sink"
     marker = "sensitive_body_marker"
     code = r'''
 import json,sys
@@ -208,7 +214,7 @@ a.opener.open=opened
 a.get(a.url("/repos/test/repo/issues",{"filter":"sensitive_body_marker"}),"issues")
 print(json.dumps({"ok":True,"requests":a.requests}))
 '''
-    env = dict(os.environ, ICSOT_DEBUG="1", FAKE_TOKEN_TEST="ghp_" + marker,
+    env = dict(os.environ, ICSOT_DEBUG=activation[1], FAKE_TOKEN_TEST="ghp_" + marker,
                PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
     result = subprocess.run([sys.executable, "-B", "-c", code, str(tmp_path)], capture_output=True, text=True, env=env, check=True)
     assert json.loads(result.stdout) == {"ok": True, "requests": 1}

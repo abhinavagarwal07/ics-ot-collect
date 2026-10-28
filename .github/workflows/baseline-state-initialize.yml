@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Existing bounded metadata-only sink; response bodies and secrets are excluded.
+  ICSOT_DEBUG: '1'
+
 concurrency:
   group: persistent-collection
   cancel-in-progress: false

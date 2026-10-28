@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Existing bounded metadata-only sink; response bodies and secrets are excluded.
+  ICSOT_DEBUG: '1'
+
 # Shared with the selected pilot: at most one cohort/pilot run owns the eight
 # cohort slots. Pending runs queue in this shared group without replacing work.
 concurrency:

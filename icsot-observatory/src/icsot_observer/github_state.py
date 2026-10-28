@@ -1184,6 +1184,19 @@ class GitHubStateStore:
             raise StateError(f"Insufficient disk for {operation}: need approximately {required} free bytes; "
                              f"{free} available. Select a smaller repository or use a larger runner.")
 
+    @staticmethod
+    def _compaction_disk_bytes(*, max_upload_bytes: int, index_plaintext_bound: int,
+                               state_bytes: int, max_old_part_scratch: int,
+                               immutable_group_bytes: int) -> int:
+        # Frozen assets include one encrypted index. Capture's copy fallback
+        # additionally holds the original encrypted index and its plaintext;
+        # fresh remote index verification has the same two scratch allocations.
+        index_scratch = 2 * index_plaintext_bound + ENVELOPE_OVERHEAD
+        # Index scratch is removed before reconstructing the complete tree.
+        reconstruction_scratch = (state_bytes + max_old_part_scratch +
+                                  4 * (immutable_group_bytes + ENVELOPE_OVERHEAD))
+        return max_upload_bytes + max(index_scratch, reconstruction_scratch)
+
     def _require_empty_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         if any(child.name != ".collector.lock" for child in self.root.iterdir()):
@@ -1613,10 +1626,11 @@ class GitHubStateStore:
             # frozen assets, so local preparation also respects the byte cap.
             archive_bound = sum(self._tar_total_bytes(sum(self._tar_member_bytes(item) for item in group))
                                 for group in plan["groups"])
-            index_bound = (len(canonical_json(selection.index)) + ENVELOPE_OVERHEAD +
-                           sum(len(canonical_json(item["path"])) + 512
-                               for group in plan["groups"] for item in group) +
-                           4096 * len(plan["groups"]))
+            index_bound = min(self.part_bytes,
+                              len(canonical_json(selection.index)) + ENVELOPE_OVERHEAD +
+                              sum(len(canonical_json(item["path"])) + 512
+                                  for group in plan["groups"] for item in group) +
+                              4096 * len(plan["groups"]))
             if archive_bound + index_bound + ENVELOPE_OVERHEAD * (len(plan["groups"]) + 1) > max_upload_bytes:
                 raise StateDeferredError("Compaction cannot fit ciphertext upload byte budget",
                                          reason="compaction_byte_limit")
@@ -1624,9 +1638,10 @@ class GitHubStateStore:
             max_old = max((ref["ciphertext_bytes"] + ref["plaintext_bytes"] +
                            (ref["decoded_bytes"] if ref["encoding"] == "xz" else 0)
                            for ref in selection.index["parts"].values()), default=0)
-            # Frozen new ciphertexts, one archive/check/extract scratch group,
-            # a complete reconstructed tree, and the largest old part download.
-            required_disk = max_upload_bytes + state_bytes + max_old + 4 * (self.immutable_group_bytes + 65536)
+            required_disk = self._compaction_disk_bytes(
+                max_upload_bytes=max_upload_bytes, index_plaintext_bound=index_bound,
+                state_bytes=state_bytes, max_old_part_scratch=max_old,
+                immutable_group_bytes=self.immutable_group_bytes)
             self._preflight_disk(directory=directory, required=required_disk,
                                  operation="compaction reconstruction and frozen assets")
             estimated_requests = (2 * (len(plan["groups"]) + 1) + 15 * (len(plan["groups"]) + 1) +
@@ -1676,9 +1691,11 @@ class GitHubStateStore:
             index = {**copy.deepcopy(selection.index), "context": context, "files": files, "parts": parts}
             self._check_compaction_file_map(selection.index, index)
             plaintext, encrypted = directory / "index.json", directory / "index.enc"
-            plaintext.write_bytes(canonical_json(index))
-            if plaintext.stat().st_size > self.part_bytes:
-                raise StateError("Compacted state index exceeds plaintext part limit")
+            raw_index = canonical_json(index)
+            if len(raw_index) > index_bound:
+                raise StateDeferredError("Compacted state index exceeds admitted plaintext bound",
+                                         reason="compaction_byte_limit")
+            plaintext.write_bytes(raw_index)
             ref = {**encrypt_file(plaintext, encrypted, self.public_key), "release_tag": release, "name": "index.enc"}
             pointer = {**self._binding(generation, predecessor), **times, "index": ref,
                        "context_sha256": hashlib.sha256(canonical_json(context)).hexdigest()}
@@ -1686,6 +1703,10 @@ class GitHubStateStore:
                 pointer["proof_outbox"] = copy.deepcopy(selection.pointer["proof_outbox"])
             self._check_index(pointer, index)
             sink.capture(ref, encrypted)
+            # Keep the frozen ciphertext through upload and reconstruction, but
+            # release both preparation paths even when capture copied the file.
+            plaintext.unlink()
+            encrypted.unlink()
             upload_bytes = sum(asset["ref"]["ciphertext_bytes"] for asset in sink.assets)
             if upload_bytes > max_upload_bytes:
                 raise StateDeferredError("Compaction exceeds ciphertext upload byte budget", reason="compaction_byte_limit")
@@ -1710,6 +1731,8 @@ class GitHubStateStore:
             self._check_compaction_file_map(selection.index, fresh_index)
             if fresh_index != index:
                 raise StateError("Compacted remote index differs from frozen index")
+            remote_index.unlink()
+            decoded_index.unlink()
             staging, downloads = directory / "reconstructed", directory / "downloads"
             staging.mkdir(mode=0o700)
             downloads.mkdir(mode=0o700)

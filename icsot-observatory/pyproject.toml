@@ -18,7 +18,7 @@ icsot-observe = "icsot_observer.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-icsot_observer = ["web/*.html", "web/*.js", "web/*.css"]
+icsot_observer = ["web/*.html", "web/*.js", "web/*.css", "certificates/*.pem"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

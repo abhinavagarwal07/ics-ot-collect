@@ -17,6 +17,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -98,12 +99,29 @@ def _public_timestamp_policy(policy: dict | None) -> dict | None:
     return {key: policy[key] for key in ("endpoint", "ca_sha256", "untrusted_sha256")} if policy else None
 
 
-def _freetsa_policy() -> dict:
-    root = Path(__file__).resolve().parents[2] / "keys" / "freetsa-root.pem"
-    policy = _rfc3161_policy("https://freetsa.org/tsr", root, None)
-    if policy["ca_sha256"] != "2151b61137ffa86bf664691ba67e7da0b19f98c758e3d228d5d8ebf27e044438":
-        raise ValueError("FreeTSA root differs from the provider-published pinned PEM")
-    return policy
+@contextmanager
+def _freetsa_policy():
+    resource = resources.files("icsot_observer").joinpath("certificates", "freetsa-root.pem")
+    # Zip-backed packages extract a temporary file. Keep it alive for every
+    # consumer of the returned policy, including OpenSSL subprocesses.
+    with resources.as_file(resource) as root:
+        policy = _rfc3161_policy("https://freetsa.org/tsr", root, None)
+        if policy["ca_sha256"] != "2151b61137ffa86bf664691ba67e7da0b19f98c758e3d228d5d8ebf27e044438":
+            raise ValueError("FreeTSA root differs from the provider-published pinned PEM")
+        yield policy
+
+
+@contextmanager
+def _freetsa_trust_file(policy: dict):
+    # Captures persist ca_file across retries and process restarts. Rebind only
+    # the exact built-in trust identity, whose extracted filename can expire.
+    if (policy["endpoint"] == "https://freetsa.org/tsr" and
+            policy["ca_sha256"] == "2151b61137ffa86bf664691ba67e7da0b19f98c758e3d228d5d8ebf27e044438" and
+            policy.get("untrusted_file") is None and policy.get("untrusted_sha256") is None):
+        with _freetsa_policy() as current:
+            yield Path(current["ca_file"])
+    else:
+        yield Path(policy["ca_file"])
 
 
 def _freetsa_profile() -> dict:
@@ -549,7 +567,12 @@ class CaptureExporter:
                     files.add(provenance)
                 rfc_home = self.root / "proofs" / "rfc3161" / sha256(prior.read_bytes())
                 if rfc_home.exists():
-                    files.update(item for item in rfc_home.rglob("*") if item.is_file())
+                    # Other lane finalizers may still publish proofs. Their
+                    # dot-files/directories are unpublished atomic-write scratch
+                    # and may disappear before this archive opens its members.
+                    files.update(item for item in rfc_home.rglob("*")
+                                 if not any(part.startswith(".") for part in item.relative_to(rfc_home).parts)
+                                 and item.is_file())
             files.update(store.location(digest) for digest in objects if digest not in self.delivered_objects)
             for seed in self.legacy_seeds:
                 receipt_ref = seed["import_receipt"]
@@ -838,12 +861,13 @@ def finalize_lane(config: Config, job: Any, capture: dict[str, Any], *, stamp: b
         try:
             if failure_path.exists():
                 raise RuntimeError("Retained failed FreeTSA attempt")
-            if _file_sha256(Path(policy["ca_file"])) != policy["ca_sha256"]:
-                raise RuntimeError("FreeTSA trust file differs from frozen policy")
-            info["freetsa_evidence"] = publish_rfc3161_attestation(
-                source, manifest_sha256=info["manifest_sha256"], observation_started_at=capture["started_at"],
-                observation_finished_at=capture["finished_at"], endpoint=policy["endpoint"],
-                ca_file=Path(policy["ca_file"]), max_attempts=3)
+            with _freetsa_trust_file(policy) as ca_file:
+                if _file_sha256(ca_file) != policy["ca_sha256"]:
+                    raise RuntimeError("FreeTSA trust file differs from frozen policy")
+                info["freetsa_evidence"] = publish_rfc3161_attestation(
+                    source, manifest_sha256=info["manifest_sha256"], observation_started_at=capture["started_at"],
+                    observation_finished_at=capture["finished_at"], endpoint=policy["endpoint"],
+                    ca_file=ca_file, max_attempts=3)
         except (RuntimeError, ValueError, OSError):
             if not failure_path.exists():
                 attempt_assets = []
@@ -897,7 +921,8 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
     timestamp_policy = _rfc3161_policy(rfc3161_url, rfc3161_ca, rfc3161_chain)
     if config.token_env == "GITHUB_TOKEN" and os.getenv("COLLECTOR_READ_TOKEN", "").strip():
         config = replace(config, token_env="COLLECTOR_READ_TOKEN")
-    with nullcontext() if controller_locked else ControllerLock(config.root):
+    with (nullcontext() if controller_locked else ControllerLock(config.root)), \
+            (_freetsa_policy() if freetsa else nullcontext(None)) as freetsa_policy:
         queue = PersistentQueue(config.root)
         exporter = CaptureExporter(config.root, export_directory, public_key,
                                    verified_prior_indexes=verified_prior_indexes,
@@ -909,7 +934,7 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                                 expected_repository_ids=expected_repository_ids or {}, observation_key=observation_key,
                                 working_state_origin=working_state_origin,
                                 history_policy=history_policy,
-                                timestamp_policy=timestamp_policy, freetsa_policy=_freetsa_policy() if freetsa else None)
+                                timestamp_policy=timestamp_policy, freetsa_policy=freetsa_policy)
 
 
 def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | None, once: bool,
@@ -1330,14 +1355,80 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                 os.close(directory_fd)
         finally:
             temporary_catalog.unlink(missing_ok=True)
+        # Report only this drain's current/attempted older captures. Historical
+        # catalog entries remain prerequisites, not fresh transfer observations.
+        reported_captures = {item["capture_id"] for item in [
+            *collection.get("current_observation", {}).get("lane_outcomes", []),
+            *collection.get("resumed_older_captures", [])]}
+        catalog_by_manifest = {entry["index"]["manifest_sha256"]: entry for entry in catalog["exports"]}
+        newly_uploaded = {item["manifest_sha256"] for item in publication_observations}
+        lane_publication_outcomes = []
+
+        def timestamp_outcome(evidence, default_status):
+            metadata = evidence.get("metadata", {})
+            status = metadata.get("status", evidence.get("status", default_status))
+            allowed = {"not_configured", "not_collected", "not_recorded", "failed", "verified_chain_and_imprint",
+                       "pending_bitcoin_completion", "bitcoin_attestation_unverified",
+                       "unrecognized_attestation_unverified"}
+            verification = metadata.get("verification", {})
+            outcome = {"status": status if status in allowed else "unknown",
+                       "verification": {key: verification[key] for key in (
+                        "bitcoin_verified", "nonce_and_query_verified", "subject_imprint_verified",
+                        "certificate_chain_verified") if type(verification.get(key)) is bool}}
+            if evidence.get("retry") == "not_scheduled":
+                outcome["retry"] = "not_scheduled"
+            return outcome
+
         lane_heads = {}
         for path in sorted((root / "runs" / str(repository_id)).glob("*.manifest.json")):
             manifest = json.loads(path.read_bytes())
+            manifest_digest = _file_sha256(path)
             lane_heads[manifest.get("lane", "combined")] = {
-                "manifest_sha256": _file_sha256(path), "run_id": manifest["run_id"],
+                "manifest_sha256": manifest_digest, "run_id": manifest["run_id"],
                 "capture_id": manifest.get("capture_id", manifest["run_id"]),
                 **_observation_metadata(manifest),
             }
+            if manifest.get("capture_id") not in reported_captures:
+                continue
+            verification = manifest.get("verification") or {}
+            facts = {key: verification[key] for key in (
+                "raw_response_objects_verified", "raw_response_bytes_verified", "git_refs_verified")
+                if type(verification.get(key)) is int and 0 <= verification[key] <= 10**15}
+            for key, expected in (("portable_git_restore", "passed_into_empty_repository"),
+                                  ("git_namespace", "matches_captured_inventory"), ("git_mirror_fsck", "passed")):
+                if key in verification:
+                    facts[key] = expected if verification[key] == expected else "unknown"
+            exported = catalog_by_manifest.get(manifest_digest, {})
+            index = exported.get("index", {})
+            if (index.get("capture_id") != manifest["capture_id"] or index.get("lane") != manifest["lane"] or
+                    index.get("repository_id") != repository_id):
+                index = {}
+            index_raw = canonical_json(index)
+            index_digest = sha256(index_raw) if index else None
+            index_retained = any(ref.get("ciphertext_sha256") == index_digest and
+                                 ref.get("ciphertext_bytes") == len(index_raw) and
+                                 ref.get("name", "").endswith(".index.json") for ref in exported.get("assets", []))
+            timestamps = index.get("timestamp_evidence", {})
+            timestamp_default = "not_configured" if index else "not_recorded"
+            rfc = timestamp_outcome(timestamps.get("rfc3161", {}), timestamp_default)
+            rfc["provider"] = ("digicert" if (manifest.get("timestamp_policy") or {}).get("endpoint") ==
+                               "http://timestamp.digicert.com" else "configured_rfc3161" if
+                               (manifest.get("timestamp_policy") or {}).get("endpoint") else "not_configured")
+            lane_publication_outcomes.append({
+                "capture_id": manifest["capture_id"], "lane": manifest["lane"],
+                "manifest_sha256": manifest_digest, "verification": facts,
+                "archive_status": "complete" if index else "not_run",
+                "encryption_status": "encrypted" if index.get("encrypted") is True else "not_run",
+                "transfer_status": ("uploaded_dependency_verified" if manifest_digest in newly_uploaded else
+                                    "retained_authenticated_catalog") if index_retained else "not_run",
+                "index_sha256": index_digest,
+                "timestamp_provider_outcomes": {
+                    "rfc3161": rfc,
+                    "freetsa": timestamp_outcome(timestamps.get("additional_rfc3161", {}).get(
+                        "providers", {}).get("freetsa", {}), timestamp_default),
+                    "opentimestamps": timestamp_outcome(timestamps.get("opentimestamps", {}), timestamp_default),
+                },
+            })
         source_dir = Path(__file__).parent
         code_hashes = {path.name: _file_sha256(path) for path in source_dir.glob("*.py")}
         code_hashes["collector_commit"] = code_sha
@@ -1364,6 +1455,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
             "restore": restore_report, "publication": publication_summary,
             "new_evidence_upload_bytes": uploaded_evidence_bytes,
             "proof_maintenance_registration": proof_registration or {"status": "no_new_catalog"},
+            "lane_publication_outcomes": lane_publication_outcomes,
             "monthly_cap_enforced": False,
             "deployment_scope": "one selected repository; scheduling is controlled by the caller"}
 
