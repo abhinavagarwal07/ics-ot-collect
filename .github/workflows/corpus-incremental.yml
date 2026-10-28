@@ -1,8 +1,7 @@
 name: Corpus incremental (six hourly)
 
 on:
-  schedule:
-    - cron: '17 */6 * * *'
+  # Automatic schedules paused at the user's request; manual dispatch remains.
   workflow_dispatch:
     inputs:
       cold_bootstraps:

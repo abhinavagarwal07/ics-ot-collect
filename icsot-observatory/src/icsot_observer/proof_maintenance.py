@@ -75,7 +75,19 @@ def _ref(ref: Any) -> dict:
     if not isinstance(ref.get("sha256"), str) or not HASH.fullmatch(ref["sha256"]) or \
             type(ref.get("bytes")) is not int or not 0 < ref["bytes"] <= MAX_RECEIPT_BYTES:
         raise ValueError("Invalid immutable public asset digest or size")
-    return {k: ref[k] for k in ("release_tag", "name", "sha256", "bytes")}
+    result = {k: ref[k] for k in ("release_tag", "name", "sha256", "bytes")}
+    if "storage" in ref:
+        from .git_metadata import validate_locator
+        hint = ref["storage"]
+        if (not isinstance(hint, dict) or hint.get("kind") != "cycle_git_catalog_v1" or
+                hint.get("logical_release") != ref["release_tag"]):
+            raise ValueError("Invalid pinned public metadata storage")
+        locator = hint.get("catalog")
+        if not isinstance(locator, dict):
+            raise ValueError("Invalid pinned public metadata locator")
+        validate_locator(locator, locator.get("repository", ""))
+        result["storage"] = hint
+    return result
 
 
 def empty_state() -> dict:
@@ -252,6 +264,7 @@ class ProofTransport(GhCliStateTransport):
 
     def fetch(self, ref: dict) -> bytes:
         ref = _ref(ref)
+        self.pin_asset_ref(ref)
         asset = self._asset(ref["release_tag"], ref["name"])
         if asset.get("size") != ref["bytes"]:
             raise ValueError("Public timestamp asset advertised size mismatch")
@@ -393,7 +406,7 @@ class BitcoinCoreVerifier:
         raise RuntimeError("No Bitcoin attestation was verified by trusted RPC")
 
 
-def _marker_entries(marker: dict, tag: str, transport: Any) -> list[dict]:
+def _marker_entries(marker: dict, tag: str, transport: Any, *, storage: dict | None = None) -> list[dict]:
     """Validate public bindings without reading or mutating either queue."""
     if marker.get("schema_version") != 1 or marker.get("kind") != "icsot_evidence_metadata_catalog" or \
             marker.get("generation_release") != tag or not isinstance(marker.get("observations"), list):
@@ -457,14 +470,19 @@ def _marker_entries(marker: dict, tag: str, transport: Any) -> list[dict]:
                 any(metadata.get("receipt", {}).get(k) != proof_ref[k] for k in ("name", "sha256", "bytes")):
             raise ValueError("Public proof metadata subject or receipt differs from index")
         inspect_ots_receipt(transport.fetch(proof_ref), subject)
+        # Preserve the outer immutable locator when these original inner
+        # references are retained for a later, fresh maintenance process.
+        if storage is not None:
+            metadata_ref["storage"] = storage
+            proof_ref["storage"] = storage
         entries.append({"subject_sha256": subject, "proof": proof_ref, "metadata": metadata_ref,
                         "status": metadata["status"]})
     return entries
 
 
 def _enqueue_marker(state: dict, marker: dict, tag: str, transport: Any, now: str,
-                    head: str | None) -> tuple[dict[str, bytes], list[str]]:
-    entries = _marker_entries(marker, tag, transport)
+                    head: str | None, *, storage: dict | None = None) -> tuple[dict[str, bytes], list[str]]:
+    entries = _marker_entries(marker, tag, transport, storage=storage)
     records, proof_keys = {}, []
     for entry in entries:
         subject, metadata_ref, proof_ref = entry["subject_sha256"], entry["metadata"], entry["proof"]
@@ -509,7 +527,7 @@ def validate_catalog(transport: Any, ref: dict) -> dict:
         raw = transport.fetch(ref)
         if len(raw) != ref["bytes"] or sha256(raw) != ref["sha256"]:
             raise ValueError("Catalog validation bytes differ from verified descriptor")
-        entries = _marker_entries(_json(raw), ref["release_tag"], transport)
+        entries = _marker_entries(_json(raw), ref["release_tag"], transport, storage=ref.get("storage"))
         return {"status": "registration_pending", "catalog_key": ref["sha256"],
                 "proofs_in_catalog": len({entry["metadata"]["sha256"] for entry in entries})}
     finally:
@@ -531,7 +549,8 @@ def _register_loaded(transport: Any, head: str | None, state: dict, ref: dict,
     if sha256(raw) != ref["sha256"] or len(raw) != ref["bytes"]:
         raise ValueError("Catalog registration bytes differ from verified descriptor")
     trial = copy.deepcopy(state)
-    records, proof_keys = _enqueue_marker(trial, _json(raw), ref["release_tag"], transport, utc_iso(), head)
+    records, proof_keys = _enqueue_marker(trial, _json(raw), ref["release_tag"], transport, utc_iso(), head,
+                                         storage=ref.get("storage"))
     state["pending"] = trial["pending"]
     records[path] = canonical_json({"schema_version": 1, "catalog": ref,
         "proof_keys": proof_keys})

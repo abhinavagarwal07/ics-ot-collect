@@ -99,6 +99,7 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
         frozen_priorities.order if frozen_priorities else config.repositories, 1)}
     rows, seen_ids = [], {}
     source_deferred = False
+    destination_deferred = False
     history_settings = history_settings or {}
     for slug in config.repositories:
         row = {"slug": slug, "repository_id": None, "slot": slot,
@@ -119,6 +120,9 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
                      if priority_tier is None or by_slug[slug]["priority"] == priority_tier]
     for row in planning_rows:
         slug = row["slug"]
+        if destination_deferred:
+            row.update(plan_status="paused_destination", reason_code="shared_destination_rate_deferred")
+            continue
         if source_deferred:
             row["reason_code"] = "shared_source_rate_deferred"
             continue
@@ -170,11 +174,12 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
             row.update(plan_status="paused_state", reason_code=type(error).__name__)
             if isinstance(error, StateDeferredError):
                 row["retry_not_before"] = error.retry_not_before
-    if source_deferred and priority_tier is not None:
+                destination_deferred = True
+    if (source_deferred or destination_deferred) and priority_tier is not None:
         for row in rows:
             if row["priority"] > priority_tier:
                 row.update(plan_status="deferred_lower_priority_shared_rate",
-                           reason_code="shared_source_rate_deferred")
+                           reason_code="shared_destination_rate_deferred" if destination_deferred else "shared_source_rate_deferred")
     missing = [row for row in (planning_rows if frozen_priorities else rows)
                if row["plan_status"] == "bootstrap_pending"]
     # Corpus cold attempts honor the frozen order. Generic callers preserve
@@ -211,13 +216,13 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
         "priority_tier": priority_tier,
         "priority_counts": dict(Counter(row["priority"] for row in rows)),
         "planning_order": [row["slug"] for row in planning_rows],
-        "stop_lower_tiers": source_deferred,
+        "stop_lower_tiers": source_deferred or destination_deferred,
         "cold_bootstraps_remaining": cold_bootstraps - sum(row["allow_bootstrap"] for row in rows),
         "history_profile_readiness": "recent profile pending Git/API validation; full-history selections only",
         "max_parallel": MAX_PARALLEL, "cold_bootstrap_limit": cold_bootstraps,
         "source_quota": "public-read account allowances, optionally partitioned across two independent accounts; workers and same-account tokens do not create independent allowances",
         "source_rate_reserve": 40, "source_blocking_rate_wait_seconds": 0,
-        "monthly_evidence_policy_bytes": 50_000_000_000, "monthly_cap_enforced": False,
+        "monthly_cap_enforced": False,
         "state_accounting": "operational ciphertext is reported separately from retained evidence",
         "default_resource_limits": dict(DEFAULT_LIMITS),
         "counts": dict(Counter(row["plan_status"] for row in rows)), "repositories": rows,
@@ -445,6 +450,7 @@ def main(argv=None) -> int:
             state_private_key=args.state_private_key, evidence_public_key=args.evidence_public_key,
             code_sha=args.code_sha, config_source_sha256=sources["config_source_sha256"],
             observation_key=entry["observation_key"], allow_bootstrap=entry["allow_bootstrap"],
+            schedule_slot=entry["slot"],
             require_planned_state=True, expected_state_pointer_sha256=entry["expected_pointer_sha256"],
             max_restored_state_plaintext_bytes=limits["max_restored_state_plaintext_bytes"], transport=transport,
             history_policy=entry["history_policy"],

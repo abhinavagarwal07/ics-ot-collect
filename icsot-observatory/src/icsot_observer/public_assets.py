@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +31,14 @@ class PublicAssetUnavailable(RuntimeError):
     def __init__(self, *, status: int | None = None):
         super().__init__("Public GitHub asset is unavailable")
         self.status = status
+
+
+def _raise_network_failure(error: Exception) -> None:
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if (isinstance(reason, ssl.SSLCertVerificationError) or
+            isinstance(reason, ssl.SSLError) and getattr(reason, "reason", None) == "CERTIFICATE_VERIFY_FAILED"):
+        raise PublicAssetInvalid("Public GitHub asset TLS certificate verification failed") from None
+    raise PublicAssetUnavailable() from None
 
 
 class PublicAssetRateLimited(RuntimeError):
@@ -121,7 +130,7 @@ def download_public(url: str, target, *, size: int, digest: str | None, opener,
             finally:
                 error.close()
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
-            raise PublicAssetUnavailable() from None
+            _raise_network_failure(error)
         with response:
             if response.getcode() != 200:
                 raise PublicAssetInvalid("Unexpected public GitHub asset response")
@@ -144,8 +153,8 @@ def download_public(url: str, target, *, size: int, digest: str | None, opener,
                     chunk = reader(min(1024 * 1024, size - actual + 1))
                 except http.client.HTTPException:
                     raise PublicAssetInvalid("Public GitHub asset body was truncated or malformed") from None
-                except (OSError, TimeoutError, urllib.error.URLError):
-                    raise PublicAssetUnavailable() from None
+                except (OSError, TimeoutError, urllib.error.URLError) as error:
+                    _raise_network_failure(error)
                 if not chunk:
                     break
                 actual += len(chunk)

@@ -573,12 +573,19 @@ class GitHubAPI:
         return obj
 
     @staticmethod
-    def _item_identity(item: dict) -> tuple[str, str] | None:
+    def _item_identity(item: dict, *, pr_files: bool = False) -> tuple[str, str] | None:
+        if pr_files and isinstance(item.get("filename"), str) and item["filename"]:
+            return "filename", item["filename"]
         for field in ("id", "node_id", "sha", "name", "filename"):
             value = item.get(field)
             if (type(value) is int and value > 0) or (isinstance(value, str) and value):
                 return field, str(value)
         return None
+
+    @staticmethod
+    def _is_pr_files_url(url: str) -> bool:
+        route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url).path)
+        return route is not None and re.fullmatch(r"/pulls/[0-9]+/files", route["endpoint"]) is not None
 
     @staticmethod
     def _next_link(response: Response) -> str | None:
@@ -593,9 +600,9 @@ class GitHubAPI:
 
     @classmethod
     def _first_page_check(cls, first: Response, first_items: list[dict],
-                          fresh: Response, fresh_items: list[dict]) -> dict:
-        original = [cls._item_identity(item) for item in first_items]
-        current = [cls._item_identity(item) for item in fresh_items]
+                          fresh: Response, fresh_items: list[dict], *, pr_files: bool = False) -> dict:
+        original = [cls._item_identity(item, pr_files=pr_files) for item in first_items]
+        current = [cls._item_identity(item, pr_files=pr_files) for item in fresh_items]
         comparable = bool(original) and all(value is not None for value in original + current)
         duplicate = (len(set(original)) != len(original) or len(set(current)) != len(current)) if comparable else False
         cursor_changed = cls._next_link(first) != cls._next_link(fresh)
@@ -637,6 +644,7 @@ class GitHubAPI:
         Every raw attempt and interval remains archived; this is no atomic snapshot.
         """
         initial_url = self.url(path, {**(params or {}), "per_page": 100})
+        pr_files = self._is_pr_files_url(initial_url)
         first_route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(initial_url).path)
         assert first_route is not None
         for traversal in range(1, 3):
@@ -661,7 +669,7 @@ class GitHubAPI:
                     if first_response is None:
                         first_response, first_items = response, page
                     for item in page:
-                        identity = self._item_identity(item)
+                        identity = self._item_identity(item, pr_files=pr_files)
                         if identity is not None:
                             if identity in seen_ids:
                                 emit("api_pagination_check", important=True, scope=purpose, page=page_no,
@@ -698,7 +706,7 @@ class GitHubAPI:
                 if len(seen_urls) > 1:
                     fresh, fresh_items = self._request_json(initial_url, purpose + "_first_page_recheck", "list", page=1, scope_attempt=traversal)
                     assert first_response is not None
-                    check = self._first_page_check(first_response, first_items, fresh, fresh_items)
+                    check = self._first_page_check(first_response, first_items, fresh, fresh_items, pr_files=pr_files)
                     emit("api_pagination_check", important=not check["matches"] or check["representation_changed"],
                          scope=purpose, page=1, scope_attempt=traversal, **check)
                     if not check["matches"]:
@@ -791,6 +799,7 @@ class GitHubAPI:
         pages: list[Response] = []
         values: Any = {} if query["kind"] == "object" else []
         next_url = query["initial_url"]
+        pr_files = self._is_pr_files_url(next_url)
         seen_ids: set[tuple[str, str]] = set()
         seen_urls: set[str] = set()
         for expected, page in enumerate(state["pages"], 1):
@@ -815,7 +824,7 @@ class GitHubAPI:
                 values, next_url = value, None
             else:
                 for item in value:
-                    identity = self._item_identity(item)
+                    identity = self._item_identity(item, pr_files=pr_files)
                     if identity is not None:
                         if identity in seen_ids:
                             raise CheckpointError("Repeated entity ID in checkpoint pages")
@@ -855,6 +864,7 @@ class GitHubAPI:
 
     def _run_checkpoint_scope(self, scope: str, query: dict, *, validate=None) -> tuple[Any, dict]:
         """Resume one exact query. A drifted attempt is retained, never stitched."""
+        pr_files = self._is_pr_files_url(query["initial_url"])
         assert self.checkpoint_store is not None
         if scope in self._checkpoint_integrity_errors:
             raise CheckpointError("; ".join(self._checkpoint_integrity_errors[scope]))
@@ -893,7 +903,7 @@ class GitHubAPI:
             if resumed:
                 fresh, fresh_items = self._request_json(query["initial_url"], scope + "_resume_first_page_validation",
                                                          query["kind"], checkpointed=True, page=1, scope_attempt=state["restarts"] + 1)
-                check = (self._first_page_check(pages[0], first_items, fresh, fresh_items)
+                check = (self._first_page_check(pages[0], first_items, fresh, fresh_items, pr_files=pr_files)
                          if query["kind"] == "list" else {"matches": fresh.body == pages[0].body,
                          "failure_category": "pagination_drift"})
                 if check["matches"]:
@@ -917,7 +927,7 @@ class GitHubAPI:
                     continue
             next_url = state["pages"][-1]["next_url"] if pages else query["initial_url"]
             seen_urls = {page["url"] for page in state["pages"]}
-            seen_ids = {identity for item in values if (identity := self._item_identity(item)) is not None} if query["kind"] == "list" else set()
+            seen_ids = {identity for item in values if (identity := self._item_identity(item, pr_files=pr_files)) is not None} if query["kind"] == "list" else set()
             try:
                 while next_url is not None:
                     if next_url in seen_urls:
@@ -931,7 +941,7 @@ class GitHubAPI:
                         values, following = value, None
                     else:
                         for item in value:
-                            identity = self._item_identity(item)
+                            identity = self._item_identity(item, pr_files=pr_files)
                             if identity is not None:
                                 if identity in seen_ids:
                                     emit("api_pagination_check", important=True, scope=scope, page=len(pages) + 1,
@@ -959,7 +969,7 @@ class GitHubAPI:
                 if query["kind"] == "list" and len(pages) > 1:
                     fresh, fresh_items = self._request_json(query["initial_url"], scope + "_first_page_recheck",
                                                              "list", checkpointed=True, page=1, scope_attempt=state["restarts"] + 1)
-                    check = self._first_page_check(pages[0], first_items, fresh, fresh_items)
+                    check = self._first_page_check(pages[0], first_items, fresh, fresh_items, pr_files=pr_files)
                     matches = check["matches"]
                     emit("api_pagination_check", important=not matches or check["representation_changed"],
                          scope=scope, page=1, scope_attempt=state["restarts"] + 1, **check)

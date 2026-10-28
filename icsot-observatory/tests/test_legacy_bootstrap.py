@@ -320,7 +320,7 @@ def test_manual_initializer_queues_with_recurring_collection_under_shared_worker
     pilot = (root / ".github/workflows/persistent-selected.yml").read_text()
     tier = (root / ".github/workflows/corpus-priority-tier.yml").read_text()
     assert "  schedule:" not in initializer and "  workflow_dispatch:" in initializer
-    assert "cron: '17 */6 * * *'" in recurring
+    assert "  schedule:" not in recurring and "  workflow_dispatch:" in recurring
     for workflow in (initializer, recurring, pilot):
         concurrency = workflow.split("\nconcurrency:\n", 1)[1].split("\ndefaults:\n", 1)[0]
         assert "  group: persistent-collection\n" in concurrency

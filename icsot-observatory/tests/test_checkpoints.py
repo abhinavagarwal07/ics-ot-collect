@@ -56,6 +56,37 @@ FIRST_BODY = b'[{"id":1}]'
 LINK = {"Link": f'<{SECOND}>; rel="next"'}
 
 
+def test_pull_files_with_shared_blob_sha_survive_checkpoint_reload(tmp_path):
+    first = METADATA + "/pulls/7/files?per_page=100"
+    second = first + "&page=2"
+    first_body = b'[{"filename":"a","sha":"same"},{"filename":"b","sha":"same"}]'
+    second_body = b'[{"filename":"c","sha":"same"}]'
+    query = {"initial_url": first, "kind": "list", "updated_before": None}
+
+    def interrupted(url):
+        if url == first:
+            return Reply(first_body, {"Link": f'<{second}>; rel="next"'})
+        raise Crash()
+
+    api, _, _ = client(tmp_path, interrupted)
+    with pytest.raises(Crash):
+        api._run_checkpoint_scope("pull_files:7", query)
+
+    changed_first_body = b'[{"filename":"a","sha":"same","changes":1},{"filename":"b","sha":"same"}]'
+    def restored(url):
+        return Reply(changed_first_body, {"Link": f'<{second}>; rel="next"'}) if url == first else Reply(second_body)
+
+    resumed, _, calls = client(tmp_path, restored)
+    values, outcome = resumed._run_checkpoint_scope("pull_files:7", query)
+    assert [item["filename"] for item in values] == ["a", "b", "c"]
+    assert outcome["status"] == "complete_for_query"
+    assert calls == [first, second, first]
+    reloaded, _, calls = client(tmp_path, lambda url: pytest.fail(url))
+    values, outcome = reloaded._run_checkpoint_scope("pull_files:7", query)
+    assert [item["filename"] for item in values] == ["a", "b", "c"]
+    assert outcome["reused_from_checkpoint"] and not calls
+
+
 def test_response_and_page_are_durable_before_next_request_and_resume(tmp_path):
     def interrupted(url):
         if url == METADATA:

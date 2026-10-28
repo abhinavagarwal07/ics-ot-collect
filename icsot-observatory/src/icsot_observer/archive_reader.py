@@ -189,7 +189,7 @@ def verify_encrypted_part(part: ArchivePart, private_key_path: str | os.PathLike
 
 
 def _xz_chunks(chunks: Iterable[bytes], *, memory_limit: int,
-               max_output_bytes: int) -> Iterator[bytes]:
+               max_output_bytes: int, expected_output_bytes: int | None = None) -> Iterator[bytes]:
     decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memory_limit)
     ended, output_bytes = False, 0
     try:
@@ -216,6 +216,8 @@ def _xz_chunks(chunks: Iterable[bytes], *, memory_limit: int,
                     break
         if not ended:
             raise ArchiveError("Truncated XZ archive stream")
+        if expected_output_bytes is not None and output_bytes != expected_output_bytes:
+            raise ArchiveError("Decoded tar length differs from group index")
     except lzma.LZMAError:
         raise ArchiveError("Invalid or memory-limit-exceeding XZ archive stream") from None
 
@@ -297,6 +299,80 @@ def _pax_fields(raw: bytes) -> dict[str, str]:
     return result
 
 
+GROUP_LAYOUT = "independent-tar-xz-groups-v2"
+FALLBACK_LAYOUT = "legacy-large-member-fallback-v1"
+
+
+def reader_options(index: Mapping[str, Any]) -> dict[str, Any]:
+    layout = index.get("archive_layout")
+    if layout is None:
+        return {}
+    if layout == FALLBACK_LAYOUT:
+        from .compression import GROUP_LIMIT, FALLBACK_PROFILE, LEGACY_FALLBACK_REASON
+        fallback = index.get("large_member_fallback")
+        if (index.get("compression_profile") != FALLBACK_PROFILE or not isinstance(fallback, Mapping)
+                or set(fallback) != {"reason", "oversized_member_count", "group_tar_plaintext_limit_bytes", "requested_archive_profile"}
+                or fallback.get("reason") != LEGACY_FALLBACK_REASON
+                or fallback.get("requested_archive_profile") != "grouped-xz-v2"
+                or type(fallback.get("oversized_member_count")) is not int or fallback["oversized_member_count"] < 1
+                or type(fallback.get("group_tar_plaintext_limit_bytes")) is not int
+                or not tarfile.RECORDSIZE <= fallback["group_tar_plaintext_limit_bytes"] <= GROUP_LIMIT
+                or "groups" in index):
+            raise ArchiveError("Invalid large-member fallback metadata")
+        return {"xz_memory_limit": 256 * _CHUNK}
+    if layout != GROUP_LAYOUT:
+        raise ArchiveError("Unknown archive layout")
+    groups = index.get("groups")
+    assets = index.get("assets")
+    if not isinstance(groups, list) or not groups or not isinstance(assets, list) or len(groups) != len(assets):
+        raise ArchiveError("Invalid grouped archive asset list")
+    for group, asset in zip(groups, assets):
+        if (not isinstance(group, Mapping) or not isinstance(asset, Mapping)
+                or group.get("asset") != {"name": asset.get("name"), "sha256": asset.get("sha256")}):
+            raise ArchiveError("Grouped archive asset binding differs from index")
+    return {"groups": groups, "xz_memory_limit": 256 * _CHUNK}
+
+
+def validate_groups(groups, expected_members):
+    from .compression import GROUP_LIMIT, PROFILE
+    if not isinstance(groups, list) or not groups or expected_members is None:
+        raise ArchiveError("Grouped archive requires groups and expected members")
+    planned, names, digests, seen = [], set(), set(), set()
+    for group in groups:
+        if not isinstance(group, Mapping):
+            raise ArchiveError("Invalid group metadata")
+        asset, members, size = group.get("asset"), group.get("members"), group.get("tar_plaintext_bytes")
+        if (not isinstance(asset, Mapping) or set(asset) != {"name", "sha256"}
+                or not isinstance(asset.get("name"), str) or not asset["name"]
+                or Path(asset["name"]).name != asset["name"]
+                or not isinstance(asset.get("sha256"), str) or not _SHA256.fullmatch(asset["sha256"])
+                or asset["name"] in names or asset["sha256"] in digests or not isinstance(members, list)
+                or (not members and len(groups) != 1)
+                or type(size) is not int or size < tarfile.RECORDSIZE or size > GROUP_LIMIT
+                or size % tarfile.RECORDSIZE or group.get("profile") != PROFILE):
+            raise ArchiveError("Invalid group asset, tar size, or compression profile")
+        names.add(asset["name"])
+        digests.add(asset["sha256"])
+        expected = {}
+        for member in members:
+            if not isinstance(member, Mapping):
+                raise ArchiveError("Invalid group member")
+            path = _safe_path("evidence/" + _safe_path(member.get("path")))
+            if path in seen:
+                raise ArchiveError("Duplicate group member")
+            identity = {"bytes": member.get("bytes"), "sha256": member.get("sha256")}
+            if (type(identity["bytes"]) is not int or identity["bytes"] < 0
+                    or not isinstance(identity["sha256"], str) or not _SHA256.fullmatch(identity["sha256"])
+                    or expected_members.get(path) != identity):
+                raise ArchiveError("Group members differ from global index")
+            expected[path] = identity
+            seen.add(path)
+        planned.append((asset, expected, size))
+    if set().union(*(set(expected) for _, expected, _ in planned)) != set(expected_members):
+        raise ArchiveError("Grouped archive lacks public-index members")
+    return planned
+
+
 class VerifiedArchiveReader:
     def __init__(self, parts: Iterable[ArchivePart | ContextManager[ArchivePart]],
                  private_key_path: str | os.PathLike, *, password: bytes | None = None,
@@ -304,8 +380,10 @@ class VerifiedArchiveReader:
                  allowed_prefixes: tuple[str, ...], max_members: int = 2_000_000,
                  max_member_bytes: int = 1 << 40, max_total_bytes: int = 1 << 44,
                  max_tar_stream_bytes: int = 1 << 44,
-                 max_metadata_bytes: int = 16 * _CHUNK, xz_memory_limit: int = 64 * _CHUNK):
+                 max_metadata_bytes: int = 16 * _CHUNK, xz_memory_limit: int = 64 * _CHUNK,
+                 groups: list[dict[str, Any]] | None = None, _tar_bytes: int | None = None):
         self.parts, self.private_key_path, self.password = parts, private_key_path, password
+        self.groups, self._tar_bytes = groups, _tar_bytes
         if not allowed_prefixes:
             raise ValueError("An explicit archive path allowlist is required")
         self.allowed_prefixes = tuple(_safe_path(path.rstrip("/")) for path in allowed_prefixes)
@@ -333,7 +411,41 @@ class VerifiedArchiveReader:
     def _allowed(self, path: str) -> bool:
         return any(path == prefix or path.startswith(prefix + "/") for prefix in self.allowed_prefixes)
 
+    def _scan_groups(self, on_member):
+        planned = validate_groups(self.groups, self.expected_members)
+        if sum(size for _, _, size in planned) > self.max_tar_stream_bytes:
+            raise ArchiveError("Grouped archive exceeds aggregate tar byte bound")
+        aggregate, candidates = ArchiveScan(), iter(self.parts)
+        for asset, expected, size in planned:
+            try:
+                candidate = next(candidates)
+            except StopIteration:
+                raise ArchiveError("Grouped archive is missing an asset") from None
+            manager = contextlib.nullcontext(candidate) if isinstance(candidate, ArchivePart) else candidate
+            with manager as part:
+                if (not isinstance(part, ArchivePart) or (part.name or part.path.name) != asset["name"]
+                        or part.ciphertext_sha256 != asset["sha256"]):
+                    raise ArchiveError("Grouped archive assets differ from declared order or identity")
+                report = VerifiedArchiveReader([part], self.private_key_path, password=self.password,
+                    expected_members=expected, allowed_prefixes=self.allowed_prefixes,
+                    max_members=self.max_members, max_member_bytes=self.max_member_bytes,
+                    max_total_bytes=self.max_total_bytes, max_tar_stream_bytes=min(self.max_tar_stream_bytes, size),
+                    max_metadata_bytes=self.max_metadata_bytes, xz_memory_limit=self.xz_memory_limit,
+                    _tar_bytes=size).scan(on_member)
+            aggregate.members.extend(report.members)
+            aggregate.parts.extend(report.parts)
+            aggregate.total_bytes += report.total_bytes
+            if len(aggregate.members) > self.max_members or aggregate.total_bytes > self.max_total_bytes:
+                raise ArchiveError("Grouped archive exceeds aggregate bounds")
+        try:
+            next(candidates)
+        except StopIteration:
+            return aggregate
+        raise ArchiveError("Grouped archive has extra assets")
+
     def scan(self, on_member: Callable[[MemberRecord, BinaryIO], None] | None = None) -> ArchiveScan:
+        if self.groups is not None:
+            return self._scan_groups(on_member)
         report = ArchiveScan()
         try:
             private_key = enc._load_private_key(self.private_key_path, self.password)
@@ -341,7 +453,7 @@ class VerifiedArchiveReader:
             raise ArchiveError(str(error)) from None
         plaintext = _plaintext_parts(self.parts, private_key, report)
         source = _ChunkReader(_xz_chunks(plaintext, memory_limit=self.xz_memory_limit,
-                                        max_output_bytes=self.max_tar_stream_bytes))
+                                        max_output_bytes=self.max_tar_stream_bytes, expected_output_bytes=self._tar_bytes))
         seen, pending_pax, global_pax, longname = set(), {}, {}, None
         extensions, headers = 0, 0
         try:

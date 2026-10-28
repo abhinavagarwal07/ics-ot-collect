@@ -184,6 +184,21 @@ def test_later_tier_uses_frozen_cycle_slot_but_real_plan_time(tmp_path):
     assert result["planned_at"].startswith("1970-01-03T06:00:00")
 
 
+def test_destination_deferral_stops_identity_planning_and_lower_tiers(tmp_path):
+    from icsot_observer.github_state import StateDeferredError
+    cfg, policy, calls, identity, _ = fixture(tmp_path)
+    def blocked(_):
+        raise StateDeferredError("destination reserve", retry_not_before=200000)
+    result = build_plan(cfg, sources={}, code_sha=CODE, identity_loader=identity,
+                        pointer_loader=blocked, frozen_priorities=policy, priority_tier="P0", now=100000)
+    assert calls == [ORDER[0]] and result["stop_lower_tiers"] is True
+    assert result["matrix"]["include"] == []
+    rows = {row["slug"]: row for row in result["repositories"]}
+    assert rows[ORDER[0]]["retry_not_before"] == 200000
+    assert rows[ORDER[1]]["plan_status"] == "paused_destination"
+    assert all(rows[slug]["plan_status"] == "deferred_lower_priority_shared_rate" for slug in ORDER[2:])
+
+
 def test_changed_priority_file_rejects_an_old_plan_before_capture(tmp_path):
     cfg, policy, _, identity, pointers = fixture(tmp_path)
     result = build_plan(cfg, sources={}, code_sha=CODE, identity_loader=identity, pointer_loader=pointers.get,

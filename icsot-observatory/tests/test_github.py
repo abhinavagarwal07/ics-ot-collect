@@ -14,6 +14,38 @@ def api(tmp_path):
     return GitHubAPI(cfg, ObjectStore(tmp_path), [])
 
 
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_pull_file_pagination_uses_filename_not_blob_sha(tmp_path, duplicate):
+    client = api(tmp_path)
+    first = "https://api.github.com/repos/test/repo/pulls/7/files?per_page=100"
+    second = first + "&page=2"
+    first_reads = 0
+
+    def fake_get(url, purpose):
+        nonlocal first_reads
+        if url == first:
+            first_reads += 1
+            # A representation-only change exercises first-page identity checks.
+            body = json.dumps([{"filename": "a", "sha": "same", "changes": first_reads},
+                               {"filename": "b", "sha": "same"}]).encode()
+            headers = {"link": f'<{second}>; rel="next"'}
+        else:
+            body = json.dumps([{"filename": "a" if duplicate else "c", "sha": "different"}]).encode()
+            headers = {}
+        return Response(body, {"headers": headers, "body_sha256": client.store.put(body)})
+
+    client.get = fake_get
+    if duplicate:
+        with pytest.raises(RuntimeError, match="repeated ID a"):
+            client.list_pages("/repos/test/repo/pulls/7/files", "pull_files:7")
+    else:
+        items = client.list_pages("/repos/test/repo/pulls/7/files", "pull_files:7")
+        assert [item["filename"] for item in items] == ["a", "b", "c"]
+        assert first_reads == 2
+    assert GitHubAPI._item_identity({"sha": "commit", "filename": "x"}) == ("sha", "commit")
+    assert GitHubAPI._item_identity({"id": 1, "sha": "commit"}) == ("id", "1")
+
+
 def test_pages_and_stop_at_older_updated_date(tmp_path):
     client = api(tmp_path)
     first = "https://api.github.com/repos/test/repo/pulls?state=all&sort=updated&direction=desc&per_page=100"

@@ -756,6 +756,22 @@ def test_transport_transient_get_retry_bounded_and_writes_never_retry():
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_streamed_asset_http_transient_retries_once_and_discards_partial_bytes(tmp_path, status):
+    calls = []
+    def runner(args, **kwargs):
+        calls.append(args)
+        kwargs["stdout"].write(b"partial" if len(calls) == 1 else b"complete")
+        return subprocess.CompletedProcess(args, 1 if len(calls) == 1 else 0, None,
+            f"gh: unavailable (HTTP {status})".encode() if len(calls) == 1 else b"")
+    transport = GhCliStateTransport("owner/collector", runner=runner)
+    target = tmp_path / "download"
+    with target.open("w+b") as output:
+        transport._run(["api", "repos/owner/collector/releases/assets/1", "--method", "GET"], stdout=output)
+    assert target.read_bytes() == b"complete"
+    assert len(calls) == transport.request_count == 2
+
+
 def test_budget_deferral_keeps_old_pointer_and_uploads_no_state_assets(setup):
     transport, make, _ = setup
     store = make()
@@ -2095,3 +2111,298 @@ def test_compaction_planner_picks_smallest_complete_closures_first(setup):
     plan = store._compaction_plan(old, max_input_bytes=40, max_input_parts=20)
     assert plan["parts"] == [f"{n:064x}" for n in range(1, 21)]
     assert plan["input_bytes"] == 40 and plan["part_savings"] == 19
+
+
+def test_grouped_profile_roundtrip_and_immutable_reuse(setup, monkeypatch):
+    import lzma
+    from icsot_observer.compression import XZ_COMMAND
+    calls = []
+
+    def fake_run(command, *, stdin, stdout, stderr, check):
+        assert tuple(command) == XZ_COMMAND
+        calls.append(tuple(command))
+        stdout.write(lzma.compress(stdin.read(), preset=0))
+        return subprocess.CompletedProcess(command, 0)
+
+    transport, make, _ = setup
+    legacy = make()
+    old = b"old immutable"
+    old_hash = hashlib.sha256(old).hexdigest()
+    old_path = f"objects/sha256/{old_hash[:2]}/{old_hash}"
+    write(legacy, old_path, old)
+    publish(legacy)
+    predecessor = legacy.read()
+    old_segments = copy.deepcopy(predecessor.index["files"][0]["segments"])
+    old_part = copy.deepcopy(predecessor.index["parts"][old_segments[0]["part"]])
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    store = make()
+    executable = write(store, "scripts/run", b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    publish(store, predecessor)
+    selected = store.read()
+    assert selected.pointer["index"]["encoding"] == "xz"
+    assert selected.pointer["index"]["compression_profile"] == "grouped-xz-v2"
+    files = {item["path"]: item for item in selected.index["files"]}
+    assert files[old_path]["segments"] == old_segments
+    assert selected.index["parts"][old_segments[0]["part"]] == old_part
+    new_part = selected.index["parts"][files["scripts/run"]["segments"][0]["part"]]
+    assert new_part["compression_profile"] == "grouped-xz-v2"
+    assert new_part["decoded_bytes"] <= 500 * 1024**2
+    assert len(calls) == 2
+    damaged = copy.deepcopy(selected.pointer)
+    damaged["index"]["decoded_sha256"] = "0" * 64
+    with pytest.raises(StateError, match="digest"):
+        store._check_index(damaged, selected.index)
+    raw_pointer = json.loads(transport.commits[transport.head][store.repository_id])
+    raw_pointer["index"]["decoded_sha256"] = "0" * 64
+    transport.commits[transport.head][store.repository_id] = canonical_json(raw_pointer)
+    with pytest.raises(StateIntegrityError):
+        store.read()
+    transport.commits[transport.head][store.repository_id] = canonical_json(selected.pointer)
+    clear(store)
+    store.restore(store.read())
+    assert (store.root / old_path).read_bytes() == old
+    assert (store.root / "scripts/run").stat().st_mode & 0o777 == 0o700
+
+
+def test_grouped_profile_bound_fallback_and_legacy_index_cap(setup, monkeypatch):
+    _, make, _ = setup
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+    store = make()
+    item = {"path": "git/7.git/objects/pack/large.pack", "bytes": 500 * 1024**2,
+            "sha256": "a" * 64, "mode": 0o600}
+    plan = store._snapshot_plan([item], {"files": []})
+    assert plan["raw"] == [item] and plan["large_member_legacy_fallback_count"] == 1
+    old = {**item, "segments": [{"part": "b" * 64}]}
+    plan = store._snapshot_plan([item], {"files": [old]})
+    assert plan["reused"][item["path"]] == old["segments"]
+    item["path"] = "working/large"
+    plan = store._snapshot_plan([item], {"files": []})
+    assert plan["raw"] == [item] and plan["large_member_legacy_fallback_count"] == 1
+    assert store.profile_group_bytes == 500 * 1024**2
+    # Pointer validation preserves the historical 1 GiB encoded index limit,
+    # without constructing an index of that size.
+    monkeypatch.delenv("ICSOT_ARCHIVE_PROFILE")
+    legacy = make()
+    write(legacy, "file", b"x")
+    publish(legacy)
+    pointer = copy.deepcopy(legacy.read().pointer)
+    pointer["index"]["plaintext_bytes"] = 1024**3
+    legacy._check_pointer(pointer)
+
+
+def test_grouped_profile_parallel_groups_and_prepared_frozen_bytes(setup, monkeypatch):
+    import lzma
+    import threading
+    from icsot_observer.compression import XZ_COMMAND
+    transport, make, tmp_path = setup
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+    store = make(immutable_group_members=1)
+    for i in range(4):
+        write(store, f"file-{i}", bytes([i]) * 20)
+    barrier = threading.Barrier(4, timeout=5)
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+
+    def fake_run(command, *, stdin, stdout, stderr, check):
+        nonlocal running, peak
+        assert tuple(command) == XZ_COMMAND
+        if str(getattr(stdin, "name", "")).endswith(".tar"):
+            with lock:
+                running += 1
+                peak = max(peak, running)
+            barrier.wait()
+            stdout.write(lzma.compress(stdin.read(), preset=0))
+            with lock:
+                running -= 1
+        else:
+            stdout.write(lzma.compress(stdin.read(), preset=0))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    prepared = prepared_state(store, tmp_path)
+    assert peak == 4
+    assert not transport.uploads
+    frozen = {asset["path"]: (prepared.directory / asset["path"]).read_bytes()
+              for asset in json.loads((prepared.directory / "prepared.json").read_bytes())["assets"]}
+    monkeypatch.setattr("icsot_observer.github_state.encrypt_file", lambda *a, **kw: pytest.fail("reencrypted"))
+    store.publish_prepared(prepared, quiescent=True)
+    assert all((prepared.directory / path).read_bytes() == value for path, value in frozen.items())
+    selection = store.read()
+    clear(store)
+    store.restore(selection)
+    assert [(store.root / f"file-{i}").read_bytes() for i in range(4)] == [bytes([i]) * 20 for i in range(4)]
+
+
+def test_grouped_profile_compaction_reads_back_compressed_index(setup, monkeypatch):
+    import lzma
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    for value in (b"alpha", b"beta", b"gamma"):
+        cas_file(legacy, value)
+    publish(legacy)
+    before = legacy.read()
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+
+    def fake_run(command, *, stdin, stdout, stderr, check):
+        stdout.write(lzma.compress(stdin.read(), preset=0))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    store = make()
+    clear(store)
+    store.restore(before)
+    old = dict(transport.assets)
+    assert compact_for_test(store, before)["status"] == "complete"
+    after = store.read()
+    assert after.pointer["index"]["encoding"] == "xz"
+    assert any(part.get("compression_profile") == "grouped-xz-v2" for part in after.index["parts"].values())
+    assert all(transport.assets[key] == value for key, value in old.items())
+    clear(store)
+    store.restore(after)
+
+
+def test_grouped_profile_oversized_legacy_fallback_reconstructs(setup, monkeypatch):
+    import lzma
+    import random
+    from icsot_observer.compression import XZ_COMMAND
+    transport, make, _ = setup
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+    store = make(part_bytes=16384)
+    store.profile_group_bytes = 10240
+    calls = []
+
+    def fake_run(command, *, stdin, stdout, stderr, check):
+        assert tuple(command) == XZ_COMMAND
+        calls.append(Path(stdin.name).name)
+        stdout.write(lzma.compress(stdin.read(), preset=0))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    cas_data = b"cas-body-" * 2300
+    cas_hash = hashlib.sha256(cas_data).hexdigest()
+    cas_path = f"objects/sha256/{cas_hash[:2]}/{cas_hash}"
+    git_path = "git/7.git/objects/pack/pack-large.pack"
+    git_data = b"PACK" + b"g" * 21000
+    mutable_data = b"m" * 21000
+    random_data = random.Random(17).randbytes(12000)
+    write(store, "random", random_data)
+    write(store, cas_path, cas_data)
+    write(store, git_path, git_data).chmod(0o700)
+    write(store, "mutable", mutable_data)
+    write(store, "small", b"small grouped file")
+    report = publish(store)
+    assert report["large_member_legacy_fallback_count"] == 4
+    assert report["large_member_legacy_fallback_profile"] == "mixed-raw-or-custom-xz-parts"
+    selection = store.read()
+    assert selection.index["context"]["state_archive_profile"] == {
+        "name": "grouped-xz-v2", "large_member_legacy_fallback_count": 4,
+        "large_member_legacy_fallback_profile": "mixed-raw-or-custom-xz-parts"}
+    files = {item["path"]: item for item in selection.index["files"]}
+    for name in (cas_path, git_path, "mutable"):
+        assert len(files[name]["segments"]) == 2
+        assert all(selection.index["parts"][segment["part"]]["kind"] == "raw"
+                   for segment in files[name]["segments"])
+    assert all(selection.index["parts"][segment["part"]]["encoding"] == "raw"
+               for segment in files[git_path]["segments"])
+    assert all(selection.index["parts"][segment["part"]]["encoding"] == "xz" and
+               selection.index["parts"][segment["part"]]["compression_profile"] == "grouped-xz-v2"
+               for segment in files[cas_path]["segments"])
+    random_part = selection.index["parts"][files["random"]["segments"][0]["part"]]
+    assert random_part["encoding"] == "xz" and random_part["plaintext_bytes"] > len(random_data)
+    assert random_part["compression_profile"] == "grouped-xz-v2"
+    assert calls.count("chunk") == 5
+    assert selection.index["parts"][files["small"]["segments"][0]["part"]]["compression_profile"] == "grouped-xz-v2"
+    saved = {name: copy.deepcopy(files[name]["segments"]) for name in (cas_path, git_path)}
+    second = publish(store, selection)
+    current = store.read()
+    assert second["large_member_legacy_fallback_count"] == 2
+    assert all(next(item for item in current.index["files"] if item["path"] == name)["segments"] == segments
+               for name, segments in saved.items())
+    clear(store)
+    store.restore(current)
+    assert (store.root / cas_path).read_bytes() == cas_data
+    assert (store.root / git_path).read_bytes() == git_data
+    assert (store.root / git_path).stat().st_mode & 0o777 == 0o700
+    assert (store.root / "mutable").read_bytes() == mutable_data
+    assert (store.root / "random").read_bytes() == random_data
+    assert (store.root / "small").read_bytes() == b"small grouped file"
+
+
+def test_grouped_profile_failed_batch_does_not_upload_partial_batch(setup, monkeypatch):
+    import lzma
+    transport, make, _ = setup
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+    store = make(immutable_group_members=1)
+    for i in range(4):
+        write(store, f"file-{i}", bytes([i]))
+
+    def fake_run(command, *, stdin, stdout, stderr, check):
+        if str(stdin.name).endswith("group-1.tar"):
+            raise subprocess.CalledProcessError(1, command)
+        stdout.write(lzma.compress(stdin.read(), preset=0))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(StateError, match="compression failed"):
+        publish(store)
+    assert transport.uploads == []
+
+
+def test_grouped_profile_raw_encoder_failure_does_not_fallback(setup, monkeypatch):
+    transport, make, _ = setup
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+    store = make(part_bytes=16384)
+    store.profile_group_bytes = 10240
+    write(store, "large", b"x" * 12000)
+
+    def failed_run(command, *, stdin, stdout, stderr, check):
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    with pytest.raises(StateError, match="compression failed"):
+        publish(store)
+    assert not transport.uploads
+
+
+def test_grouped_profile_decoder_has_bounded_memory(setup, monkeypatch, tmp_path):
+    import lzma
+    _, make, _ = setup
+    store = make()
+    raw = b"small synthetic data"
+    encoded = tmp_path / "data.xz"
+    encoded.write_bytes(lzma.compress(raw, preset=0))
+    ref = {"encoding": "xz", "compression_profile": "grouped-xz-v2",
+           "plaintext_sha256": hashlib.sha256(encoded.read_bytes()).hexdigest(),
+           "decoded_sha256": hashlib.sha256(raw).hexdigest(), "decoded_bytes": len(raw)}
+    original = lzma.LZMADecompressor
+    limits = []
+
+    def bounded(*args, **kwargs):
+        limits.append(kwargs.get("memlimit"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(lzma, "LZMADecompressor", bounded)
+    assert store._decode_part(ref, encoded, tmp_path / "decoded").read_bytes() == raw
+    assert limits == [256 * 1024**2]
+
+
+def test_grouped_profile_raw_encoded_part_over_limit_defers(setup, monkeypatch):
+    import lzma
+    import random
+    transport, make, _ = setup
+    monkeypatch.setenv("ICSOT_ARCHIVE_PROFILE", "grouped-xz-v2")
+    store = make(part_bytes=16384)
+    store.profile_group_bytes = 10240
+    write(store, "random", random.Random(93).randbytes(16384))
+
+    def fake_run(command, *, stdin, stdout, stderr, check):
+        stdout.write(lzma.compress(stdin.read(), preset=0))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(StateDeferredError, match="Encoded state part exceeds"):
+        publish(store)
+    assert not transport.uploads

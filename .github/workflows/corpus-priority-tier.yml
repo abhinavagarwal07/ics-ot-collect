@@ -24,6 +24,9 @@ permissions:
 env:
   # Caller workflow env does not propagate to reusable workflows.
   ICSOT_DEBUG: '1'
+  ICSOT_ARCHIVE_PROFILE: grouped-xz-v2
+  ICSOT_RELEASE_LAYOUT: cycle-v1
+  ICSOT_CYCLE_SLOT: ${{ inputs.schedule_slot }}
 
 defaults:
   run:
@@ -39,7 +42,7 @@ jobs:
       planned_count: ${{ steps.plan.outputs.planned_count }}
       plan_sha256: ${{ steps.plan.outputs.plan_sha256 }}
       code_sha: ${{ steps.plan.outputs.code_sha }}
-      plan_release: ${{ steps.release.outputs.plan_release }}
+      plan_locator: ${{ steps.metadata.outputs.plan_locator }}
       cold_bootstraps_remaining: ${{ steps.plan.outputs.cold_bootstraps_remaining }}
       stop_lower_tiers: ${{ steps.plan.outputs.stop_lower_tiers }}
     steps:
@@ -79,17 +82,15 @@ jobs:
               "--github-output", os.environ["GITHUB_OUTPUT"]], check=True)
           PY
       - name: Publish the immutable metadata-only plan
-        id: release
+        id: metadata
         env:
           GH_TOKEN: ${{ github.token }}
           PRIORITY_TIER: ${{ inputs.priority_tier }}
         run: |
-          tag="collector-incremental-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PRIORITY_TIER}"
-          gh release create "$tag" analysis/recurring-plan/recurring-plan.json \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Six-hour ${PRIORITY_TIER} collection plan ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}" \
-            --notes "Immutable metadata plan for all 185 cohort entries, selecting the ${PRIORITY_TIER} tier in frozen order. Ready state resumes incrementally. Scheduled fresh bootstraps default to zero; an explicit manual selection can request up to eight new public bootstraps across tiers. Retained baseline initialization is handled separately. Other tiers remain explicitly unselected or deferred. This release is not a completed-cohort claim. No user-imposed GitHub storage budget applies; actual service limits still apply."
-          printf 'plan_release=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          python -m icsot_observer.git_metadata put --repository "$GITHUB_REPOSITORY" \
+            --path "plans/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${PRIORITY_TIER}.json" \
+            --file analysis/recurring-plan/recurring-plan.json \
+            --github-output "$GITHUB_OUTPUT" --output-name plan_locator
 
   observe:
     needs: plan
@@ -119,10 +120,11 @@ jobs:
       - name: Fetch only this run's public metadata plan
         env:
           GH_TOKEN: ${{ github.token }}
-          PLAN_RELEASE: ${{ needs.plan.outputs.plan_release }}
+          PLAN_LOCATOR: ${{ needs.plan.outputs.plan_locator }}
         run: |
-          gh release download "$PLAN_RELEASE" --repo "$GITHUB_REPOSITORY" \
-            --pattern recurring-plan.json --dir "$RUNNER_TEMP/icsot-recurring-plan"
+          mkdir -p "$RUNNER_TEMP/icsot-recurring-plan"
+          python -m icsot_observer.git_metadata get --repository "$GITHUB_REPOSITORY" \
+            --locator-json "$PLAN_LOCATOR" --output "$RUNNER_TEMP/icsot-recurring-plan/recurring-plan.json"
       - name: Materialize the existing operational state key
         env:
           COLLECTOR_STATE_PRIVATE_KEY: ${{ secrets.COLLECTOR_STATE_PRIVATE_KEY }}
@@ -173,11 +175,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_REPOSITORY_ID: ${{ matrix.repository_id }}
-          PLAN_RELEASE: ${{ needs.plan.outputs.plan_release }}
         run: |
           outcome="analysis/recurring-outcomes/outcome-r${SOURCE_REPOSITORY_ID}-attempt${GITHUB_RUN_ATTEMPT}.json"
           if [ -f "$outcome" ]; then
-            gh release upload "$PLAN_RELEASE" "$outcome" --repo "$GITHUB_REPOSITORY"
+            python -m icsot_observer.git_metadata put --repository "$GITHUB_REPOSITORY" \
+              --path "outcomes/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/r${SOURCE_REPOSITORY_ID}.json" \
+              --file "$outcome"
             cat "$outcome" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Preserve bounded runner outcome metadata

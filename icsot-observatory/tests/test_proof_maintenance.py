@@ -166,6 +166,27 @@ def test_registration_is_durable_idempotent_and_cas_retries(tmp_path):
     assert github.state == snapshot and github.saves == saves
 
 
+def test_cycle_registration_retains_pins_for_fresh_proof_readers(tmp_path):
+    from test_cycle_release import FakeGitMetadataStore, FakeTransport, upload
+    github = FakeGitHub()
+    ref, _ = observation(tmp_path, github)
+    git = FakeGitMetadataStore()
+    writer = FakeTransport(git)
+    for (tag, name), raw in github.assets.items():
+        descriptor = upload(writer, tmp_path, tag, name, raw)
+        if name == "metadata-catalog.json":
+            ref["storage"] = descriptor["storage"]
+    assert register_catalog(github, ref)["status"] == "registered"
+    pending = next(iter(github.state["pending"].values()))
+    fresh = ProofTransport("owner/archive")
+    fresh._cycle_catalog.store = git
+    for kind in ("proof", "metadata"):
+        assert pending[kind]["storage"] == ref["storage"]
+        assert fresh.fetch(pending[kind]) == github.assets[TAG, pending[kind]["name"]]
+    history = json.loads(github.files[f'proofs/{pending["metadata"]["sha256"]}.json'])["history"]
+    assert history[0]["proof"]["storage"] == ref["storage"]
+
+
 def test_catalog_validation_has_no_queue_access_or_capacity_dependency(tmp_path):
     github = FakeGitHub()
     ref, evidence = observation(tmp_path, github)

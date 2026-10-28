@@ -16,6 +16,8 @@ permissions:
 env:
   # Existing bounded metadata-only sink; response bodies and secrets are excluded.
   ICSOT_DEBUG: '1'
+  ICSOT_ARCHIVE_PROFILE: grouped-xz-v2
+  ICSOT_RELEASE_LAYOUT: cycle-v1
 
 concurrency:
   group: persistent-collection

@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import ssl
 import subprocess
 from email.message import Message
 from urllib.error import HTTPError, URLError
@@ -90,7 +91,7 @@ def test_public_redirects_use_fresh_credential_free_requests(tmp_path, monkeypat
     assert client.request_count == before
     assert client.asset_download_counts == {
         "public_http_requests": 2, "public_downloads": 1, "public_bytes": len(CONTENT),
-        "authenticated_downloads": 0, "fallbacks": 0,
+        "authenticated_downloads": 0, "authenticated_attempts": 0, "fallbacks": 0,
     }
     assert [request.full_url for request, _ in opener.requests] == [URL, CDN]
     for request, timeout in opener.requests:
@@ -112,7 +113,7 @@ def test_public_unavailability_falls_back_once(tmp_path, status):
     assert client.request_count == 1
     assert client.asset_download_counts == {
         "public_http_requests": 1, "public_downloads": 0, "public_bytes": 0,
-        "authenticated_downloads": 1, "fallbacks": 1,
+        "authenticated_downloads": 1, "authenticated_attempts": 1, "fallbacks": 1,
     }
 
 
@@ -122,6 +123,9 @@ def test_private_like_404_is_cached_for_the_release(tmp_path):
     for number in range(2):
         client.download_asset(TAG, NAME, tmp_path / str(number))
     assert len(opener.requests) == 1
+    assert client.asset_download_counts["fallbacks"] == 1
+    assert client.asset_download_counts["authenticated_attempts"] == 2
+    assert client.asset_download_counts["authenticated_downloads"] == 2
     assert len(runner.calls) == 2
 
 
@@ -131,6 +135,40 @@ def test_network_failure_before_body_falls_back(tmp_path):
     client.download_asset(TAG, NAME, tmp_path / NAME)
     assert len(opener.requests) == len(runner.calls) == 1
     assert (tmp_path / NAME).read_bytes() == CONTENT
+
+
+@pytest.mark.parametrize("location", ["open", "read"])
+@pytest.mark.parametrize("wrapped", [False, True, "ssl_reason"])
+def test_certificate_verification_failure_fails_closed(tmp_path, location, wrapped):
+    secret = "sensitive-certificate-detail"
+    error = ssl.SSLCertVerificationError(secret)
+    if wrapped == "ssl_reason":
+        error = ssl.SSLError(1, secret)
+        error.reason = "CERTIFICATE_VERIFY_FAILED"
+    if wrapped:
+        error = URLError(error)
+
+    class FailedBody(Response):
+        def read1(self, size=-1):
+            if self.tell() == 0:
+                return self.read(3)
+            raise error
+
+    opener = Opener(error if location == "open" else FailedBody())
+    client, runner = transport(opener)
+    destination = tmp_path / NAME
+    with pytest.raises(StateError) as caught:
+        client.download_asset(TAG, NAME, destination)
+    assert secret not in str(caught.value)
+    assert not destination.exists() and not runner.calls
+    assert client.asset_download_counts["fallbacks"] == 0
+
+
+def test_other_ssl_network_failure_still_falls_back(tmp_path):
+    opener = Opener(URLError(ssl.SSLError(1, "handshake failed")))
+    client, runner = transport(opener)
+    client.download_asset(TAG, NAME, tmp_path / NAME)
+    assert len(runner.calls) == 1
 
 
 @pytest.mark.parametrize("status,headers,deadline", [
@@ -351,6 +389,8 @@ def test_corrupt_authenticated_fallback_fails_and_cleans(tmp_path, body):
     assert not destination.exists()
     assert len(opener.requests) == len(runner.calls) == 1
     assert client.asset_download_counts["fallbacks"] == 1
+    assert client.asset_download_counts["authenticated_attempts"] == 1
+    assert client.asset_download_counts["authenticated_downloads"] == 0
 
 
 def test_public_diagnostics_and_metrics_exclude_signed_url(tmp_path, monkeypatch):

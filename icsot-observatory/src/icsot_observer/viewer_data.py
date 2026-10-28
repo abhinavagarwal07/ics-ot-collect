@@ -272,6 +272,56 @@ class GitHubMetadata:
         with self._transport_lock:
             self.cache = {key: value for key, value in self.cache.items() if key.startswith("asset:")}
 
+    def outbox_catalogs(self, slug: str):
+        """Walk one repository's bounded public outbox at a frozen state head."""
+        from .proof_maintenance import _outbox_ref
+        head = self.json(f"repos/{self.repository}/git/ref/heads/collector-state")["object"]["sha"]
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise MetadataError("Invalid public state head")
+
+        def read(path):
+            obj = self.json(f"repos/{self.repository}/contents/{path}?ref={head}")
+            if obj.get("type") != "file" or obj.get("encoding") != "base64":
+                raise MetadataError("Invalid public state file")
+            raw = base64.b64decode(obj["content"], validate=False)
+            if len(raw) != obj.get("size") or len(raw) > 4096:
+                raise MetadataError("Invalid public state file size")
+            value = json.loads(raw)
+            if not isinstance(value, dict) or canonical_json(value) != raw:
+                raise MetadataError("Invalid public state JSON")
+            return value, raw
+
+        slug_key = slug.lower()
+        binding, _ = read(f"slugs/{sha256(slug_key.encode())}.json")
+        repository_id = binding.get("repository_id")
+        if (binding != {"schema_version": 1, "slug_key": slug_key, "repository_id": repository_id}
+                or type(repository_id) is not int or repository_id <= 0):
+            raise MetadataError("Public state slug binding differs")
+        pointer, _ = read(f"repos/{repository_id}.json")
+        if pointer.get("repository_id") != repository_id or pointer.get("slug", "").lower() != slug_key:
+            raise MetadataError("Public state repository binding differs")
+        cursor = _outbox_ref(pointer.get("proof_outbox"))
+        refs, seen = [], set()
+        while cursor is not None:
+            if len(refs) >= 64:
+                return repository_id, refs, False
+            if cursor["sha256"] in seen:
+                raise MetadataError("Public outbox chain contains a cycle")
+            seen.add(cursor["sha256"])
+            node, raw = read(f"proof-outbox/{repository_id}/{cursor['sha256']}.json")
+            if (len(raw) != cursor["bytes"] or sha256(raw) != cursor["sha256"] or
+                    node.get("schema_version") != 1 or node.get("kind") != "icsot_public_proof_outbox" or
+                    node.get("repository_id") != repository_id or node.get("slug", "").lower() != slug_key or
+                    not re.fullmatch(r"[0-9a-f]{32}", str(node.get("generation", "")))):
+                raise MetadataError("Public outbox node identity differs")
+            ref = node.get("catalog")
+            if (not isinstance(ref, dict) or ref.get("name") != "metadata-catalog.json" or
+                    ref.get("release_tag") != f"collector-observations-r{repository_id}-g{node['generation']}"):
+                raise MetadataError("Public outbox catalog identity differs")
+            refs.append(ref)
+            cursor = _outbox_ref(node.get("previous"))
+        return repository_id, refs, True
+
     def asset(self, asset: dict, expected: str | None = None) -> dict:
         with self._transport_lock:
             return self._cached_asset(asset, expected)
@@ -325,6 +375,7 @@ class ViewerData:
         self.offline = offline
         self.remote = metadata or GitHubMetadata(release_repository)
         self.release_repository = release_repository
+        self._cycle_catalog = None
         self.gaps: list[dict] = []
         self._repos: dict[str, dict] = {}
         self._by_slug: dict[str, str] = {}
@@ -405,7 +456,7 @@ class ViewerData:
             return {"state": "offline", "availability_known": False}
         if not self._remote_done:
             return {"state": "partial" if self._releases else "unknown", "availability_known": False}
-        if repo["key"] in self._repo_remote_done or not self._repo_descriptor_count(repo):
+        if repo["key"] in self._repo_remote_done or (not hasattr(self.remote, "outbox_catalogs") and not self._repo_descriptor_count(repo)):
             return {"state": "complete", "availability_known": True}
         return {"state": "partial" if repo["key"] in self._repo_remote_attempted else "not_read",
                 "availability_known": False}
@@ -618,7 +669,7 @@ class ViewerData:
                 repo = self._repository(slug, summary.get("repository_id"))
                 self._add_capture(repo, summary, remote=remote, source={**row, "csv_sha256": inventory.get("csv_sha256")})
 
-    def _native_catalog(self, catalog: dict, tag: str):
+    def _native_catalog(self, catalog: dict, tag: str, storage=None):
         slug = catalog.get("slug")
         if catalog.get("generation_release", tag) != tag:
             raise MetadataError("Native catalog release binding mismatch")
@@ -632,9 +683,74 @@ class ViewerData:
             repo = self._repository(observed_slug, catalog.get("repository_id") if slug else None)
             index = observation.get("index") or {}
             remote = {"release_tag": index.get("release_tag", tag), "name": index.get("name"),
-                      "expected_sha256": index.get("sha256")}
+                      "expected_sha256": index.get("sha256"), "bytes": index.get("bytes")}
+            if index.get("storage") is not None:
+                remote["storage"] = index["storage"]
+            elif storage is not None and remote["release_tag"] == tag:
+                remote["storage"] = storage
             source = {"timestamp_evidence": observation.get("timestamp_evidence") or {}}
             self._add_capture(repo, observation, remote=remote, source=source)
+
+    def _cycle(self):
+        if self._cycle_catalog is None:
+            from .cycle_release import CycleReleaseCatalog
+            class ReadOnlyAdapter:
+                def __init__(self, repository, remote):
+                    self.repository, self.remote = repository, remote
+
+                def _api(self, endpoint, **kwargs):
+                    if kwargs:
+                        raise MetadataError("Unexpected mutable catalog request")
+                    return self.remote.json(endpoint)
+            self._cycle_catalog = CycleReleaseCatalog(ReadOnlyAdapter(self.release_repository, self.remote))
+        return self._cycle_catalog
+
+    def _cycle_metadata(self, ref):
+        cycle = self._cycle()
+        cycle.pin(ref)
+        row = cycle.documents[ref["release_tag"]]["metadata"].get(ref["name"])
+        if not isinstance(row, dict) or type(row.get("bytes")) is not int or not 0 < row["bytes"] <= METADATA_LIMIT:
+            raise MetadataError("Pinned metadata exceeds the viewer metadata bound")
+        raw = base64.b64decode(row.get("base64", ""), validate=True)
+        if len(raw) != row["bytes"] or sha256(raw) != row["sha256"]:
+            raise MetadataError("Pinned metadata bytes differ")
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            raise MetadataError("Pinned metadata is not a JSON object")
+        return obj
+
+    def _cycle_payload_asset(self, descriptor, description):
+        cycle = self._cycle()
+        ref = {"release_tag": descriptor["release_tag"], "name": description["name"],
+               "sha256": description["ciphertext_sha256"], "bytes": description["ciphertext_bytes"],
+               "storage": descriptor["storage"]}
+        cycle.pin(ref)
+        row = cycle.documents[ref["release_tag"]]["payloads"].get(ref["name"])
+        if not isinstance(row, dict):
+            raise MetadataError("Pinned encrypted payload is missing")
+        tag, name = row.get("release_tag"), row.get("name")
+        if (not isinstance(tag, str) or not re.fullmatch(r"collector-cycle-s[0-9]+(?:-p[2-9][0-9]*)?", tag)
+                or not isinstance(name, str) or not SAFE.fullmatch(name)):
+            raise MetadataError("Invalid physical cycle asset location")
+        release = self.remote.json(f"repos/{self.release_repository}/releases/tags/{tag}")
+        if release.get("tag_name") != tag or type(release.get("id")) is not int:
+            raise MetadataError("Physical cycle release identity differs")
+        for page in range(1, 31):
+            assets = self.remote.json(f"repos/{self.release_repository}/releases/{release['id']}/assets?per_page=100&page={page}")
+            if not isinstance(assets, list):
+                raise MetadataError("Invalid physical cycle assets")
+            matches = [asset for asset in assets if asset.get("name") == name]
+            if len(matches) > 1:
+                raise MetadataError("Duplicate physical cycle asset")
+            if matches:
+                asset = matches[0]
+                if (type(asset.get("id")) is not int or asset.get("size") != ref["bytes"] or
+                        asset.get("digest") != "sha256:" + ref["sha256"]):
+                    raise MetadataError("Physical cycle asset identity differs")
+                return asset
+            if len(assets) < 100:
+                break
+        raise MetadataError("Pinned physical cycle asset is unavailable")
 
     def _index_remote_repository(self, repo: dict):
         if (repo["key"] in self._repo_remote_done or repo["key"] in self._repo_remote_attempted or self.offline
@@ -642,6 +758,26 @@ class ViewerData:
             return
         self._repo_remote_attempted.add(repo["key"])
         complete = True
+        if hasattr(self.remote, "outbox_catalogs"):
+            try:
+                repository_id, refs, outbox_complete = self.remote.outbox_catalogs(repo["slug"])
+                self._repository(repo["slug"], repository_id)
+                if not outbox_complete:
+                    complete = False
+                    self._gap("repository_index_unavailable", repository=repo["slug"], detail="Public outbox chain exceeds its 64-node bound")
+                for ref in refs:
+                    if ref.get("storage") is not None:
+                        try:
+                            catalog = self._cycle_metadata(ref)
+                            if catalog.get("slug", "").lower() != repo["slug"].lower() or catalog.get("repository_id") != repository_id:
+                                raise MetadataError("Public catalog source identity differs")
+                            self._native_catalog(catalog, ref["release_tag"], ref["storage"])
+                        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+                            complete = False
+                            self._gap("repository_index_unavailable", repository=repo["slug"], release=ref.get("release_tag"), detail=str(error))
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+                complete = False
+                self._gap("repository_index_unavailable", repository=repo["slug"], detail=str(error))
         descriptors = list(repo["index_assets"])
         descriptors.extend(c["remote"] for c in self._captures.values()
                            if c["repo_key"] == repo["key"] and c.get("remote"))
@@ -691,7 +827,7 @@ class ViewerData:
                         source={"legacy_seed": seed})
                 self._record_attempt(repo, {"release_tag": identity[0], "status": index.get("status", "index_present"),
                     "complete": index.get("complete"), "errors": index.get("errors") or [], "index_asset": identity[1]})
-            except (OSError, ValueError, TypeError) as error:
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
                 complete = False
                 self._gap("repository_index_unavailable", repository=repo["slug"], release=identity[0], detail=str(error))
         if complete:
@@ -748,14 +884,18 @@ class ViewerData:
             validate_legacy_seed(seed, source_index=index, migration_index=migration)
             descriptor["index"] = index
             return index
-        release = self._releases.get(descriptor.get("release_tag"))
-        if release is None:
-            raise MetadataError("Referenced parent release has not been inventoried")
-        name = descriptor.get("name")
-        asset = release["assets"].get(name)
-        if asset is None:
-            raise MetadataError("Referenced immutable index asset is missing")
-        index = self.remote.asset(asset, descriptor.get("expected_sha256"))
+        if descriptor.get("storage") is not None:
+            index = self._cycle_metadata({"release_tag": descriptor.get("release_tag"), "name": descriptor.get("name"),
+                "sha256": descriptor.get("expected_sha256"), "bytes": descriptor.get("bytes"), "storage": descriptor["storage"]})
+        else:
+            release = self._releases.get(descriptor.get("release_tag"))
+            if release is None:
+                raise MetadataError("Referenced parent release has not been inventoried")
+            name = descriptor.get("name")
+            asset = release["assets"].get(name)
+            if asset is None:
+                raise MetadataError("Referenced immutable index asset is missing")
+            index = self.remote.asset(asset, descriptor.get("expected_sha256"))
         if index.get("repository") is not None and str(index["repository"]).lower() != repo["slug"].lower():
             raise MetadataError("Index repository identity differs from selected repository")
         declared_ids = {m.get("repository_id") for m in index.get("manifests") or []}
@@ -1416,7 +1556,7 @@ class ViewerData:
     load = load_capture
 
     def _remote_reader(self, repo: dict, capture: dict):
-        from .archive_reader import ArchivePart, VerifiedArchiveReader
+        from .archive_reader import ArchivePart, VerifiedArchiveReader, reader_options
         descriptor = capture.get("remote")
         if not descriptor:
             raise ValueError("No remote archive reference exists for this capture")
@@ -1427,7 +1567,7 @@ class ViewerData:
             from .legacy_seed_catalog import validate_legacy_seed
             for seed in index["legacy_prerequisites"]:
                 validate_legacy_seed(seed, repository_id=repo["repository_id"], slug=repo["slug"])
-        release = self._releases[descriptor["release_tag"]]
+        release = self._releases.get(descriptor["release_tag"])
         expected_members = None
         archive = index.get("archive") or {}
         if index.get("encrypted") is True or archive.get("encrypted") is True:
@@ -1443,6 +1583,8 @@ class ViewerData:
                     "ciphertext_bytes": part["bytes"], "plaintext_sha256": encrypted.get("plaintext_sha256"),
                     "plaintext_bytes": encrypted.get("plaintext_bytes")})
         else:
+            if release is None:
+                raise ValueError("Historical plaintext archive release is unavailable")
             aliases = {p["plaintext"]["name"]: p for p in descriptor.get("aliases") or []}
             if not aliases:
                 migration_asset = release["assets"].get("encryption-migration-index.json")
@@ -1465,14 +1607,15 @@ class ViewerData:
         contexts = []
         for description in descriptions:
             name = description["name"]
-            asset = release["assets"].get(name)
+            asset = (self._cycle_payload_asset(descriptor, description) if descriptor.get("storage") is not None
+                     else (release or {}).get("assets", {}).get(name))
             if asset is None or asset.get("size") != description["ciphertext_bytes"] or asset.get("digest") != "sha256:" + description["ciphertext_sha256"]:
                 raise ValueError("Immutable encrypted asset is missing or differs from index")
             contexts.append(self._download_part(asset, description, capture, ArchivePart))
         expected = {"evidence/" + m["path"]: {"bytes": m["bytes"], "sha256": m["sha256"]}
                     for m in expected_members} if expected_members is not None else None
         reader = VerifiedArchiveReader(contexts, self.private_key_path, expected_members=expected,
-                                       allowed_prefixes=("evidence", "reports"))
+                                       allowed_prefixes=("evidence", "reports"), **reader_options(index))
         return reader, index
 
     def _legacy_reader(self, repo: dict, capture: dict, seed: dict):

@@ -51,6 +51,7 @@ def test_entire_cohort_plan_selects_ready_state_and_only_bounded_explicit_cold_w
     assert cold["allow_bootstrap"] is True and cold["expected_pointer_sha256"] is None
     assert result["max_parallel"] == 8
     assert result["monthly_cap_enforced"] is False
+    assert "monthly_evidence_policy_bytes" not in result
 
 
 def test_manual_and_scheduled_retries_share_slot_and_cold_attempts_rotate(tmp_path):
@@ -535,6 +536,27 @@ def test_same_slot_restart_retains_origin_and_partial_without_recapturing_comple
     manifests = [json.loads(path.read_bytes()) for path in (cfg.root / "runs" / "17").glob("*.manifest.json")]
     assert len(manifests) == 2
     assert all(item["working_state_origin"] == "fresh_public_bootstrap" for item in manifests)
+
+
+def test_runtime_keeps_frozen_plan_slot_across_a_six_hour_boundary(tmp_path, monkeypatch):
+    cfg = replace(config(tmp_path), root=tmp_path / "working", repositories=("one/repo",))
+    slots = []
+    def capture(cfg, job, queue):
+        slots.append(job.payload["schedule_slot"])
+        return {"capture_id": job.capture_id, "slug": job.slug, "repository_id": 17, "lane": job.lane,
+                "mode": "full", "requested_mode": job.mode, "responses": [], "failures": [],
+                "started_at": "2026-10-26T06:00:00Z", "finished_at": "2026-10-26T06:00:01Z"}
+    def finalize(cfg, job, result, **options):
+        info = pipeline.append_capture_manifest(cfg, result)
+        return Finalization(info["manifest"], info["manifest_sha256"])
+    monkeypatch.setattr(pipeline, "capture_lane", capture)
+    monkeypatch.setattr(pipeline, "finalize_lane", finalize)
+    monkeypatch.setattr(pipeline.time, "time", lambda: 124 * 21600 + 1)
+    result = pipeline.run_persistent(cfg, once=True, stamp=False, schedule_slot=123)
+    assert slots == [123, 123]
+    assert result["current_observation"]["status"] == "complete"
+    assert {row["schedule_slot"] for row in result["current_observation"]["lane_outcomes"]} == {123}
+    assert all(row["started_at"] == "2026-10-26T06:00:00Z" for row in result["current_observation"]["lane_outcomes"])
 
 
 def test_resuming_an_older_pending_slot_does_not_claim_current_slot_coverage(tmp_path, monkeypatch):

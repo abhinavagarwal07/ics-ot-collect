@@ -1,8 +1,7 @@
 name: Refresh delayed public timestamp proofs
 
 on:
-  schedule:
-    - cron: '43 4 * * *'
+  # Automatic schedules paused at the user's request; manual dispatch remains.
   workflow_dispatch:
 
 permissions:

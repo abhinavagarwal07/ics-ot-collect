@@ -228,8 +228,19 @@ def test_original_package_plus_new_increment_restores_without_working_state_or_u
     shutil.rmtree(c["evidence"])
     output = c["root"] / "independent-recovery"
     published_ref = {key: c["native_ref"][key] for key in ("release_tag", "name", "sha256", "bytes")}
+    storage = {"kind": "cycle_git_catalog_v1", "logical_release": published_ref["release_tag"], "catalog": {"synthetic": True}}
+    published_ref["storage"] = storage
+    observed = []
+    @contextmanager
+    def open_asset(ref):
+        if ref["release_tag"] == published_ref["release_tag"]:
+            observed.append(ref)
+            assert ref["storage"] == storage
+        with c["open_asset"](ref) as path:
+            yield path
     report = restore_legacy_seeded_capture(c["native_path"].read_bytes(), published_ref,
-        open_asset=c["open_asset"], owner_private_key_path=c["private"], output_root=output)
+        open_asset=open_asset, owner_private_key_path=c["private"], output_root=output)
+    assert observed
     assert report["status"] == "restored"
     evidence = output / "evidence"
     assert (evidence / "runs/123/legacy-one.manifest.json.ots").read_bytes() == c["proof"]

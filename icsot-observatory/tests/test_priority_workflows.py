@@ -92,7 +92,11 @@ def test_child_preserves_limits_and_tier_specific_planning():
     assert "group: persistent-selected-id-${{ matrix.repository_id }}" in jobs["observe"]
     assert '"--priority-tier", os.environ["PRIORITY_TIER"]' in jobs["plan"]
     assert '"--slot", os.environ["SCHEDULE_SLOT"]' in jobs["plan"]
-    assert '${GITHUB_RUN_ATTEMPT}-${PRIORITY_TIER}' in jobs["plan"]
+    assert 'plans/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${PRIORITY_TIER}.json' in jobs["plan"]
+    assert 'icsot_observer.git_metadata put' in jobs["plan"]
+    assert 'plan_locator: ${{ steps.metadata.outputs.plan_locator }}' in jobs["plan"]
+    assert 'icsot_observer.git_metadata get' in jobs["observe"]
+    assert 'ICSOT_CYCLE_SLOT: ${{ inputs.schedule_slot }}' in child
 
 
 @pytest.mark.parametrize("raw,valid", [("", True), ("0", True), ("8", True), ("9", False), ("-1", False), ("1.5", False), ("abc", False)])

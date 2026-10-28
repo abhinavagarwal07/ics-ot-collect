@@ -257,7 +257,7 @@ class GhCliStateTransport:
     def __init__(self, destination_repository: str, *, runner: Callable = subprocess.run,
                  rate_reserve: int = 100, transient_retries: int = 1,
                  clock: Callable[[], float] = time.time, asset_download_mode: str | None = None,
-                 public_opener: Callable | None = None):
+                 public_opener: Callable | None = None, cycle_slot: int | None = None):
         if not REPO_RE.fullmatch(destination_repository):
             raise ValueError("Invalid destination repository")
         if type(rate_reserve) is not int or rate_reserve < 0 or not 0 <= transient_retries <= 2:
@@ -271,8 +271,19 @@ class GhCliStateTransport:
         self._public_unavailable_releases: set[str] = set()
         self._public_unavailable_until = 0.0
         self.asset_download_counts = {"public_http_requests": 0, "public_downloads": 0,
-                                      "public_bytes": 0, "authenticated_downloads": 0, "fallbacks": 0}
+                                      "public_bytes": 0, "authenticated_downloads": 0,
+                                      "authenticated_attempts": 0, "fallbacks": 0}
         self.repository, self.runner = destination_repository, runner
+        if cycle_slot is None and os.getenv("ICSOT_RELEASE_LAYOUT") == "cycle-v1":
+            configured = os.getenv("ICSOT_CYCLE_SLOT")
+            if configured is not None and not configured.isdecimal():
+                raise ValueError("Invalid frozen cycle slot")
+            cycle_slot = int(configured) if configured is not None else int(clock() // 21600)
+        if cycle_slot is not None and (type(cycle_slot) is not int or cycle_slot < 0):
+            raise ValueError("Invalid frozen cycle slot")
+        from .cycle_release import CycleReleaseCatalog
+        self.cycle_slot = cycle_slot
+        self._cycle_catalog = CycleReleaseCatalog(self, cycle_slot)
         self.rate_reserve, self.transient_retries, self.clock = rate_reserve, transient_retries, clock
         self.request_count = 0
         self.rate_remaining: int | None = None
@@ -309,6 +320,10 @@ class GhCliStateTransport:
         other._public_unavailable_until = self._public_unavailable_until
         other.asset_download_counts = copy.deepcopy(self.asset_download_counts)
         other._public_unavailable_releases = self._public_unavailable_releases
+        other.cycle_slot = self.cycle_slot
+        other._cycle_catalog.slot = self.cycle_slot
+        for name in ("documents", "locators", "dirty", "git_downloads", "git_bytes"):
+            setattr(other._cycle_catalog, name, getattr(self._cycle_catalog, name))
         # These caches name immutable Git objects and uploaded asset identities;
         # specialized adapters can retain discoveries made in either direction.
         for name in ("_releases", "_assets", "_listed", "_git_files"):
@@ -509,6 +524,7 @@ class GhCliStateTransport:
             result = self.runner(command, input=data, stdout=stdout, stderr=subprocess.PIPE, check=False)
             raw = result.stdout or b""
             headers, body, status = self._response(raw) if capture_headers else ({}, raw, None)
+            self._last_http_status = status
             observed = self._rate_headers(headers)
             self._last_response_rate_headers = observed
             retry = self._retry_after(headers.get("retry-after"))
@@ -531,7 +547,7 @@ class GhCliStateTransport:
             if rate_failure:
                 retry = self._rate_retry(observed, combined, retry, graphql=graphql)
                 raise self._defer("destination API rate limit", retry)
-            transient = (status in (502, 503, 504) or any(text in error.lower() for text in
+            transient = (status in (502, 503, 504) or any(f"HTTP {code}" in error for code in (502, 503, 504)) or any(text in error.lower() for text in
                          ("connection reset", "connection timed out", "unexpected eof")))
             if is_get and transient and attempt < self.transient_retries:
                 if stdout != subprocess.PIPE:
@@ -777,9 +793,19 @@ class GhCliStateTransport:
         if new:
             if not create:
                 raise StateReleaseMissingError("GitHub release tag was not found")
-            release = self._api(f"repos/{self.repository}/releases", method="POST", payload={
-                "tag_name": tag, "prerelease": True, "name": tag,
-                "body": "Encrypted collector working state; retain prerequisites."})
+            try:
+                release = self._api(f"repos/{self.repository}/releases", method="POST", payload={
+                    "tag_name": tag, "prerelease": True, "name": tag,
+                    "body": "Encrypted collector snapshot; retain pinned Git metadata and prerequisites."})
+            except StateDeferredError:
+                raise
+            except StateError:
+                # A concurrent cycle publisher may have created this exact
+                # release. Reconcile with a read; never blindly repeat POST.
+                release = self._api(f"repos/{self.repository}/releases/tags/{tag}", missing_ok=True)
+                if release is None:
+                    raise
+                new = False
         self._validate_release(release, tag)
         self._releases[tag] = release
         self._assets[tag] = {asset["name"]: asset for asset in release.get("assets", [])}
@@ -788,11 +814,17 @@ class GhCliStateTransport:
         return release
 
     def ensure_release(self, tag: str) -> None:
+        if self._cycle_catalog.writable(tag):
+            self._cycle_catalog.ensure(tag)
+            return
         self._release(tag, create=True)
 
     def upload_asset(self, tag: str, name: str, source: Path) -> None:
         _asset_ref({"release_tag": tag, "name": name, "ciphertext_sha256": "0" * 64,
                     "ciphertext_bytes": 1})
+        if self._cycle_catalog.writable(tag):
+            self._cycle_catalog.upload(tag, name, source)
+            return
         release = self._release(tag, create=True)
         if name in self._assets[tag]:
             raise StateError("Immutable GitHub asset name already exists")
@@ -811,6 +843,8 @@ class GhCliStateTransport:
         self._assets[tag][name] = asset
 
     def find_asset(self, tag: str, name: str, *, refresh: bool = False) -> dict | None:
+        if self._cycle_catalog.known(tag):
+            return self._cycle_catalog.asset(tag, name)
         self._release(tag)
         if refresh:
             self._listed.discard(tag)
@@ -824,6 +858,8 @@ class GhCliStateTransport:
         return asset
 
     def _find_asset(self, tag: str, name: str) -> dict | None:
+        if self._cycle_catalog.known(tag):
+            return self._cycle_catalog.asset(tag, name)
         release = self._release(tag)
         if name in self._assets[tag]:
             asset = self._assets[tag][name]
@@ -859,6 +895,9 @@ class GhCliStateTransport:
     def download_asset(self, tag: str, name: str, destination: Path) -> None:
         _asset_ref({"release_tag": tag, "name": name, "ciphertext_sha256": "0" * 64,
                     "ciphertext_bytes": 1})
+        if self._cycle_catalog.known(tag):
+            self._cycle_catalog.download(tag, name, destination)
+            return
         asset = self._asset(tag, name)
         release = self._releases[tag]  # _asset already cached the validated release.
         size, digest = asset.get("size"), asset.get("digest")
@@ -913,32 +952,51 @@ class GhCliStateTransport:
                         return
                 if mode == "public-only":
                     raise StateError("Public GitHub asset download unavailable; authenticated fallback disabled")
-                if mode == "public-first":
+                if mode == "public-first" and public_ready:
                     self.asset_download_counts["fallbacks"] += 1
-                self.asset_download_counts["authenticated_downloads"] += 1
+                self.asset_download_counts["authenticated_attempts"] += 1
                 self._run(["api", f"repos/{self.repository}/releases/assets/{asset['id']}",
                            "--method", "GET", "-H", "Accept: application/octet-stream"], stdout=target)
             # Retain the trusted caller's SHA/AEAD checks as well. GitHub's
             # optional digest is an additional transport check, not their source.
             if destination.stat().st_size != size or digest is not None and _digest(destination) != digest:
                 raise StateError("Authenticated GitHub asset hash or size differs from metadata")
-            self._emit_asset_download("authenticated_fallback" if mode == "public-first" else "authenticated_download", size)
+            self.asset_download_counts["authenticated_downloads"] += 1
+            self._emit_asset_download("authenticated_fallback" if mode == "public-first" and public_ready
+                                      else "authenticated_download", size)
         except Exception:
             if created:
                 destination.unlink(missing_ok=True)
             raise
 
     def download_metrics(self) -> dict[str, int]:
-        return {"destination_github_public_asset_requests_total": self.asset_download_counts["public_http_requests"],
+        return {"destination_git_metadata_downloads_total": self._cycle_catalog.git_downloads,
+                "destination_git_metadata_download_bytes_total": self._cycle_catalog.git_bytes,
+                "destination_github_public_asset_requests_total": self.asset_download_counts["public_http_requests"],
                 "destination_github_public_asset_downloads_total": self.asset_download_counts["public_downloads"],
                 "destination_github_public_asset_download_bytes_total": self.asset_download_counts["public_bytes"],
                 "destination_github_authenticated_asset_downloads_total": self.asset_download_counts["authenticated_downloads"],
+                "destination_github_authenticated_asset_download_attempts_total": self.asset_download_counts["authenticated_attempts"],
                 "destination_github_asset_download_fallbacks_total": self.asset_download_counts["fallbacks"]}
 
     def _emit_asset_download(self, reason: str, size: int) -> None:
         from .diagnostics import emit
         emit("stage_end", stage="asset_download", status="complete", reason=reason, bytes=size,
              request_count=self.request_count, **self.asset_download_counts)
+
+    def pin_asset_ref(self, ref: dict) -> None:
+        from .cycle_release import CycleCatalogError
+        try:
+            self._cycle_catalog.pin(ref)
+        except CycleCatalogError:
+            raise StateError("Pinned cycle catalog failed validation") from None
+
+    def bind_asset_ref(self, ref: dict) -> dict:
+        return self._cycle_catalog.bind(ref)
+
+    def bind_asset_refs(self, refs) -> None:
+        for ref in refs:
+            self.bind_asset_ref(ref)
 
 
 class GitHubStateStore:
@@ -972,6 +1030,8 @@ class GitHubStateStore:
             raise ValueError("Working-state private key must be outside the captured root")
         self.recipient = public_key_fingerprint(self.public_key)
         self.part_bytes = part_bytes
+        self.grouped_profile = os.environ.get("ICSOT_ARCHIVE_PROFILE") == "grouped-xz-v2"
+        self.profile_group_bytes = min(500 * 1024**2, part_bytes)
         self.group_bytes = min(mutable_group_bytes, part_bytes - 10240)
         if self.group_bytes < 1:
             self.group_bytes = 1
@@ -1023,12 +1083,26 @@ class GitHubStateStore:
                 not 1 <= index["plaintext_bytes"] <= self.part_bytes or
                 index.get("public_key_fingerprint_sha256") != self.recipient):
             raise StateError("Invalid encrypted index metadata/key binding")
+        encoding = index.get("encoding", "raw")
+        if encoding == "xz":
+            if (index.get("compression_profile") != "grouped-xz-v2" or
+                    type(index.get("decoded_bytes")) is not int or
+                    not 1 <= index["decoded_bytes"] <= self.part_bytes or
+                    not isinstance(index.get("decoded_sha256"), str) or
+                    not _HASH.fullmatch(index["decoded_sha256"])):
+                raise StateError("Invalid compressed index metadata")
+        elif encoding != "raw" or any(field in index for field in
+                                      ("decoded_bytes", "decoded_sha256", "compression_profile")):
+            raise StateError("Invalid index encoding metadata")
 
     def _check_index(self, pointer: dict, index: dict) -> None:
         self._check_pointer(pointer)
         raw_index = canonical_json(index)
-        if (hashlib.sha256(raw_index).hexdigest() != pointer["index"]["plaintext_sha256"] or
-                len(raw_index) != pointer["index"]["plaintext_bytes"]):
+        index_ref = pointer["index"]
+        digest_field, size_field = (("decoded_sha256", "decoded_bytes") if index_ref.get("encoding") == "xz"
+                                    else ("plaintext_sha256", "plaintext_bytes"))
+        if (hashlib.sha256(raw_index).hexdigest() != index_ref[digest_field] or
+                len(raw_index) != index_ref[size_field]):
             raise StateError("In-memory index differs from authenticated pointer digest")
         context = index.get("context")
         if not isinstance(context, dict):
@@ -1064,6 +1138,10 @@ class GitHubStateStore:
                     not _HASH.fullmatch(part["decoded_sha256"]) or
                     part.get("public_key_fingerprint_sha256") != self.recipient):
                 raise StateError("Invalid state part binding")
+            if "compression_profile" in part and (part["compression_profile"] != "grouped-xz-v2" or
+                    part["encoding"] != "xz" or
+                    (part["kind"] == "tar" and part["decoded_bytes"] > 500 * 1024**2)):
+                raise StateError("Invalid state part compression profile")
             _asset_ref(part)
         seen = set()
         used_parts = set()
@@ -1112,6 +1190,9 @@ class GitHubStateStore:
 
     def _download_verified(self, ref: dict, target: Path) -> None:
         _asset_ref(ref)
+        pin = getattr(self.transport, "pin_asset_ref", None)
+        if callable(pin):
+            pin(ref)
         self.transport.download_asset(ref["release_tag"], ref["name"], target)
         _verify_file_integrity(target, size=ref["ciphertext_bytes"], digest=ref["ciphertext_sha256"],
                                stage="asset_download", subject="asset:" + ref["ciphertext_sha256"],
@@ -1135,15 +1216,34 @@ class GitHubStateStore:
             target = plaintext
         else:
             try:
-                with lzma.open(plaintext, "rb") as source, decoded.open("xb") as output:
+                if ref.get("compression_profile") == "grouped-xz-v2":
+                    decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=256 * 1024**2)
                     copied = 0
-                    while chunk := source.read(min(4 * 1024 * 1024, ref["decoded_bytes"] - copied + 1)):
-                        copied += len(chunk)
-                        if copied > ref["decoded_bytes"]:
-                            raise StateIntegrityError("Decoded state part exceeds authenticated size",
-                                stage="part_decode", subject="part:" + ref["plaintext_sha256"], field="bytes",
-                                expected=ref["decoded_bytes"], actual=copied)
-                        output.write(chunk)
+                    with plaintext.open("rb") as source, decoded.open("xb") as output:
+                        while not decoder.eof:
+                            data = source.read(4 * 1024 * 1024) if decoder.needs_input else b""
+                            if not data and decoder.needs_input:
+                                raise EOFError("Truncated XZ working-state part")
+                            chunk = decoder.decompress(data, max_length=min(4 * 1024 * 1024,
+                                                       ref["decoded_bytes"] - copied + 1))
+                            copied += len(chunk)
+                            if copied > ref["decoded_bytes"]:
+                                raise StateIntegrityError("Decoded state part exceeds authenticated size",
+                                    stage="part_decode", subject="part:" + ref["plaintext_sha256"], field="bytes",
+                                    expected=ref["decoded_bytes"], actual=copied)
+                            output.write(chunk)
+                        if decoder.unused_data or source.read(1):
+                            raise StateError("Trailing data after XZ working-state part")
+                else:
+                    with lzma.open(plaintext, "rb") as source, decoded.open("xb") as output:
+                        copied = 0
+                        while chunk := source.read(min(4 * 1024 * 1024, ref["decoded_bytes"] - copied + 1)):
+                            copied += len(chunk)
+                            if copied > ref["decoded_bytes"]:
+                                raise StateIntegrityError("Decoded state part exceeds authenticated size",
+                                    stage="part_decode", subject="part:" + ref["plaintext_sha256"], field="bytes",
+                                    expected=ref["decoded_bytes"], actual=copied)
+                            output.write(chunk)
                 target = decoded
             except (lzma.LZMAError, EOFError) as exc:
                 raise StateError("Invalid XZ working-state part") from exc
@@ -1178,7 +1278,9 @@ class GitHubStateStore:
             encrypted, plaintext = Path(temporary) / "index.enc", Path(temporary) / "index.json"
             self._download_verified(pointer["index"], encrypted)
             self._decrypt(pointer["index"], encrypted, plaintext)
-            index = _json(plaintext.read_bytes(), "encrypted state index")
+            decoded = (self._decode_part(pointer["index"], plaintext, Path(temporary) / "index.decoded")
+                       if pointer["index"].get("encoding") == "xz" else plaintext)
+            index = _json(decoded.read_bytes(), "encrypted state index")
             self._check_index(pointer, index)
         return StateSelection(head, pointer, index)
 
@@ -1276,11 +1378,11 @@ class GitHubStateStore:
     @staticmethod
     def _compaction_disk_bytes(*, max_upload_bytes: int, index_plaintext_bound: int,
                                state_bytes: int, max_old_part_scratch: int,
-                               immutable_group_bytes: int) -> int:
+                               immutable_group_bytes: int, compressed_index: bool = False) -> int:
         # Frozen assets include one encrypted index. Capture's copy fallback
         # additionally holds the original encrypted index and its plaintext;
         # fresh remote index verification has the same two scratch allocations.
-        index_scratch = 2 * index_plaintext_bound + ENVELOPE_OVERHEAD
+        index_scratch = (3 if compressed_index else 2) * index_plaintext_bound + ENVELOPE_OVERHEAD
         # Index scratch is removed before reconstructing the complete tree.
         reconstruction_scratch = (state_bytes + max_old_part_scratch +
                                   4 * (immutable_group_bytes + ENVELOPE_OVERHEAD))
@@ -1414,9 +1516,40 @@ class GitHubStateStore:
         metrics["reused_parts"] += 1
         return digest
 
+    @staticmethod
+    def _profile_compress(source: Path, destination: Path) -> None:
+        from .compression import XZ_COMMAND
+        try:
+            with source.open("rb") as input_file, destination.open("xb") as output_file:
+                subprocess.run(XZ_COMMAND, stdin=input_file, stdout=output_file,
+                               stderr=subprocess.DEVNULL, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            destination.unlink(missing_ok=True)
+            raise StateError("Grouped XZ compression failed") from exc
+
+    def _index_ref(self, raw_index: bytes, directory: Path, release: str) -> tuple[dict, Path, Path]:
+        plaintext, encrypted = directory / "index.json", directory / "index.enc"
+        if len(raw_index) > self.part_bytes:
+            raise StateError("State index exceeds plaintext part limit")
+        plaintext.write_bytes(raw_index)
+        encoded = plaintext
+        extra = {}
+        if self.grouped_profile:
+            encoded = directory / "index.json.xz"
+            self._profile_compress(plaintext, encoded)
+            if encoded.stat().st_size > self.part_bytes:
+                raise StateDeferredError("Encoded state index exceeds plaintext part limit", reason="state_index_limit")
+            extra = {"encoding": "xz", "decoded_sha256": hashlib.sha256(raw_index).hexdigest(),
+                     "decoded_bytes": len(raw_index), "compression_profile": "grouped-xz-v2"}
+        record = encrypt_file(encoded, encrypted, self.public_key)
+        if encoded != plaintext:
+            encoded.unlink()
+        return {**record, **extra, "release_tag": release, "name": "index.enc"}, plaintext, encrypted
+
     def _part(self, plaintext: Path, kind: str, release: str, prior: dict, directory: Path,
               parts: dict, metrics: dict, *, compress: bool = True,
-              prepared_sink: _PreparedSink | None = None, capture_reused: bool = False) -> str:
+              prepared_sink: _PreparedSink | None = None, capture_reused: bool = False,
+              preencoded: Path | None = None) -> str:
         decoded_sha256, decoded_bytes = _digest(plaintext), plaintext.stat().st_size
         existing = prior.get((decoded_sha256, decoded_bytes, kind))
         if existing:
@@ -1424,10 +1557,18 @@ class GitHubStateStore:
                                     prepared_sink=prepared_sink if capture_reused else None)
         encoding = "raw"
         if compress:
-            compressed = directory / ("encoded-" + uuid.uuid4().hex + ".xz")
-            with plaintext.open("rb") as source, lzma.open(compressed, "wb", preset=1) as output:
-                shutil.copyfileobj(source, output, length=4 * 1024 * 1024)
-            if compressed.stat().st_size <= min(self.part_bytes, plaintext.stat().st_size):
+            compressed = preencoded or directory / ("encoded-" + uuid.uuid4().hex + ".xz")
+            if preencoded is not None:
+                if not self.grouped_profile or kind != "tar":
+                    raise StateError("Preencoded state group requires grouped XZ profile")
+            elif self.grouped_profile:
+                self._profile_compress(plaintext, compressed)
+            else:
+                with plaintext.open("rb") as source, lzma.open(compressed, "wb", preset=1) as output:
+                    shutil.copyfileobj(source, output, length=4 * 1024 * 1024)
+            if self.grouped_profile and compressed.stat().st_size > self.part_bytes:
+                raise StateDeferredError("Encoded state part exceeds plaintext part limit", reason="state_group_limit")
+            if self.grouped_profile or compressed.stat().st_size <= min(self.part_bytes, plaintext.stat().st_size):
                 plaintext, encoding = compressed, "xz"
             else:
                 compressed.unlink()  # Incompressible input at the part limit.
@@ -1450,6 +1591,8 @@ class GitHubStateStore:
         metrics["_asset_count"] += 1
         ref = {**record, "release_tag": actual_release, "name": name, "kind": kind,
                "encoding": encoding, "decoded_sha256": decoded_sha256, "decoded_bytes": decoded_bytes}
+        if self.grouped_profile and encoding == "xz":
+            ref["compression_profile"] = "grouped-xz-v2"
         if prepared_sink is None:
             self.transport.upload_asset(actual_release, name, encrypted)
             verify = directory / (digest + ".remote")
@@ -1509,7 +1652,10 @@ class GitHubStateStore:
             if self._immutable(name) and not self._excluded(name) and name not in current:
                 raise StateError("Previously retained immutable state file is missing")
         raw, small, mutable, reused = [], [], [], {}
+        legacy_fallback_count = 0
         mutable_target = min(self.part_bytes, max(tarfile.RECORDSIZE, self.group_bytes))
+        if self.grouped_profile:
+            mutable_target = self.profile_group_bytes
         for item in files:
             name, old = item["path"], previous.get(item["path"])
             if self._immutable(name):
@@ -1518,19 +1664,32 @@ class GitHubStateStore:
                         raise StateError("Previously retained immutable state file changed")
                     reused[name] = copy.deepcopy(old["segments"])
                     continue
-                if (self.small_immutable_bytes and item["bytes"] <= self.small_immutable_bytes and
+                if self.grouped_profile:
+                    if self._tar_total_bytes(self._tar_member_bytes(item)) > self.profile_group_bytes:
+                        raw.append(item)
+                        legacy_fallback_count += 1
+                    else:
+                        small.append(item)
+                elif (self.small_immutable_bytes and item["bytes"] <= self.small_immutable_bytes and
                         self._tar_total_bytes(self._tar_member_bytes(item)) <= self.immutable_group_bytes):
                     small.append(item)
                 else:
                     raw.append(item)
+            elif self.grouped_profile:
+                if self._tar_total_bytes(self._tar_member_bytes(item)) > self.profile_group_bytes:
+                    raw.append(item)
+                    legacy_fallback_count += 1
+                else:
+                    mutable.append(item)
             elif (item["bytes"] <= self.group_bytes and
                   self._tar_total_bytes(self._tar_member_bytes(item)) <= mutable_target):
                 mutable.append(item)
             else:
                 raw.append(item)
-        groups = self._group_files(small, self.immutable_group_bytes) + self._group_files(mutable, mutable_target)
+        groups = self._group_files(small, self.profile_group_bytes if self.grouped_profile else self.immutable_group_bytes) + self._group_files(mutable, mutable_target)
         return {"raw": raw, "groups": groups, "reused": reused,
-                "new_small_immutable_files": len(small)}
+                "new_small_immutable_files": len(small),
+                "large_member_legacy_fallback_count": legacy_fallback_count}
 
     def _publication_requests_estimate(self, files: list[dict], prior: dict,
                                       recovery_parts: dict | None = None) -> int:
@@ -1644,13 +1803,17 @@ class GitHubStateStore:
         except ValueError as exc:
             raise StateError("Invalid compaction proof outbox node time") from exc
         catalog, previous = node["catalog"], node["previous"]
-        if (not isinstance(catalog, dict) or set(catalog) != {"release_tag", "name", "sha256", "bytes"} or
+        catalog_keys = {"release_tag", "name", "sha256", "bytes"}
+        if (not isinstance(catalog, dict) or set(catalog) not in (catalog_keys, catalog_keys | {"storage"}) or
                 not isinstance(catalog.get("release_tag"), str) or not re.fullmatch(
                     rf"collector-observations-r{self.repository_id}-g[0-9a-f]{{32}}", catalog["release_tag"]) or
                 catalog.get("name") != "metadata-catalog.json" or not isinstance(catalog.get("sha256"), str) or
                 not _HASH.fullmatch(catalog["sha256"]) or type(catalog.get("bytes")) is not int or
                 not 1 <= catalog["bytes"] <= 16 * 1024 * 1024):
             raise StateError("Invalid compaction proof outbox catalog")
+        if "storage" in catalog:
+            from .proof_maintenance import _ref
+            _ref(catalog)
         if (previous is not None and (not isinstance(previous, dict) or set(previous) != {"sha256", "bytes"} or
                 not isinstance(previous.get("sha256"), str) or not _HASH.fullmatch(previous["sha256"]) or
                 type(previous.get("bytes")) is not int or not 1 <= previous["bytes"] <= 4096 or previous == ref)):
@@ -1665,6 +1828,8 @@ class GitHubStateStore:
         succeeds and the predecessor pointer is advanced by compare-and-swap.
         """
         self.compaction_candidate_pointer_sha256 = None
+        if getattr(self.transport, "cycle_slot", None) is not None:
+            raise StateError("Manual compaction retains the legacy Release transport; disable cycle layout")
         bounds = (max_input_bytes, max_input_parts, max_upload_bytes, min_part_savings, max_runtime_seconds)
         if any(type(value) is not int or value < 1 for value in bounds):
             raise ValueError("Positive integer compaction limits are required")
@@ -1730,7 +1895,7 @@ class GitHubStateStore:
             required_disk = self._compaction_disk_bytes(
                 max_upload_bytes=max_upload_bytes, index_plaintext_bound=index_bound,
                 state_bytes=state_bytes, max_old_part_scratch=max_old,
-                immutable_group_bytes=self.immutable_group_bytes)
+                immutable_group_bytes=self.immutable_group_bytes, compressed_index=self.grouped_profile)
             self._preflight_disk(directory=directory, required=required_disk,
                                  operation="compaction reconstruction and frozen assets")
             estimated_requests = (2 * (len(plan["groups"]) + 1) + 15 * (len(plan["groups"]) + 1) +
@@ -1779,13 +1944,11 @@ class GitHubStateStore:
             }
             index = {**copy.deepcopy(selection.index), "context": context, "files": files, "parts": parts}
             self._check_compaction_file_map(selection.index, index)
-            plaintext, encrypted = directory / "index.json", directory / "index.enc"
             raw_index = canonical_json(index)
             if len(raw_index) > index_bound:
                 raise StateDeferredError("Compacted state index exceeds admitted plaintext bound",
                                          reason="compaction_byte_limit")
-            plaintext.write_bytes(raw_index)
-            ref = {**encrypt_file(plaintext, encrypted, self.public_key), "release_tag": release, "name": "index.enc"}
+            ref, plaintext, encrypted = self._index_ref(raw_index, directory, release)
             pointer = {**self._binding(generation, predecessor), **times, "index": ref,
                        "context_sha256": hashlib.sha256(canonical_json(context)).hexdigest()}
             if selection.pointer.get("proof_outbox") is not None:
@@ -1815,12 +1978,16 @@ class GitHubStateStore:
             decoded_index = directory / "remote-index.json"
             self._download_verified(ref, remote_index)
             self._decrypt(ref, remote_index, decoded_index)
-            fresh_index = _json(decoded_index.read_bytes(), "compacted encrypted state index")
+            index_json = (self._decode_part(ref, decoded_index, directory / "remote-index.decoded")
+                          if ref.get("encoding") == "xz" else decoded_index)
+            fresh_index = _json(index_json.read_bytes(), "compacted encrypted state index")
             self._check_index(pointer, fresh_index)
             self._check_compaction_file_map(selection.index, fresh_index)
             if fresh_index != index:
                 raise StateError("Compacted remote index differs from frozen index")
             remote_index.unlink()
+            if index_json != decoded_index:
+                index_json.unlink()
             decoded_index.unlink()
             staging, downloads = directory / "reconstructed", directory / "downloads"
             staging.mkdir(mode=0o700)
@@ -1960,11 +2127,19 @@ class GitHubStateStore:
                         if wal.is_file():
                             source_bytes += wal.stat().st_size
             largest_payload = min(self.part_bytes, max(largest_file,
-                                  min(self.immutable_group_bytes, source_bytes + 10240 * (source_files + 1)),
-                                  min(source_bytes, self.group_bytes) + 10240 * (source_files + 1)))
+                                  min(self.profile_group_bytes if self.grouped_profile else self.immutable_group_bytes,
+                                      source_bytes + 10240 * (source_files + 1)),
+                                  min(source_bytes, self.profile_group_bytes if self.grouped_profile else self.group_bytes)
+                                      + 10240 * (source_files + 1)))
             # Snapshot copy + current raw/tar + XZ + local/remote ciphertext.
             # Encryption envelope overhead is bounded by the codec's 64 KiB header.
-            publish_peak = source_bytes + 4 * (largest_payload + 65536)
+            if self.grouped_profile:
+                # Raw oversized chunks are processed serially; only tar groups
+                # use the four-worker batch. Do not charge thirteen raw chunks.
+                group_peak = 13 * (min(self.profile_group_bytes, largest_payload) + 8 * 1024**2 + 65536)
+                publish_peak = source_bytes + max(group_peak, 4 * (largest_payload + 65536))
+            else:
+                publish_peak = source_bytes + 4 * (largest_payload + 65536)
             if prepared_sink is not None:
                 # Retain every encrypted asset plus a generous per-file/index
                 # metadata allowance until authoritative pointer acknowledgement.
@@ -1998,6 +2173,9 @@ class GitHubStateStore:
             metrics["_releases"].add(release)
             plan = self._snapshot_plan(files, prior)
             metrics["new_small_immutable_files_packed"] = plan["new_small_immutable_files"]
+            if self.grouped_profile:
+                metrics["large_member_legacy_fallback_count"] = plan["large_member_legacy_fallback_count"]
+                metrics["large_member_legacy_fallback_profile"] = "mixed-raw-or-custom-xz-parts"
             for item in files:
                 if item["path"] in plan["reused"]:
                     item["segments"] = plan["reused"][item["path"]]
@@ -2030,21 +2208,51 @@ class GitHubStateStore:
                         if count < self.part_bytes:
                             break
             groups = plan["groups"]
-            for number, members in enumerate(groups):
+            def prepare_group(number: int, members: list[dict]) -> tuple[Path, Path | None]:
                 archive_path = directory / f"group-{number}.tar"
                 with tarfile.open(archive_path, "w", format=tarfile.PAX_FORMAT) as archive:
                     for item in members:
-                        info = self._tar_info(item)
                         with (staging / item["path"]).open("rb") as source:
-                            archive.addfile(info, source)
-                if archive_path.stat().st_size > self.part_bytes:
+                            archive.addfile(self._tar_info(item), source)
+                limit = self.profile_group_bytes if self.grouped_profile else self.part_bytes
+                if archive_path.stat().st_size > limit:
                     raise StateError("Grouped snapshot exceeds plaintext part limit")
                 self._verify_group_files(archive_path, members, directory / f"group-check-{number}")
+                encoded = None
+                if self.grouped_profile:
+                    encoded = directory / f"group-{number}.xz"
+                    self._profile_compress(archive_path, encoded)
+                return archive_path, encoded
+
+            def upload_group(members: list[dict], prepared: tuple[Path, Path | None]) -> None:
+                archive_path, encoded = prepared
                 part_id = self._part(archive_path, "tar", release, prior_parts, directory, parts, metrics,
-                                     prepared_sink=prepared_sink, capture_reused=recovery_candidates is not None)
+                                     prepared_sink=prepared_sink, capture_reused=recovery_candidates is not None,
+                                     preencoded=encoded)
                 for item in members:
                     item["segments"] = [{"part": part_id, "member": item["path"]}]
                 archive_path.unlink()
+                if encoded is not None:
+                    encoded.unlink(missing_ok=True)
+
+            if self.grouped_profile:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    for offset in range(0, len(groups), 4):
+                        batch = groups[offset:offset + 4]
+                        futures = [pool.submit(prepare_group, offset + i, members)
+                                   for i, members in enumerate(batch)]
+                        # Resolve the entire batch before the first upload. The
+                        # temporary directory cleans all partial outputs on error.
+                        ready = [future.result() for future in futures]
+                        for members, prepared in zip(batch, ready):
+                            upload_group(members, prepared)
+            else:
+                for number, members in enumerate(groups):
+                    upload_group(members, prepare_group(number, members))
+            bind = getattr(self.transport, "bind_asset_refs", None)
+            if prepared_sink is None and callable(bind):
+                bind(parts.values())
             snapshot_times = {"snapshot_started_at": snapshot_started_at, "snapshot_sealed_at": utc_iso(),
                               "clock_source": "runner_system_clock"}
             context = {**self._binding(generation, predecessor), **snapshot_times,
@@ -2053,21 +2261,32 @@ class GitHubStateStore:
                        "dependencies_sha256": hashlib.sha256(canonical_json(all_dependencies)).hexdigest(),
                        "code_hashes": code_hashes or {}, "config_hashes": config_hashes or {},
                        "lane_heads": lane_heads or {}, "evidence_heads": evidence_heads or {}}
+            if self.grouped_profile:
+                context["state_archive_profile"] = {
+                    "name": "grouped-xz-v2",
+                    "large_member_legacy_fallback_count": plan["large_member_legacy_fallback_count"],
+                    "large_member_legacy_fallback_profile": "mixed-raw-or-custom-xz-parts",
+                }
             proof_node = None
             proof_head = (selection.pointer or {}).get("proof_outbox")
             if proof_catalog is not None:
+                catalog_keys = {"release_tag", "name", "sha256", "bytes"}
                 if (not isinstance(proof_catalog, dict) or
-                        set(proof_catalog) != {"release_tag", "name", "sha256", "bytes"} or
+                        set(proof_catalog) not in (catalog_keys, catalog_keys | {"storage"}) or
                         proof_catalog.get("name") != "metadata-catalog.json" or
                         not isinstance(proof_catalog.get("release_tag"), str) or
                         not re.fullmatch(f"collector-observations-r{self.repository_id}-g[0-9a-f]{{32}}", proof_catalog["release_tag"]) or
                         not isinstance(proof_catalog.get("sha256"), str) or not _HASH.fullmatch(proof_catalog["sha256"]) or
                         type(proof_catalog.get("bytes")) is not int or not 1 <= proof_catalog["bytes"] <= 8 * 1024 * 1024):
                     raise StateError("Invalid verified public proof catalog descriptor")
+                if "storage" in proof_catalog:
+                    from .proof_maintenance import _ref
+                    _ref(proof_catalog)
                 marker = next((ref for ref in all_dependencies
                     if ref.get("release_tag") == proof_catalog["release_tag"] and ref.get("name") == proof_catalog["name"] and
                     ref.get("ciphertext_sha256") == proof_catalog["sha256"] and
-                    ref.get("ciphertext_bytes") == proof_catalog["bytes"]), None)
+                    ref.get("ciphertext_bytes") == proof_catalog["bytes"] and
+                    ref.get("storage") == proof_catalog.get("storage")), None)
                 if marker is None or _asset_identity(marker) not in self._verified_downloads:
                     raise StateError("Public proof outbox requires a remotely verified marker dependency")
                 proof_node = {"schema_version": 1, "kind": "icsot_public_proof_outbox",
@@ -2082,12 +2301,7 @@ class GitHubStateStore:
                 context["proof_outbox"] = proof_head
             index = {"context": context, "files": files, "parts": parts,
                      "dependencies": all_dependencies}
-            plaintext, encrypted = directory / "index.json", directory / "index.enc"
-            plaintext.write_bytes(canonical_json(index))
-            if plaintext.stat().st_size > self.part_bytes:
-                raise StateError("State index exceeds plaintext part limit")
-            record = encrypt_file(plaintext, encrypted, self.public_key)
-            ref = {**record, "release_tag": release, "name": "index.enc"}
+            ref, plaintext, encrypted = self._index_ref(canonical_json(index), directory, release)
             pointer = {**self._binding(generation, predecessor), **snapshot_times, "index": ref,
                        "context_sha256": hashlib.sha256(canonical_json(context)).hexdigest()}
             if proof_head is not None:
@@ -2095,6 +2309,9 @@ class GitHubStateStore:
             self._check_index(pointer, index)
             if prepared_sink is None:
                 self.transport.upload_asset(release, ref["name"], encrypted)
+                binder = getattr(self.transport, "bind_asset_ref", None)
+                if callable(binder):
+                    binder(ref)
                 self._download_verified(ref, directory / "verified-index.enc")
                 commit = self._advance(selection, pointer,
                                        proof_outbox_node=canonical_json(proof_node) if proof_node else None)
@@ -2119,7 +2336,8 @@ class GitHubStateStore:
                 "destination_github_graphql_rate_remaining": getattr(self.transport, "graphql_rate_remaining", None),
                 "destination_github_graphql_rate_reset": getattr(self.transport, "graphql_rate_reset", None),
                 "destination_github_api_requests_for_publish": request_total - request_start,
-                "state_encoding": "per-part XZ by default; already compressed Git data stays raw",
+                "state_encoding": ("grouped-xz-v2" if self.grouped_profile else
+                                   "per-part XZ by default; already compressed Git data stays raw"),
                 "generation": generation, "pointer_commit": commit,
                 "index_sha256": ref["ciphertext_sha256"], "pointer": pointer,
                 "state_referenced_ciphertext_bytes": sum(p["ciphertext_bytes"] for p in parts.values()) + ref["ciphertext_bytes"],
@@ -2181,6 +2399,8 @@ class GitHubStateStore:
         """
         if not quiescent:
             raise StateError("Preparation requires joined capture/finalizer callbacks")
+        if getattr(self.transport, "cycle_slot", None) is not None:
+            raise StateError("Prepared maintenance publication retains the legacy Release transport")
         if not isinstance(generation, str) or not _GENERATION.fullmatch(generation):
             raise ValueError("Explicit stable 32-hex generation required")
         if not isinstance(source_import_sha256, str) or not _HASH.fullmatch(source_import_sha256):
@@ -2343,6 +2563,8 @@ class GitHubStateStore:
         """Upload one frozen generation; caller controls bounded reset-aware retries."""
         if not quiescent:
             raise StateError("Prepared publication requires joined callbacks")
+        if getattr(self.transport, "cycle_slot", None) is not None:
+            raise StateError("Prepared maintenance publication retains the legacy Release transport")
         if not isinstance(prepared, PreparedState):
             raise TypeError("A SHA-pinned PreparedState is required")
         if type(progress_requests_reserve) is not int or not 0 <= progress_requests_reserve <= 100000:
@@ -2479,6 +2701,7 @@ class GitHubStateStore:
         request_total = getattr(self.transport, "request_count", 0)
         graphql_total = getattr(self.transport, "graphql_request_count", 0)
         report.update(budget_metrics)
+        report.update(getattr(self.transport, "download_metrics", lambda: {})())
         report.update(status="already_committed" if already_committed else "complete", pointer_commit=head,
                       prepared_manifest_sha256=loaded.manifest_sha256,
                       source_import_sha256=loaded.source_import_sha256,

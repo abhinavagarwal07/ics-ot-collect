@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from .archive_reader import ArchivePart, VerifiedArchiveReader
+from .archive_reader import ArchivePart, VerifiedArchiveReader, reader_options
 from .core import canonical_json, sha256
 from .legacy_archive import normalize_legacy_parts
 
@@ -423,7 +423,7 @@ def restore_legacy_seeded_capture(native_index_bytes: bytes, native_index_ref: d
             wanted_sizes = {path: item["bytes"] for path, item in expected_native.items()}
             scan = VerifiedArchiveReader([native_part(p) for p in native_parts],
                 owner_private_key_path, expected_members={p: {"sha256": m["sha256"], "bytes": m["bytes"]} for p, m in expected_native.items()},
-                allowed_prefixes=("evidence",), max_total_bytes=max_restore_bytes).scan(receive)
+                allowed_prefixes=("evidence",), max_total_bytes=max_restore_bytes, **reader_options(index)).scan(receive)
             check_files(scan.members)
             evidence = output_root / "evidence"
             for digest in index.get("requires_cas_sha256") or []:

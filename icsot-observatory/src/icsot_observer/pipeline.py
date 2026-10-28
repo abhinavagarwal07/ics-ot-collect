@@ -496,6 +496,14 @@ class CaptureExporter:
                 index.get("recipient_spki_sha256") != self.recipient or
                 re.fullmatch(r"[0-9a-f]{64}", index.get("manifest_sha256", "")) is None):
             raise ValueError("Invalid encrypted export catalog or recipient")
+        from .archive_reader import reader_options, validate_groups
+        options = reader_options(index)
+        if "groups" in options:
+            expected = {"evidence/" + member["path"]: {"bytes": member["bytes"], "sha256": member["sha256"]}
+                        for member in index["members"]}
+            if len(expected) != len(index["members"]):
+                raise ValueError("Duplicate grouped export catalog member")
+            validate_groups(options["groups"], expected)
         for member in index["members"]:
             path = Path(member["path"])
             if path.is_absolute() or ".." in path.parts or re.fullmatch(r"[0-9a-f]{64}", member["sha256"]) is None:
@@ -595,28 +603,64 @@ class CaptureExporter:
                 files.update(item for item in ledger.rglob("*") if item.is_file())
             members = [{"path": file.relative_to(self.root).as_posix(), "sha256": _file_sha256(file),
                         "bytes": file.stat().st_size} for file in sorted(files)]
-            with tempfile.TemporaryDirectory(prefix=".capture-export-", dir=self.directory) as temporary:
-                sink = _EncryptedParts(Path(temporary), self.directory,
-                                       info["run_id"] + "-" + uuid.uuid4().hex[:8], self.public_key, self.part_bytes)
+            profile = os.environ.get("ICSOT_ARCHIVE_PROFILE", "")
+            if profile not in ("", "grouped-xz-v2"):
+                raise ValueError("Unknown archive compression profile")
+            groups, fallback = None, None
+            if profile == "grouped-xz-v2":
+                from . import compression
                 try:
-                    with lzma.LZMAFile(sink, "w", preset=1) as compressed:
-                        with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-                            for member in members:
-                                archive.add(self.root / member["path"], arcname="evidence/" + member["path"], recursive=False)
-                finally:
-                    sink.close()
+                    compression.plan_groups(members)
+                except compression.OversizedMembers as exc:
+                    fallback = {"reason": compression.LEGACY_FALLBACK_REASON,
+                                "oversized_member_count": exc.count,
+                                "group_tar_plaintext_limit_bytes": compression.GROUP_LIMIT,
+                                "requested_archive_profile": profile}
+            with tempfile.TemporaryDirectory(prefix=".capture-export-", dir=self.directory) as temporary:
+                prefix = info["run_id"] + "-" + uuid.uuid4().hex[:8]
+                if profile == "grouped-xz-v2" and fallback is None:
+                    archive_assets, groups = compression.export_groups(self.root, members, Path(temporary),
+                                                                       self.directory, prefix, self.public_key)
+                else:
+                    sink = _EncryptedParts(Path(temporary), self.directory, prefix, self.public_key, self.part_bytes)
+                    try:
+                        try:
+                            if fallback is not None:
+                                compression.stream_tar_xz_to_sink(self.root, members, sink)
+                            else:
+                                with lzma.LZMAFile(sink, "w", preset=1) as compressed:
+                                    with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+                                        for member in members:
+                                            archive.add(self.root / member["path"], arcname="evidence/" + member["path"], recursive=False)
+                        finally:
+                            sink.close()
+                    except BaseException:
+                        if fallback is not None:
+                            for asset in sink.parts:
+                                (self.directory / asset["name"]).unlink(missing_ok=True)
+                        raise
+                    archive_assets = sink.parts
             index = {
                 "schema_version": 1, "capture_id": manifest["capture_id"], "lane": manifest["lane"],
                 "repository_id": manifest["repository_id"], "manifest_sha256": info["manifest_sha256"],
                 **_observation_metadata(manifest),
                 "recipient_spki_sha256": self.recipient, "encrypted": True,
-                "assets": sink.parts, "maximum_plaintext_part_bytes": self.part_bytes,
+                "assets": archive_assets, "maximum_plaintext_part_bytes": self.part_bytes,
                 "encoding": "one tar/XZ stream, split in order before independent encryption",
                 "members": members, "requires_cas_sha256": sorted(objects & self.delivered_objects),
                 "legacy_prerequisites": self.legacy_seeds,
                 "previous_manifest_sha256": manifest["previous_manifest_sha256"],
                 "restore": "Verify each encrypted asset hash, decrypt every part, concatenate plaintext parts in listed order, extract into the same evidence root as all prerequisites, then verify and restore Git offline.",
             }
+            if groups is not None:
+                index.pop("maximum_plaintext_part_bytes")
+                index.update(archive_layout="independent-tar-xz-groups-v2", groups=groups,
+                             encoding="independent tar/XZ groups, each encrypted after compression",
+                             restore="Verify and decrypt each asset, decompress and extract each group into the same evidence root as all prerequisites, then verify and restore Git offline.")
+            if fallback is not None:
+                index.update(archive_layout="legacy-large-member-fallback-v1",
+                             compression_profile=compression.FALLBACK_PROFILE,
+                             large_member_fallback=fallback)
             if info.get("immutable_initial_proof"):
                 from .attestations import publish_ots_attestation
                 timing = info.get("timestamp_provenance", {})
@@ -676,8 +720,8 @@ class CaptureExporter:
                 index["timestamp_evidence"]["additional_rfc3161"] = {
                     "schema_version": 1, "providers": {"freetsa": {**evidence, "provider_profile": _freetsa_profile()}}}
                 index["public_sidecars"].extend(assets)
-            if len(sink.parts) == 1:
-                index["asset"] = sink.parts[0]  # Compatibility with initial single-part exports.
+            if len(archive_assets) == 1:
+                index["asset"] = archive_assets[0]  # Compatibility with initial single-part exports.
             write_once(index_path, canonical_json(index))
             self.delivered.update(member["sha256"] for member in members)
             self.delivered_objects.update(member["sha256"] for member in members
@@ -897,6 +941,7 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                    verified_legacy_seeds: list[dict[str, Any]] | None = None,
                    expected_repository_ids: dict[str, int] | None = None,
                    observation_key: str | None = None, controller_locked: bool = False,
+                   schedule_slot: int | None = None,
                    working_state_origin: str | None = None,
                    history_policy: dict | None = None,
                    rfc3161_url: str | None = None, rfc3161_ca: Path | None = None,
@@ -911,6 +956,8 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
         raise ValueError("Collection and polling intervals must be positive")
     if min(api_workers, git_workers) < 1:
         raise ValueError("At least one worker is required in each lane")
+    if schedule_slot is not None and (type(schedule_slot) is not int or schedule_slot < 0):
+        raise ValueError("A nonnegative frozen schedule slot is required")
     if (export_directory is None) != (public_key is None):
         raise ValueError("Encrypted export requires both --export-directory and --public-key")
     if expected_repository_ids and any(slug not in config.repositories or type(repo_id) is not int or repo_id <= 0
@@ -932,6 +979,7 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                                 git_interval_seconds=git_interval_seconds,
                                 poll_interval_seconds=poll_interval_seconds, deep_full=deep_full, stamp=stamp,
                                 expected_repository_ids=expected_repository_ids or {}, observation_key=observation_key,
+                                schedule_slot=schedule_slot,
                                 working_state_origin=working_state_origin,
                                 history_policy=history_policy,
                                 timestamp_policy=timestamp_policy, freetsa_policy=freetsa_policy)
@@ -942,7 +990,8 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
                      git_interval_seconds: int, poll_interval_seconds: float,
                      deep_full: bool, stamp: bool, expected_repository_ids: dict[str, int],
                      observation_key: str | None, timestamp_policy: dict | None, freetsa_policy: dict | None = None,
-                     working_state_origin: str | None = None, history_policy: dict | None = None) -> dict[str, Any]:
+                     working_state_origin: str | None = None, history_policy: dict | None = None,
+                     schedule_slot: int | None = None) -> dict[str, Any]:
     frozen = _public_config(config)
     identity_config = {"config": frozen, "deep_full": deep_full,
                                      "expected_repository_ids": expected_repository_ids,
@@ -956,7 +1005,7 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
         known = {(job.slug, job.lane, job.capture_id) for job in existing_jobs}
         pending = {(job.slug, job.lane) for job in existing_jobs if job.state != "complete"}
         for lane, interval in (("api", api_interval_seconds), ("git", git_interval_seconds)):
-            slot = int(now // interval)
+            slot = int(now // interval) if schedule_slot is None else schedule_slot
             # Keep one outstanding capture per repository/lane. A delayed job is
             # resumed, rather than accumulating catch-up full-cohort work.
             for slug in config.repositories:
@@ -994,7 +1043,8 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
         attempted_ids = completed_ids | {item["job_id"] for item in result["errors"]}
         current_jobs, older_attempts = [], []
         for job in queue.jobs():
-            expected_slot = int(now // (api_interval_seconds if job.lane == "api" else git_interval_seconds))
+            expected_slot = (int(now // (api_interval_seconds if job.lane == "api" else git_interval_seconds))
+                             if schedule_slot is None else schedule_slot)
             current = (job.input_hash == input_hash and (
                 job.payload.get("observation_key") == observation_key if observation_key else
                 job.payload.get("schedule_slot") == expected_slot))
@@ -1178,6 +1228,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                           state_private_key: Path, evidence_public_key: Path,
                           code_sha: str, config_source_sha256: str,
                           observation_key: str | None = None, deep_full: bool = False,
+                          schedule_slot: int | None = None,
                           stamp: bool = True, transport: Any = None,
                           allow_bootstrap: bool = True, require_planned_state: bool = False,
                           expected_state_pointer_sha256: str | None = None,
@@ -1220,6 +1271,8 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
         config = replace(config, history_profile=history_policy["profile"],
                          history_cutoff_utc=history_policy.get("cutoff_utc"))
     transport = transport or GhCliStateTransport(destination_repository)
+    if schedule_slot is None:
+        schedule_slot = getattr(transport, "cycle_slot", None)
     backend = GitHubStateStore(transport, repository_id=repository_id, slug=slug,
                                public_key=state_public_key, private_key=state_private_key, logical_root=root)
     with ControllerLock(root), tempfile.TemporaryDirectory(prefix=f"icsot-transfers-{repository_id}-") as temporary:
@@ -1254,6 +1307,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                                     verified_legacy_seeds=catalog.get("legacy_seed_packages", []),
                                     expected_repository_ids={slug: repository_id},
                                     observation_key=observation_key or run_id(), controller_locked=True,
+                                    schedule_slot=schedule_slot,
                                     working_state_origin=working_state_origin,
                                     history_policy=history_policy,
                                     rfc3161_url=rfc3161_url, rfc3161_ca=rfc3161_ca, rfc3161_chain=rfc3161_chain,
@@ -1327,6 +1381,9 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                           "ciphertext_sha256": _file_sha256(marker_path), "ciphertext_bytes": marker_path.stat().st_size}
             dependencies.append(marker_ref)
             uploaded_evidence_bytes += marker_ref["ciphertext_bytes"]
+            binder = getattr(transport, "bind_asset_refs", None)
+            if callable(binder):
+                binder(dependencies)
             catalog.setdefault("publication_markers", []).append(marker_ref)
             verified_marker = Path(temporary) / "verified-public-marker.json"
             publish_call(transport.download_asset, release_tag, marker_path.name, verified_marker)
@@ -1462,4 +1519,5 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
 
 def _public_asset_ref(ref: dict) -> dict:
     return {"release_tag": ref["release_tag"], "name": ref["name"],
-            "sha256": ref["ciphertext_sha256"], "bytes": ref["ciphertext_bytes"]}
+            "sha256": ref["ciphertext_sha256"], "bytes": ref["ciphertext_bytes"],
+            **({"storage": ref["storage"]} if "storage" in ref else {})}

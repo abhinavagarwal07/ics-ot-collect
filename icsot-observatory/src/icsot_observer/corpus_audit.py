@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
-from .archive_reader import ArchivePart, VerifiedArchiveReader, verify_encrypted_part
+from .archive_reader import ArchivePart, VerifiedArchiveReader, reader_options, verify_encrypted_part
 from .attestations import AttestationDependencyError, inspect_ots_receipt
 from .checks import _git_namespace
 from .core import Config, REPO_RE, canonical_json, sha256, utc_iso
@@ -1085,8 +1085,12 @@ def audit_capture(capture: Capture, github: GitHubReadOnly, budget: LocalBudget,
         writer = selected.open_writer() if selected is not None else None
         audit = MemberAudit(capture, writer)
         try:
+            options = reader_options(capture.index)
+            expected = ({"evidence/" + member["path"]: {"bytes": member["bytes"], "sha256": member["sha256"]}
+                         for member in capture.index.get("members", [])} if options else None)
             reader = VerifiedArchiveReader((downloaded_part(github, budget, part) for part in parts),
-                                           private_key_path=private_key_path, allowed_prefixes=("evidence", "reports"))
+                                           private_key_path=private_key_path, allowed_prefixes=("evidence", "reports"),
+                                           expected_members=expected, **options)
             scan = reader.scan(audit.on_member)
             result["parts"] = scan.parts
             result.update(audit.validate(scan.members))
