@@ -98,6 +98,21 @@ def _public_timestamp_policy(policy: dict | None) -> dict | None:
     return {key: policy[key] for key in ("endpoint", "ca_sha256", "untrusted_sha256")} if policy else None
 
 
+def _freetsa_policy() -> dict:
+    root = Path(__file__).resolve().parents[2] / "keys" / "freetsa-root.pem"
+    policy = _rfc3161_policy("https://freetsa.org/tsr", root, None)
+    if policy["ca_sha256"] != "2151b61137ffa86bf664691ba67e7da0b19f98c758e3d228d5d8ebf27e044438":
+        raise ValueError("FreeTSA root differs from the provider-published pinned PEM")
+    return policy
+
+
+def _freetsa_profile() -> dict:
+    return {"name": "FreeTSA", "endpoint": "https://freetsa.org/tsr",
+            "provider_documentation": "https://freetsa.org/index_en.php",
+            "root_pem_sha256": "2151b61137ffa86bf664691ba67e7da0b19f98c758e3d228d5d8ebf27e044438",
+            "root_der_sha256": "a6379e7cecc05faa3cbf076013d745e327bbbaa38c0b9af22469d4701d18aabc"}
+
+
 def _registry_path(root: Path, slug: str) -> Path:
     return root / "registry" / (slug.lower().replace("/", "__") + ".json")
 
@@ -327,6 +342,8 @@ def capture_lane(config: Config, job: Any, queue: Any) -> dict[str, Any]:
         "public_config": _public_config(config),
         "rfc3161_policy": job.payload.get("rfc3161_policy"),
     }
+    if job.payload.get("freetsa_policy"):
+        payload["freetsa_policy"] = job.payload["freetsa_policy"]
     # Bind identity envelopes durably before either lane continues, including a
     # first Git capture whose result may outlive its worker process.
     checkpoint = CheckpointStore(config.root, repo_id, job.capture_id)
@@ -613,6 +630,29 @@ class CaptureExporter:
                 index["public_sidecars"].extend(assets)
             else:
                 index["timestamp_evidence"]["rfc3161"] = {"status": "not_configured"}
+            if info.get("freetsa_evidence"):
+                evidence = info["freetsa_evidence"]
+                source = Path(info["freetsa_source"])
+                if evidence.get("status") == "failed":
+                    assets = evidence["attempt_assets"] + [evidence["failure_asset"]]
+                else:
+                    assets = [evidence["request_asset"], evidence["proof_asset"],
+                              *([evidence["details_asset"]] if evidence.get("details_asset") else []),
+                              *evidence["trust_assets"], evidence["metadata_asset"]]
+                for asset in assets:
+                    if Path(asset["name"]).name != asset["name"]:
+                        raise ValueError("Unsafe timestamp sidecar asset name")
+                    contents = (source / asset["name"]).read_bytes()
+                    if sha256(contents) != asset["sha256"] or len(contents) != asset["bytes"]:
+                        raise RuntimeError("FreeTSA sidecar differs from retained metadata")
+                    try:
+                        write_once(self.directory / asset["name"], contents)
+                    except FileExistsError:
+                        if (self.directory / asset["name"]).read_bytes() != contents:
+                            raise RuntimeError("Conflicting immutable timestamp sidecar")
+                index["timestamp_evidence"]["additional_rfc3161"] = {
+                    "schema_version": 1, "providers": {"freetsa": {**evidence, "provider_profile": _freetsa_profile()}}}
+                index["public_sidecars"].extend(assets)
             if len(sink.parts) == 1:
                 index["asset"] = sink.parts[0]  # Compatibility with initial single-part exports.
             write_once(index_path, canonical_json(index))
@@ -787,6 +827,38 @@ def finalize_lane(config: Config, job: Any, capture: dict[str, Any], *, stamp: b
             observation_finished_at=capture["finished_at"], endpoint=policy["endpoint"],
             ca_file=Path(policy["ca_file"]), untrusted_file=Path(policy["untrusted_file"]) if policy["untrusted_file"] else None)
         info["rfc3161_source"] = str(source)
+    policy = capture.get("freetsa_policy")
+    if policy:
+        from .attestations import publish_rfc3161_attestation
+        source = config.root / "proofs" / "rfc3161" / info["manifest_sha256"] / "freetsa"
+        if source.is_symlink():
+            raise RuntimeError("FreeTSA evidence directory must not be a symlink")
+        source.mkdir(parents=True, exist_ok=True)
+        failure_path = source / ("freetsa-" + info["manifest_sha256"] + ".failure.json")
+        try:
+            if failure_path.exists():
+                raise RuntimeError("Retained failed FreeTSA attempt")
+            if _file_sha256(Path(policy["ca_file"])) != policy["ca_sha256"]:
+                raise RuntimeError("FreeTSA trust file differs from frozen policy")
+            info["freetsa_evidence"] = publish_rfc3161_attestation(
+                source, manifest_sha256=info["manifest_sha256"], observation_started_at=capture["started_at"],
+                observation_finished_at=capture["finished_at"], endpoint=policy["endpoint"],
+                ca_file=Path(policy["ca_file"]), max_attempts=3)
+        except (RuntimeError, ValueError, OSError):
+            if not failure_path.exists():
+                attempt_assets = []
+                for path in sorted(source.iterdir()):
+                    if path.is_file() and not path.is_symlink() and path.name.endswith((".tsq", ".tsr", ".request.json", ".attempt.json", ".pem")):
+                        attempt_assets.append({"name": path.name, "sha256": _file_sha256(path), "bytes": path.stat().st_size})
+                failure = {"schema_version": 1, "method": "rfc3161", "status": "failed",
+                           "subject_sha256": info["manifest_sha256"], "provider": {"endpoint": policy["endpoint"]},
+                           "reason": "request_or_verification_failed", "retry": "not_scheduled",
+                           "attempt_assets": attempt_assets, "recorded_at": utc_iso()}
+                write_once(failure_path, canonical_json(failure))
+            failure = json.loads(failure_path.read_bytes())
+            info["freetsa_evidence"] = {**failure, "failure_asset": {"name": failure_path.name,
+                "sha256": _file_sha256(failure_path), "bytes": failure_path.stat().st_size}}
+        info["freetsa_source"] = str(source)
     if exporter:
         exporter.export(info)
     return Finalization(info["manifest"], info["manifest_sha256"], candidates)
@@ -804,7 +876,7 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                    working_state_origin: str | None = None,
                    history_policy: dict | None = None,
                    rfc3161_url: str | None = None, rfc3161_ca: Path | None = None,
-                   rfc3161_chain: Path | None = None) -> dict[str, Any]:
+                   rfc3161_chain: Path | None = None, freetsa: bool = False) -> dict[str, Any]:
     """Run durable independent lanes on an existing trusted persistent root.
 
     Schedule-slot IDs make restart enqueue idempotent. This function never starts
@@ -837,19 +909,22 @@ def run_persistent(config: Config, *, once: bool = False, api_workers: int = 1, 
                                 expected_repository_ids=expected_repository_ids or {}, observation_key=observation_key,
                                 working_state_origin=working_state_origin,
                                 history_policy=history_policy,
-                                timestamp_policy=timestamp_policy)
+                                timestamp_policy=timestamp_policy, freetsa_policy=_freetsa_policy() if freetsa else None)
 
 
 def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | None, once: bool,
                      api_workers: int, git_workers: int, api_interval_seconds: int,
                      git_interval_seconds: int, poll_interval_seconds: float,
                      deep_full: bool, stamp: bool, expected_repository_ids: dict[str, int],
-                     observation_key: str | None, timestamp_policy: dict | None,
+                     observation_key: str | None, timestamp_policy: dict | None, freetsa_policy: dict | None = None,
                      working_state_origin: str | None = None, history_policy: dict | None = None) -> dict[str, Any]:
     frozen = _public_config(config)
-    input_hash = sha256(canonical_json({"config": frozen, "deep_full": deep_full,
+    identity_config = {"config": frozen, "deep_full": deep_full,
                                      "expected_repository_ids": expected_repository_ids,
-                                     "timestamp_policy": _public_timestamp_policy(timestamp_policy)}))
+                                     "timestamp_policy": _public_timestamp_policy(timestamp_policy)}
+    if freetsa_policy:
+        identity_config["additional_timestamp_policy"] = {"freetsa": _public_timestamp_policy(freetsa_policy)}
+    input_hash = sha256(canonical_json(identity_config))
     while True:
         now = time.time()
         existing_jobs = queue.jobs()
@@ -881,6 +956,8 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
                     extra["expected_repository_id"] = expected_repository_ids[slug]
                 if timestamp_policy:
                     extra["rfc3161_policy"] = timestamp_policy
+                if freetsa_policy:
+                    extra["freetsa_policy"] = freetsa_policy
                 enqueue_capture(queue, config, slug, lane, capture_id, mode="delta", deep_full=deep_full,
                                 input_hash=input_hash, extra_payload=extra)
         result = queue.run_pending(lambda job: capture_lane(config, job, queue),
@@ -1083,7 +1160,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                           history_policy: dict | None = None,
                           logical_root: Path | None = None, rfc3161_url: str | None = None,
                           rfc3161_ca: Path | None = None, rfc3161_chain: Path | None = None,
-                          publication_controller: Any = None) -> dict[str, Any]:
+                          publication_controller: Any = None, freetsa: bool = False) -> dict[str, Any]:
     """Selected-repository hosted run: restore, collect, publish evidence, CAS state.
 
     The operational state recipient differs from the owner-only evidence recipient.
@@ -1154,7 +1231,8 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
                                     observation_key=observation_key or run_id(), controller_locked=True,
                                     working_state_origin=working_state_origin,
                                     history_policy=history_policy,
-                                    rfc3161_url=rfc3161_url, rfc3161_ca=rfc3161_ca, rfc3161_chain=rfc3161_chain)
+                                    rfc3161_url=rfc3161_url, rfc3161_ca=rfc3161_ca, rfc3161_chain=rfc3161_chain,
+                                    freetsa=freetsa)
         release_tag = f"collector-observations-r{repository_id}-g{uuid.uuid4().hex}"
         if publication_controller is not None:
             publication_controller.capture_completed(collection=collection, release_tag=release_tag, exports=exports)

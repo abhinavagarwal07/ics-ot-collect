@@ -398,6 +398,46 @@ def _marker_entries(marker: dict, tag: str, transport: Any) -> list[dict]:
         if index_ref["release_tag"] != tag or not index_ref["name"].endswith(".index.json"):
             raise ValueError("Completion marker index names another release")
         index = _json(transport.fetch(index_ref))
+        additional = index.get("timestamp_evidence", {}).get("additional_rfc3161")
+        if additional is not None:
+            if (not isinstance(index.get("manifest_sha256"), str) or not HASH.fullmatch(index["manifest_sha256"]) or
+                    observation.get("manifest_sha256") != index["manifest_sha256"]):
+                raise ValueError("Additional RFC 3161 observation subject differs")
+            if not isinstance(additional, dict) or additional.get("schema_version") != 1 or not isinstance(additional.get("providers"), dict):
+                raise ValueError("Invalid additional RFC 3161 evidence")
+            if observation.get("timestamp_evidence", {}).get("additional_rfc3161") != additional:
+                raise ValueError("Additional RFC 3161 catalog and index differ")
+            for provider, item in additional["providers"].items():
+                if provider != "freetsa" or not isinstance(item, dict):
+                    raise ValueError("Unsupported additional RFC 3161 provider")
+                failed = item.get("status") == "failed"
+                if failed:
+                    assets = [*item["attempt_assets"], item["failure_asset"]]
+                    meta_asset = item["failure_asset"]
+                    expected = {k: v for k, v in item.items() if k not in ("failure_asset", "provider_profile")}
+                    if expected.get("subject_sha256") != index.get("manifest_sha256") or expected.get("retry") != "not_scheduled":
+                        raise ValueError("Failed FreeTSA record subject or retry status differs")
+                else:
+                    metadata = item["metadata"]
+                    assets = [item["request_asset"], item["proof_asset"],
+                              *([item["details_asset"]] if item.get("details_asset") else []),
+                              *item["trust_assets"], item["metadata_asset"]]
+                    meta_asset = item["metadata_asset"]
+                    expected = metadata
+                    if (metadata.get("status") != "verified_chain_and_imprint" or
+                            metadata.get("subject_sha256") != index.get("manifest_sha256") or
+                            metadata.get("receipt") != item["proof_asset"] or
+                            metadata.get("request_asset") != item["request_asset"] or
+                            metadata.get("trust_assets") != item["trust_assets"]):
+                        raise ValueError("FreeTSA metadata binding differs")
+                index_assets = index.get("public_sidecars", [])
+                marker_assets = observation.get("public_sidecars", [])
+                for asset in assets:
+                    ref = _ref({"release_tag": tag, **asset})
+                    if asset not in index_assets or ref not in marker_assets:
+                        raise ValueError("FreeTSA sidecar absent from public index or catalog")
+                if _json(transport.fetch(_ref({"release_tag": tag, **meta_asset}))) != expected:
+                    raise ValueError("FreeTSA public metadata differs from index")
         evidence = index.get("timestamp_evidence", {}).get("opentimestamps", {})
         if "metadata" not in evidence:
             continue

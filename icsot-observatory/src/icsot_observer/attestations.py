@@ -12,13 +12,16 @@ from __future__ import annotations
 import io
 import base64
 import json
+import random
 import re
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -282,6 +285,40 @@ def _retained_asset(directory: Path, descriptor: dict[str, Any]) -> Path:
     return path
 
 
+def _post_timestamp(request: urllib.request.Request, timeout: float, max_bytes: int,
+                    attempts: int) -> bytes:
+    """Bound retries and honor provider delays without extending the request budget."""
+    deadline = time.monotonic() + timeout
+    for number in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            with urllib.request.urlopen(request, timeout=remaining) as response:
+                return response.read(max_bytes + 1)
+        except urllib.error.HTTPError as error:
+            if error.code not in (429, 503) or number + 1 == attempts:
+                raise RFC3161Error("RFC 3161 timestamp request failed") from error
+            value = error.headers.get("Retry-After") if error.headers else None
+            delay = 0.0
+            if value:
+                try:
+                    delay = float(int(value)) if value.strip().isdigit() else max(
+                        0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+                except (ValueError, TypeError, OverflowError):
+                    delay = 0.0
+            error.close()
+        except (OSError, urllib.error.URLError) as error:
+            if number + 1 == attempts:
+                raise RFC3161Error("RFC 3161 timestamp request failed") from error
+            delay = 0.0
+        delay = max(1.0, delay) + random.uniform(0.05, 0.25)
+        if delay >= deadline - time.monotonic():
+            break
+        time.sleep(delay)
+    raise RFC3161Error("RFC 3161 timestamp request retry budget exhausted")
+
+
 def publish_rfc3161_attestation(
     output_dir: Path,
     *,
@@ -294,6 +331,7 @@ def publish_rfc3161_attestation(
     openssl_binary: str = "openssl",
     timeout_seconds: float = 35,
     max_response_bytes: int = 1024 * 1024,
+    max_attempts: int = 1,
 ) -> dict[str, Any]:
     """Request and preserve a configured RFC 3161 timestamp for a digest only.
 
@@ -311,7 +349,7 @@ def publish_rfc3161_attestation(
     if (parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc or
             parsed_url.username is not None or parsed_url.password is not None or parsed_url.query or parsed_url.fragment):
         raise ValueError("RFC 3161 endpoint must be an explicit public HTTP(S) URL without credentials, query or fragment")
-    if not 0 < timeout_seconds <= 180 or not 0 < max_response_bytes <= MAX_RECEIPT_BYTES:
+    if not 0 < timeout_seconds <= 180 or not 0 < max_response_bytes <= MAX_RECEIPT_BYTES or not 1 <= max_attempts <= 3:
         raise ValueError("RFC 3161 timeout or response limit is outside the allowed bounds")
     started = _utc(observation_started_at, "observation_started_at")
     finished = _utc(observation_finished_at, "observation_finished_at")
@@ -380,11 +418,7 @@ def publish_rfc3161_attestation(
     _immutable_asset(output_dir, f"rfc3161-{manifest_sha256}-{sha256(request_record_bytes)}.request.json", request_record_bytes)
     request = urllib.request.Request(endpoint, data=query_bytes, method="POST",
                                      headers={"Content-Type": "application/timestamp-query", "Accept": "application/timestamp-reply"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            response_bytes = response.read(max_response_bytes + 1)
-    except (OSError, urllib.error.URLError) as error:
-        raise RFC3161Error("RFC 3161 timestamp request failed") from error
+    response_bytes = _post_timestamp(request, timeout_seconds, max_response_bytes, max_attempts)
     received = utc_iso()
     if not response_bytes or len(response_bytes) > max_response_bytes:
         raise RFC3161Error("RFC 3161 response is empty or exceeds the configured size limit")

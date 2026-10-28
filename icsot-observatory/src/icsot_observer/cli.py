@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     gc.add_argument("--deep-full", action="store_true")
     gc.add_argument("--no-stamp", action="store_true", help="Testing: disable OpenTimestamps submission")
     for parser in (pc, gc):
+        parser.add_argument("--freetsa", action="store_true", help="Also request a FreeTSA RFC 3161 proof using the bundled pinned root")
         parser.add_argument("--rfc3161-url", help="Optional RFC 3161 TSA endpoint; only a digest is submitted")
         parser.add_argument("--rfc3161-ca", type=Path, help="Explicit trusted CA PEM for RFC 3161 verification")
         parser.add_argument("--rfc3161-chain", type=Path, help="Optional intermediate certificate PEM for RFC 3161 verification")
@@ -96,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
                                     poll_interval_seconds=args.poll_interval_seconds,
                                     deep_full=args.deep_full, stamp=not args.no_stamp,
                                     export_directory=args.export_directory, public_key=args.public_key,
-                                    rfc3161_url=args.rfc3161_url, rfc3161_ca=args.rfc3161_ca, rfc3161_chain=args.rfc3161_chain)
+                                    rfc3161_url=args.rfc3161_url, rfc3161_ca=args.rfc3161_ca, rfc3161_chain=args.rfc3161_chain,
+                                    freetsa=args.freetsa)
         except KeyboardInterrupt:
             return 130
         print(json.dumps(result, indent=2))
@@ -112,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
                                            config_source_sha256=sha256(args.config.read_bytes()),
                                            observation_key=args.observation_key, deep_full=args.deep_full,
                                            stamp=not args.no_stamp, rfc3161_url=args.rfc3161_url,
-                                           rfc3161_ca=args.rfc3161_ca, rfc3161_chain=args.rfc3161_chain)
+                                           rfc3161_ca=args.rfc3161_ca, rfc3161_chain=args.rfc3161_chain, freetsa=args.freetsa)
         except StateDeferredError as error:
             deadline = None
             if error.retry_not_before is not None:

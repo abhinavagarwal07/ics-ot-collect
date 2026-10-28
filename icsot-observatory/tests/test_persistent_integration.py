@@ -239,6 +239,60 @@ def test_rfc_failure_retries_only_finalization_and_exports_verified_sidecars(tmp
     assert all((tmp_path / "exports" / asset["name"]).is_file() for asset in index["public_sidecars"])
 
 
+@pytest.mark.parametrize("free_fails", [False, True])
+def test_freetsa_independent_of_digicert_and_publicly_reachable(tmp_path, monkeypatch, free_fails):
+    root = tmp_path / "evidence"
+    cfg, queue = config(root), PersistentQueue(root)
+    ca = tmp_path / "root.pem"
+    ca.write_bytes(b"test-only root")
+    capture = captured("two-tsas")
+    capture["rfc3161_policy"] = pipeline._rfc3161_policy("https://digi.example.invalid", ca, None)
+    capture["freetsa_policy"] = pipeline._rfc3161_policy("https://free.example.invalid", ca, None)
+    queue.enqueue("test/repo", capture_id=capture["capture_id"])
+    public = tmp_path / "public.pem"
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public.write_bytes(key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    exporter = pipeline.CaptureExporter(root, tmp_path / "exports", public)
+    calls = []
+
+    def tsa(directory, **options):
+        free = options["endpoint"].startswith("https://free")
+        calls.append(options["endpoint"])
+        directory.mkdir(parents=True, exist_ok=True)
+        if free and free_fails:
+            write_once(directory / "freetsa-attempt.tsq", b"failed request")
+            raise RuntimeError("temporary failure")
+        def asset(name, contents):
+            write_once(directory / name, contents)
+            return {"name": name, "sha256": sha256(contents), "bytes": len(contents)}
+        prefix = "free" if free else "digi"
+        request = asset(prefix + ".tsq", b"request " + prefix.encode())
+        proof = asset(prefix + ".tsr", b"receipt " + prefix.encode())
+        trust = asset(prefix + ".pem", ca.read_bytes())
+        metadata = {"status": "verified_chain_and_imprint", "subject_sha256": options["manifest_sha256"]}
+        sidecar = asset(prefix + ".json", canonical_json(metadata))
+        return {"metadata": metadata, "request_asset": request, "proof_asset": proof,
+                "trust_assets": [trust], "metadata_asset": sidecar}
+
+    monkeypatch.setattr("icsot_observer.attestations.publish_rfc3161_attestation", tsa)
+    handler = lambda job: capture
+    finalizer = lambda job, result: pipeline.finalize_lane(cfg, job, result, stamp=False, exporter=exporter)
+    assert queue.run_pending(handler, handler, finalizer)["completed"] == 1
+    index = json.loads(next((tmp_path / "exports").glob("*.index.json")).read_bytes())
+    assert index["timestamp_evidence"]["rfc3161"]["metadata"]["status"] == "verified_chain_and_imprint"
+    entry = index["timestamp_evidence"]["additional_rfc3161"]["providers"]["freetsa"]
+    assert (entry if free_fails else entry["metadata"])["status"] == ("failed" if free_fails else "verified_chain_and_imprint")
+    assert len(calls) == 2
+    sidecars = {item["name"]: item for item in index["public_sidecars"]}
+    refs = ([*entry["attempt_assets"], entry["failure_asset"]] if free_fails else
+            [entry["request_asset"], entry["proof_asset"], *entry["trust_assets"], entry["metadata_asset"]])
+    for item in refs:
+        assert sidecars[item["name"]] == item
+        assert sha256((tmp_path / "exports" / item["name"]).read_bytes()) == item["sha256"]
+    if free_fails:
+        assert entry["retry"] == "not_scheduled"
+
+
 def test_failed_scope_candidate_is_rejected_before_manifest_or_watermark(tmp_path):
     capture = captured("invalid", api={"scope_statuses": {"issues": {"status": "failed"}}})
     capture["watermark_candidates"] = {"issues": "2026-10-20T00:00:00Z"}

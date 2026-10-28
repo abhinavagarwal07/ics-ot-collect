@@ -181,6 +181,47 @@ def test_catalog_validation_has_no_queue_access_or_capacity_dependency(tmp_path)
     assert github.saves == 0 and github.files == {}
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_additional_rfc_catalog_binding_does_not_depend_on_ots(failed):
+    from icsot_observer.proof_maintenance import _marker_entries
+    github = FakeGitHub()
+
+    def asset(name, raw):
+        github.assets[TAG, name] = raw
+        return {"name": name, "sha256": sha256(raw), "bytes": len(raw)}
+
+    request = asset("free.tsq", b"request")
+    if failed:
+        metadata = {"schema_version": 1, "method": "rfc3161", "status": "failed",
+                    "subject_sha256": SUBJECT, "retry": "not_scheduled", "attempt_assets": [request]}
+        metadata_asset = asset("free.failure.json", canonical_json(metadata))
+        entry = {**metadata, "failure_asset": metadata_asset, "provider_profile": {"name": "FreeTSA"}}
+        assets = [request, metadata_asset]
+    else:
+        proof = asset("free.tsr", b"signed fixture")
+        root = asset("root.pem", b"root fixture")
+        metadata = {"status": "verified_chain_and_imprint", "subject_sha256": SUBJECT,
+                    "request_asset": request, "receipt": proof, "trust_assets": [root]}
+        metadata_asset = asset("free.attestation.json", canonical_json(metadata))
+        entry = {"metadata": metadata, "request_asset": request, "proof_asset": proof,
+                 "trust_assets": [root], "metadata_asset": metadata_asset}
+        assets = [request, proof, root, metadata_asset]
+    additional = {"schema_version": 1, "providers": {"freetsa": entry}}
+    index = {"manifest_sha256": SUBJECT, "timestamp_evidence": {"additional_rfc3161": additional},
+             "public_sidecars": assets}
+    raw = canonical_json(index)
+    index_ref = {"release_tag": TAG, **asset("free.index.json", raw)}
+    row = {"manifest_sha256": SUBJECT, "index": index_ref,
+           "timestamp_evidence": {"additional_rfc3161": additional},
+           "public_sidecars": [{"release_tag": TAG, **item} for item in assets]}
+    marker = {"schema_version": 1, "kind": "icsot_evidence_metadata_catalog", "generation_release": TAG,
+              "observations": [row]}
+    assert _marker_entries(marker, TAG, github) == []
+    row["public_sidecars"].pop()
+    with pytest.raises(ValueError, match="absent from public index or catalog"):
+        _marker_entries(marker, TAG, github)
+
+
 def test_full_attempt_queue_keeps_outbox_and_still_drains_then_registers(tmp_path):
     github = OutboxGitHub()
     old_ref, old_evidence = observation(tmp_path, github)

@@ -1355,6 +1355,7 @@ def main(argv=None):
             child.add_argument("--evidence-public-key", required=True, type=Path)
             child.add_argument("--max-runtime-seconds", type=int, default=19800)
             child.add_argument("--rfc3161-url")
+            child.add_argument("--freetsa", action="store_true")
             child.add_argument("--rfc3161-ca", type=Path)
             child.add_argument("--rfc3161-chain", type=Path)
     args = parser.parse_args(argv)
@@ -1435,7 +1436,7 @@ def main(argv=None):
             scratch=Path(temporary), reader=reader, ledger=ledger, transport=transport,
             max_runtime_seconds=args.max_runtime_seconds,
             rfc3161_options={"rfc3161_url": args.rfc3161_url, "rfc3161_ca": args.rfc3161_ca,
-                             "rfc3161_chain": args.rfc3161_chain})
+                             "rfc3161_chain": args.rfc3161_chain, "freetsa": args.freetsa})
     result.update(destination_github_api_requests_total=transport.request_count,
                   destination_github_graphql_api_requests_total=transport.graphql_request_count,
                   destination_github_rest_api_requests_total=transport.request_count - transport.graphql_request_count,

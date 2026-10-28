@@ -259,6 +259,7 @@ def main(argv=None) -> int:
             for key in ("state-public-key", "state-private-key", "evidence-public-key", "rfc3161-ca", "rfc3161-chain"):
                 child.add_argument("--" + key, required=key.endswith("key"), type=Path)
             child.add_argument("--rfc3161-url")
+            child.add_argument("--freetsa", action="store_true")
     args = parser.parse_args(argv)
     if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != args.code_sha:
         raise ValueError("Collector checkout differs from the requested full code SHA")
@@ -310,7 +311,8 @@ def main(argv=None) -> int:
             require_planned_state=True, expected_state_pointer_sha256=entry["expected_pointer_sha256"],
             max_restored_state_plaintext_bytes=limits["max_restored_state_plaintext_bytes"], transport=transport,
             history_policy=entry["history_policy"],
-            rfc3161_url=args.rfc3161_url, rfc3161_ca=args.rfc3161_ca, rfc3161_chain=args.rfc3161_chain)
+            rfc3161_url=args.rfc3161_url, rfc3161_ca=args.rfc3161_ca, rfc3161_chain=args.rfc3161_chain,
+            freetsa=args.freetsa)
         report = public_outcome(result, entry)
         code = 0 if report["status"] == "complete" else 2
     except (StateError, APIRequestDeferred) as error:

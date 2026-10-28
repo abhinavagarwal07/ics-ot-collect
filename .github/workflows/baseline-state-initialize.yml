@@ -151,6 +151,7 @@ jobs:
             --rfc3161-url http://timestamp.digicert.com \
             --rfc3161-ca keys/digicert-trusted-root-g4.pem \
             --rfc3161-chain keys/digicert-timestamp-2025-intermediate.pem \
+            --freetsa \
             --max-runtime-seconds 19800 \
             --output "analysis/legacy-state-outcomes/r${REPOSITORY_ID}-run${GITHUB_RUN_ID}-attempt${GITHUB_RUN_ATTEMPT}.json"
       - name: Preserve bounded migration outcome metadata

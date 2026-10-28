@@ -177,6 +177,16 @@ def _proof(source: dict, local_receipt: bool = False) -> dict:
                         "tsa_generation_time": metadata.get("tsa_generation_time"),
                         "bitcoin_block_heights": metadata.get("bitcoin_block_heights"),
                         "metadata_sha256": (entry.get("metadata_asset") or {}).get("sha256")}
+    additional = evidence.get("additional_rfc3161") or {}
+    if additional.get("schema_version") == 1:
+        for provider, entry in (additional.get("providers") or {}).items():
+            if provider != "freetsa" or not isinstance(entry, dict):
+                continue
+            metadata = entry.get("metadata", entry)
+            result[provider] = {"status": metadata.get("status", "not_recorded"),
+                                "verification": metadata.get("verification"),
+                                "tsa_generation_time": metadata.get("tsa_generation_time"),
+                                "metadata_sha256": (entry.get("metadata_asset") or entry.get("failure_asset") or {}).get("sha256")}
     return result
 
 

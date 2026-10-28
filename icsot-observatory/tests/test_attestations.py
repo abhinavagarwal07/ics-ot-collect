@@ -343,6 +343,76 @@ def test_real_rfc3161_nonce_chain_and_imprint_verification_and_offline_reuse(tmp
     assert len(calls) == 1, "export retry must reuse the original accepted request/receipt"
 
 
+def test_two_rfc_providers_retain_distinct_receipts_for_same_subject(tmp_path, monkeypatch, local_tsa):
+    calls = mock_tsa(monkeypatch, local_tsa)
+    first = rfc_publish(tmp_path, local_tsa)
+    second = rfc_publish(tmp_path, local_tsa, endpoint="https://second.example.invalid")
+    assert len(calls) == 2
+    assert first["metadata"]["subject_sha256"] == second["metadata"]["subject_sha256"] == SUBJECT
+    assert first["proof_asset"]["name"] != second["proof_asset"]["name"]
+    assert len(list((tmp_path / "rfc3161").glob("*.accepted.json"))) == 2
+    assert rfc_publish(tmp_path, local_tsa) == first
+    assert rfc_publish(tmp_path, local_tsa, endpoint="https://second.example.invalid") == second
+    assert len(calls) == 2
+
+
+def test_rfc_retry_honors_retry_after_and_reuses_query(tmp_path, monkeypatch, local_tsa):
+    import urllib.error
+    from icsot_observer import attestations
+    requests, sleeps = [], []
+
+    def urlopen(request, timeout):
+        requests.append(request.data)
+        if len(requests) == 1:
+            raise urllib.error.HTTPError(request.full_url, 429, "limited", {"Retry-After": "3"}, None)
+        return io.BytesIO(local_tsa["sign"](request.data))
+
+    monkeypatch.setattr(attestations.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(attestations.time, "sleep", sleeps.append)
+    monkeypatch.setattr(attestations.random, "uniform", lambda a, b: 0.1)
+    result = rfc_publish(tmp_path, local_tsa, max_attempts=3)
+    assert result["metadata"]["status"] == "verified_chain_and_imprint"
+    assert requests[0] == requests[1]
+    assert sleeps == [3.1]
+
+
+def test_rfc_retry_after_longer_than_budget_fails_without_early_retry(tmp_path, monkeypatch, local_tsa):
+    import urllib.error
+    from icsot_observer import attestations
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(request.data)
+        raise urllib.error.HTTPError(request.full_url, 503, "busy", {"Retry-After": "3600"}, None)
+
+    monkeypatch.setattr(attestations.urllib.request, "urlopen", urlopen)
+    with pytest.raises(RFC3161Error, match="budget exhausted"):
+        rfc_publish(tmp_path, local_tsa, max_attempts=3)
+    assert len(calls) == 1
+
+
+def test_rfc_retry_after_http_date_is_respected(tmp_path, monkeypatch, local_tsa):
+    import urllib.error
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime, parsedate_to_datetime
+    from icsot_observer import attestations
+    calls, sleeps, expected_delays = [], [], []
+    retry_at = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=5), usegmt=True)
+
+    def urlopen(request, timeout):
+        calls.append(request.data)
+        if len(calls) == 1:
+            expected_delays.append(max(1.0, (parsedate_to_datetime(retry_at) - datetime.now(timezone.utc)).total_seconds()) + 0.1)
+            raise urllib.error.HTTPError(request.full_url, 503, "busy", {"Retry-After": retry_at}, None)
+        return io.BytesIO(local_tsa["sign"](request.data))
+
+    monkeypatch.setattr(attestations.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(attestations.time, "sleep", sleeps.append)
+    monkeypatch.setattr(attestations.random, "uniform", lambda a, b: 0.1)
+    assert rfc_publish(tmp_path, local_tsa, max_attempts=3)["metadata"]["status"] == "verified_chain_and_imprint"
+    assert len(calls) == 2 and abs(sleeps[0] - expected_delays[0]) < 0.5
+
+
 def test_rfc3161_older_accepted_metadata_is_enriched_without_restamping_or_mutation(tmp_path, monkeypatch, local_tsa):
     calls = mock_tsa(monkeypatch, local_tsa)
     original = rfc_publish(tmp_path, local_tsa)

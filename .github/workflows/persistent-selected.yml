@@ -127,7 +127,8 @@ jobs:
             --observation-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --rfc3161-url http://timestamp.digicert.com \
             --rfc3161-ca keys/digicert-trusted-root-g4.pem \
-            --rfc3161-chain keys/digicert-timestamp-2025-intermediate.pem
+            --rfc3161-chain keys/digicert-timestamp-2025-intermediate.pem \
+            --freetsa
       - name: Remove runner operational key
         if: always()
         run: rm -f "$RUNNER_TEMP/icsot-state-private.pem"

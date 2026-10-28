@@ -25,9 +25,9 @@ Record proof hash, verification time, Bitcoin network, block height/hash, and ve
 
 ## Automatic delayed-proof maintenance
 
-Repository observations remain manual. The separate `timestamp-refresh.yml` workflow is scheduled once per 24 hours at 04:43 UTC and supports manual dispatch, using only public indexes, proof sidecars and calendars. It attempts at most 128 proofs within its time budget; keeping up with the full 185-repository backlog is not established. It does not recapture repositories, decrypt evidence or load either RSA private key.
+The separate `timestamp-refresh.yml` workflow is scheduled once per 24 hours at 04:43 UTC and supports manual dispatch, using only public indexes, proof sidecars and calendars. It attempts at most 128 proofs within its time budget; keeping up with the full 185-repository backlog is not established. It does not recapture repositories, decrypt evidence or load either RSA private key.
 
-After public sidecars/indexes are uploaded, the collector uploads `metadata-catalog.json` last, verifies its remote hash/size, and registers the catalog on `collector-attestations` before publishing the new `collector-state` pointer. Registration is idempotent and uses compare-and-swap; a failed registration preserves the previous working-state pointer. Bounded Release discovery provides fallback recovery, and unmarked/incomplete releases stay retry candidates.
+After public sidecars/indexes are uploaded, the collector uploads `metadata-catalog.json` last, verifies its remote hash/size, validates its public proof bindings, and atomically publishes its reference in the new `collector-state` outbox. Maintenance registers catalogs idempotently on `collector-attestations` and checkpoints discovery with compare-and-swap. Bounded Release discovery provides fallback recovery, and unmarked/incomplete releases stay retry candidates.
 
 The worker keeps an operational pending queue separately from retained proof histories. An upgraded `.ots` and its canonical metadata are new immutable assets linked to the previous proof/metadata hashes; original files and frozen observation times remain unchanged. Rate refusals, calendar failures and partial discovery remain explicit and retryable.
 
@@ -38,6 +38,10 @@ Proofs reaching Bitcoin-attestation presence without RPC leave the pending queue
 ## RFC 3161
 
 A configured TSA can return an immediately verifiable signed timestamp without a code-signing private key. Configure the endpoint, accepted trust roots, optional intermediate certificates and acceptable TSA policy. Do not silently select a different provider or treat certificates supplied by a response as trust anchors. Missing configuration, request failure, received-but-unverified response, and verified response are separate outcomes.
+
+The selected persistent, recurring, and baseline-state initialization workflows request DigiCert, FreeTSA and OpenTimestamps for each new API or Git manifest. The original `timestamp_evidence.rfc3161` entry remains DigiCert; `timestamp_evidence.additional_rfc3161` version 1 contains the separately identified FreeTSA result. Each index and completion catalog links the relevant public sidecars, so an auditor can inspect a repository's full manifest digest, request, response, trust material, and verification metadata independently. The viewer reports the two RFC providers separately. Older captures are not backfilled; the earlier one-time corpus baseline and smoke workflows keep their existing behavior.
+
+FreeTSA uses up to three attempts within the request timeout, with at least one second plus jitter between retries and Retry-After honored for HTTP 429/503 when the remaining budget allows. A failed or exhausted attempt is recorded as `failed` and `retry: not_scheduled`; it does not claim verification or a delayed retry. Requests from concurrent runners can still race on shared egress, and the retry delay is not a global rate limiter. OTS and DigiCert run earlier and their existing failure behavior can defer finalization before FreeTSA is reached.
 
 The following commands use only the manifest digest. Query creation includes a nonce by default; retain it and never add `-no_nonce`. `-cert` requests the signer certificate. Set `-tspolicy OID` when an expected TSA policy is configured.
 
@@ -76,3 +80,9 @@ Fetched from the linked official HTTPS sources and verified on **2026-10-26 UTC*
 | `keys/digicert-timestamp-2025-intermediate.pem` | [DigiCert Trusted G4 TimeStamping RSA4096 SHA256 2025 CA1](https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertTrustedG4TimeStampingRSA4096SHA2562025CA1.pem) | `ca0b1554ecd901ea19dcad8749e9f2648c8d6dfcea1add9d2c2109415bb82ccd` | `5e13de210e735b614d6ec948361aadef9dd6c0ef575382a75f57fd59e183b90e` |
 
 The root expires 2038-01-15 12:00:00 UTC; the intermediate expires 2038-01-14 23:59:59 UTC. The checked [SHA-256 responder certificate](https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertSHA256RSA4096TimestampResponder20261.cer) has DER SHA-256 `2da09da7f4131f9fe72db6c5e6e9c9656755af043f1ea742cc0d2120e141ebfc` and validity 2026-08-05 through 2037-11-04 23:59:59 UTC; it is not bundled or pinned as a trust anchor.
+
+## FreeTSA public certificate and policy
+
+The explicit FreeTSA profile uses `https://freetsa.org/tsr` and `keys/freetsa-root.pem`. The provider's [service page](https://freetsa.org/index_en.php) publishes certificate hashes and the [certification practice statement](https://freetsa.org/freetsa_cps.html) identifies the root. The bundled PEM SHA-256 is `2151b61137ffa86bf664691ba67e7da0b19f98c758e3d228d5d8ebf27e044438`; its DER certificate SHA-256 is `a6379e7cecc05faa3cbf076013d745e327bbbaa38c0b9af22469d4701d18aabc`. This is an explicitly chosen FreeTSA trust anchor, separate from DigiCert's root. A synthetic nonce-bearing SHA-256 probe verified a response against that root on 2026-10-28 UTC; one request does not establish future uptime or throughput. Revocation was not checked.
+
+FreeTSA's [usage policy](https://freetsa.org/freetsa.html) specifies at most one timestamp request per second per IP for its public service and describes best-effort service without an SLA. Concurrent runners may share an IP; the configured retries do not guarantee that all traffic sharing an IP remains within that limit.

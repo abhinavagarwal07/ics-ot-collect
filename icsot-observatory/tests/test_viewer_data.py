@@ -297,6 +297,19 @@ def test_remote_metadata_browse_without_key_or_payload_downloads(workspace, nati
         assert viewer.repo(repo)["attempts"][0]["errors"] == ["synthetic partial capture"]
 
 
+@pytest.mark.parametrize("status", ["verified_chain_and_imprint", "failed"])
+def test_viewer_keeps_freetsa_status_distinct_from_digicert_and_ots(status):
+    from icsot_observer.viewer_data import _proof
+    free = {"status": status} if status == "failed" else {"metadata": {"status": status}}
+    result = _proof({"timestamp_evidence": {
+        "opentimestamps": {"metadata": {"status": "pending_bitcoin_completion"}},
+        "rfc3161": {"metadata": {"status": "verified_chain_and_imprint"}},
+        "additional_rfc3161": {"schema_version": 1, "providers": {"freetsa": free}}}})
+    assert result["opentimestamps"]["status"] == "pending_bitcoin_completion"
+    assert result["rfc3161"]["status"] == "verified_chain_and_imprint"
+    assert result["freetsa"]["status"] == status
+
+
 def test_metadata_asset_exact_hash_and_length_gate(monkeypatch):
     metadata = GitHubMetadata("example/release")
     raw = canonical_json({"synthetic": True})

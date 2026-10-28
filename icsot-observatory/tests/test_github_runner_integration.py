@@ -120,8 +120,8 @@ def keys(tmp_path, prefix):
     return public, private
 
 
-@pytest.mark.parametrize("stamp,rfc", [(False, False), (True, False), (False, True), (True, True)])
-def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_cipher_redownload(tmp_path, monkeypatch, stamp, rfc):
+@pytest.mark.parametrize("stamp,rfc,free", [(False, False, False), (True, False, False), (False, True, False), (True, True, False), (False, True, True)])
+def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_cipher_redownload(tmp_path, monkeypatch, stamp, rfc, free):
     if stamp:
         pytest.importorskip("opentimestamps.core.timestamp")
     config = Config(tmp_path / "unused", ("test/repo",), "2026-03-10", "research", "NO_TEST_TOKEN", 5, 1000000, 48, 100)
@@ -160,23 +160,27 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
         ca.write_bytes(b"shared explicit TSA root fixture")
         chain.write_bytes(b"shared explicit TSA intermediate fixture")
         rfc_options = {"rfc3161_url": "http://tsa.example.invalid", "rfc3161_ca": ca, "rfc3161_chain": chain}
+        if free:
+            rfc_options["freetsa"] = True
 
         def rfc_receipt(output_dir, **options):
             output_dir.mkdir(parents=True, exist_ok=True)
             digest = options["manifest_sha256"]
+            provider = "-free" if options["endpoint"] == "https://freetsa.org/tsr" else ""
 
             def asset(name, contents):
                 path = output_dir / name
                 path.write_bytes(contents)
                 return {"name": name, "sha256": sha256(contents), "bytes": len(contents)}
 
-            request = asset(f"rfc3161-{digest}.tsq", b"retained request " + digest.encode())
-            proof = asset(f"rfc3161-{digest}.tsr", b"signed response fixture " + digest.encode())
-            details = asset(f"rfc3161-{digest}.txt", b"signed TSTInfo text fixture " + digest.encode())
+            request = asset(f"rfc3161-{digest}{provider}.tsq", b"retained request " + digest.encode() + provider.encode())
+            proof = asset(f"rfc3161-{digest}{provider}.tsr", b"signed response fixture " + digest.encode() + provider.encode())
+            details = asset(f"rfc3161-{digest}{provider}.txt", b"signed TSTInfo text fixture " + digest.encode() + provider.encode())
             roots = [asset(f"rfc3161-trust-root-{sha256(ca.read_bytes())}.pem", ca.read_bytes()),
                      asset(f"rfc3161-untrusted-{sha256(chain.read_bytes())}.pem", chain.read_bytes())]
-            metadata = {"method": "rfc3161", "status": "verified_chain_and_imprint", "subject_sha256": digest}
-            sidecar = asset(f"rfc3161-{digest}.attestation.json", canonical_json(metadata))
+            metadata = {"method": "rfc3161", "status": "verified_chain_and_imprint", "subject_sha256": digest,
+                        "request_asset": request, "receipt": proof, "trust_assets": roots}
+            sidecar = asset(f"rfc3161-{digest}{provider}.attestation.json", canonical_json(metadata))
             return {"metadata": metadata, "request_asset": request, "proof_asset": proof, "details_asset": details,
                     "trust_assets": roots, "metadata_asset": sidecar}
 
@@ -191,7 +195,8 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
                 "responses": [{"purpose": "identity", "api_version": config.api_version,
                                "body_sha256": ObjectStore(config.root).put(body), "body_bytes": len(body)}],
                 "failures": [], "public_config": pipeline._public_config(config),
-                "rfc3161_policy": job.payload.get("rfc3161_policy")}
+                "rfc3161_policy": job.payload.get("rfc3161_policy"),
+                **({"freetsa_policy": job.payload["freetsa_policy"]} if job.payload.get("freetsa_policy") else {})}
 
     monkeypatch.setattr(pipeline, "capture_lane", capture)
     options = dict(slug="test/repo", repository_id=17, destination_repository="owner/collector",
@@ -237,6 +242,13 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
                 assert sha256(contents) == sidecar["sha256"]
         if rfc:
             assert index["timestamp_evidence"]["rfc3161"]["metadata"]["status"] == "verified_chain_and_imprint"
+        if free:
+            evidence = index["timestamp_evidence"]["additional_rfc3161"]["providers"]["freetsa"]
+            assert evidence["metadata"]["subject_sha256"] == index["manifest_sha256"]
+            assert evidence["metadata"]["status"] == "verified_chain_and_imprint"
+            for sidecar in (evidence["request_asset"], evidence["proof_asset"], evidence["metadata_asset"], *evidence["trust_assets"]):
+                ref = next(ref for ref in entry["assets"] if ref["name"] == sidecar["name"])
+                assert sha256(transport.assets[ref["release_tag"], ref["name"]]) == sidecar["sha256"]
     from icsot_observer.github_state import GitHubStateStore
     selected = GitHubStateStore(transport, repository_id=17, slug="test/repo", public_key=state_public,
                                 private_key=state_private, logical_root=root).read()
@@ -263,6 +275,11 @@ def test_two_hosted_cycles_restore_queue_and_deduplicate_prior_evidence_without_
         assert {entry["lane"] for entry in marker["observations"]} == {"api", "git"}
         for ref in marker["indexes"]:
             assert sha256(transport.assets[release, ref["name"]]) == ref["sha256"]
+        if free:
+            for observation in marker["observations"]:
+                evidence = observation["timestamp_evidence"]["additional_rfc3161"]["providers"]["freetsa"]
+                assert evidence["metadata"]["subject_sha256"] == observation["manifest_sha256"]
+                assert any(ref["name"] == evidence["proof_asset"]["name"] for ref in observation["public_sidecars"])
         if rfc:
             for prefix in ("rfc3161-trust-root-", "rfc3161-untrusted-"):
                 assert len([name for tag, name in transport.assets if tag == release and name.startswith(prefix)]) == 1

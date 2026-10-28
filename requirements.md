@@ -32,7 +32,7 @@ Create local, incremental, independently verifiable records of public GitHub obs
 1. Find when a commit was **first observed within each watched repository**, with observation-time branch/ref attribution. Mark baseline commits; do not claim exact first-publication time.
 2. Report each repository/lane's original observation start/end in UTC ISO 8601 with microsecond representation and `Z`, labeled `runner_system_clock`, and compare observations including edits and ref changes. Publish state snapshot start/seal UTC separately; collection is an interval, not an atomic instant. Clock precision does not establish externally verified clock accuracy. Distinguish absence from confirmed deletion.
 3. Preserve original response bodies, Git objects, manifests, and proofs. Allow independent hash verification and history restoration without contacting upstream.
-4. Externally timestamp manifest digests using **RFC 3161 and/or OpenTimestamps**. Retain immutable receipts and canonical attestation metadata beside public observation indexes, with original UTC request/receipt times when recorded, subject hashes and trust/verification status. Pending OTS receipts are not verified Bitcoin evidence; RFC 3161 responses require explicit trusted-chain, nonce and imprint verification. Evidence existence and GitHub provenance remain separate claims.
+4. For new captures in the configured persistent workflows, request independent DigiCert and FreeTSA RFC 3161 proofs and OpenTimestamps for each manifest's full SHA-256 digest. Preserve per-repository public indexes, immutable receipts and attestation metadata so each manifest can be audited independently, with original UTC request/receipt times when recorded and explicit trust/verification status. FreeTSA has bounded Retry-After-aware retries with jitter; an exhausted or failed attempt is recorded as failed with no scheduled retry. Pending OTS receipts are not verified Bitcoin evidence; RFC 3161 responses require explicit trusted-chain, nonce and imprint verification. Evidence existence and GitHub provenance remain separate claims.
    Delayed OTS proofs are refreshed once per 24 hours or manually through a bounded queue. Upgrades append hash-linked receipts and metadata without recapturing repositories or replacing original proofs. Without a trusted Bitcoin Core node, Bitcoin attestation presence remains unverified.
 5. Record expected observations, attempts, partial results, failures, rate limits, clock uncertainty, and scope/configuration changes to reconstruct gaps and collection bias. Emit bounded metadata-only stage/API diagnostics and terminal Actions summaries that separate scientific coverage from verification, archive/encryption, transfer and proof outcomes. Include identities, timings, selected quota/request-ID metadata, safe failure categories and retained index digests without logging bodies, raw header dumps, credentials or arbitrary exception text.
 6. Regenerate measurements and the analysis index from preserved evidence without trusting the working database.
@@ -56,7 +56,7 @@ Manual working-state compaction is scoped to one explicitly selected authenticat
 
 ## Decisions still open
 
-- Timestamp provider and acceptable attestation precision/delay.
+- Acceptable attestation precision and delay for each configured provider.
 - Off-host backups and their separate capacity/accounting policy.
 - Always-on host location and deployment; independent archive destination. See [storage decision](icsot-observatory/docs/STORAGE.md).
 
