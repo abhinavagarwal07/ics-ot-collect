@@ -41,6 +41,8 @@ from .runtime import ControllerLock
 SCHEMA_VERSION = 1
 BRANCH = "collector-state"
 MAX_PART_BYTES = 1024 ** 3
+# Maximum codec header plus framing and GCM tag.
+ENVELOPE_OVERHEAD = 65536 + 64
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _ASSET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\Z")
@@ -49,6 +51,47 @@ _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
 
 class StateError(RuntimeError):
     """Invalid, corrupt, incompatible, or concurrently changed working state."""
+
+
+class StateIntegrityError(StateError):
+    """A bounded, non-payload description of a verified integrity mismatch."""
+
+    def __init__(self, message: str, *, stage: str, subject: str, field: str,
+                 expected: str | int, actual: str | int):
+        if stage not in {"asset_download", "part_decode", "file_reconstruction", "group_verification", "tar_member"}:
+            raise StateError("Invalid integrity diagnostic stage")
+        if not isinstance(subject, str) or not re.fullmatch(
+                r"(?:asset:|part:|path-sha256:)[0-9a-f]{64}|[A-Za-z0-9._/ -]{1,256}", subject):
+            raise StateError("Invalid integrity diagnostic subject")
+        if field == "sha256":
+            valid = all(isinstance(value, str) and _HASH.fullmatch(value) for value in (expected, actual))
+        elif field == "bytes":
+            valid = all(type(value) is int and 0 <= value <= 2 ** 63 - 1 for value in (expected, actual))
+        else:
+            valid = False
+        if not valid:
+            raise StateError("Invalid integrity diagnostic values")
+        super().__init__(message)
+        self.detail = {"stage": stage, "subject": subject, "field": field,
+                       "expected": expected, "actual": actual}
+
+
+def _diagnostic_path(path: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9._/ -]{1,256}", path):
+        return path
+    return "path-sha256:" + hashlib.sha256(path.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _verify_file_integrity(path: Path, *, size: int, digest: str, stage: str,
+                           subject: str, message: str) -> None:
+    actual_size = path.stat().st_size
+    if actual_size != size:
+        raise StateIntegrityError(message, stage=stage, subject=subject, field="bytes",
+                                  expected=size, actual=actual_size)
+    actual_digest = _digest(path)
+    if actual_digest != digest:
+        raise StateIntegrityError(message, stage=stage, subject=subject, field="sha256",
+                                  expected=digest, actual=actual_digest)
 
 
 class StateReleaseMissingError(StateError):
@@ -559,6 +602,9 @@ class GhCliStateTransport:
     def read_slug_binding(self, head: str, slug: str) -> bytes | None:
         return self._read_git_file(head, _slug_path(slug))
 
+    def read_proof_outbox(self, head: str, repository_id: int, ref: dict) -> bytes | None:
+        return self._read_git_file(head, f"proof-outbox/{repository_id}/{ref['sha256']}.json")
+
     def commit_pointer(self, parent: str | None, repository_id: int, data: bytes,
                        *, proof_outbox_node: bytes | None = None) -> str:
         import base64
@@ -812,8 +858,8 @@ class GitHubStateStore:
                  logical_root: Path | str | None = None, part_bytes: int = MAX_PART_BYTES,
                  mutable_group_bytes: int = 64 * 1024 * 1024,
                  max_assets_per_release: int = 900,
-                 small_immutable_bytes: int = 1024 * 1024,
-                 immutable_group_bytes: int = 64 * 1024 * 1024,
+                 small_immutable_bytes: int = 64 * 1024 * 1024,
+                 immutable_group_bytes: int = 128 * 1024 * 1024,
                  immutable_group_members: int = 4096):
         if type(repository_id) is not int or repository_id < 1 or not REPO_RE.fullmatch(slug):
             raise ValueError("Selected positive repository ID and slug required")
@@ -822,7 +868,7 @@ class GitHubStateStore:
         if type(max_assets_per_release) is not int or not 2 <= max_assets_per_release <= 1000:
             raise ValueError("State release asset limit must be between 2 and 1000")
         if (type(small_immutable_bytes) is not int or not 0 <= small_immutable_bytes <= 64 * 1024 * 1024 or
-                type(immutable_group_bytes) is not int or not 10240 <= immutable_group_bytes <= 64 * 1024 * 1024 or
+                type(immutable_group_bytes) is not int or not 10240 <= immutable_group_bytes <= 128 * 1024 * 1024 or
                 type(immutable_group_members) is not int or not 1 <= immutable_group_members <= 4096):
             raise ValueError("Invalid bounded immutable snapshot packing policy")
         self.max_assets_per_release = max_assets_per_release
@@ -843,6 +889,7 @@ class GitHubStateStore:
         self._verified_parts: set[bytes] = set()
         self._prepared_verified: dict[str, set[bytes]] = {}
         self._verified_downloads: set[bytes] = set()
+        self.compaction_candidate_pointer_sha256: str | None = None
 
     def _lock(self):
         return nullcontext() if ControllerLock.owned(self.root) else ControllerLock(self.root)
@@ -977,8 +1024,9 @@ class GitHubStateStore:
     def _download_verified(self, ref: dict, target: Path) -> None:
         _asset_ref(ref)
         self.transport.download_asset(ref["release_tag"], ref["name"], target)
-        if target.stat().st_size != ref["ciphertext_bytes"] or _digest(target) != ref["ciphertext_sha256"]:
-            raise StateError("Remote immutable asset hash/size differs")
+        _verify_file_integrity(target, size=ref["ciphertext_bytes"], digest=ref["ciphertext_sha256"],
+                               stage="asset_download", subject="asset:" + ref["ciphertext_sha256"],
+                               message="Remote immutable asset hash/size differs")
         self._verified_downloads.add(_asset_identity(ref))
 
     def _decrypt(self, ref: dict, encrypted: Path, plaintext: Path) -> None:
@@ -1003,13 +1051,16 @@ class GitHubStateStore:
                     while chunk := source.read(min(4 * 1024 * 1024, ref["decoded_bytes"] - copied + 1)):
                         copied += len(chunk)
                         if copied > ref["decoded_bytes"]:
-                            raise StateError("Decoded state part exceeds authenticated size")
+                            raise StateIntegrityError("Decoded state part exceeds authenticated size",
+                                stage="part_decode", subject="part:" + ref["plaintext_sha256"], field="bytes",
+                                expected=ref["decoded_bytes"], actual=copied)
                         output.write(chunk)
                 target = decoded
             except (lzma.LZMAError, EOFError) as exc:
                 raise StateError("Invalid XZ working-state part") from exc
-        if target.stat().st_size != ref["decoded_bytes"] or _digest(target) != ref["decoded_sha256"]:
-            raise StateError("Decoded state part hash/size differs")
+        _verify_file_integrity(target, size=ref["decoded_bytes"], digest=ref["decoded_sha256"],
+                               stage="part_decode", subject="part:" + ref["plaintext_sha256"],
+                               message="Decoded state part hash/size differs")
         return target
 
     def _check_slug_binding(self, head: str | None) -> dict | None:
@@ -1058,22 +1109,6 @@ class GitHubStateStore:
             staging, downloads = Path(temporary) / "state", Path(temporary) / "parts"
             staging.mkdir(mode=0o700)
             downloads.mkdir(mode=0o700)
-            grouped: dict[str, dict[str, dict]] = {}
-            for item in index["files"]:
-                if index["parts"][item["segments"][0]["part"]]["kind"] == "tar":
-                    grouped.setdefault(item["segments"][0]["part"], {})[item["path"]] = item
-            usages: dict[str, list[tuple[str, int]]] = {}
-            for item in index["files"]:
-                if "member" in item["segments"][0]:
-                    continue
-                target = staging / item["path"]
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("xb"):
-                    pass
-                offset = 0
-                for segment in item["segments"]:
-                    usages.setdefault(segment["part"], []).append((item["path"], offset))
-                    offset += index["parts"][segment["part"]]["decoded_bytes"]
             state_bytes = sum(item["bytes"] for item in index["files"])
             part_overhead = max((ref["ciphertext_bytes"] + ref["plaintext_bytes"] +
                                  (ref["decoded_bytes"] if ref["encoding"] == "xz" else 0)
@@ -1085,28 +1120,7 @@ class GitHubStateStore:
             if not same_device:
                 self._preflight_disk(directory=self.root, required=state_bytes,
                                      operation="restore destination")
-            for part_id, ref in index["parts"].items():
-                encrypted, plain = downloads / (part_id + ".enc"), downloads / part_id
-                self._download_verified(ref, encrypted)
-                self._decrypt(ref, encrypted, plain)
-                decoded = self._decode_part(ref, plain, downloads / (part_id + ".decoded"))
-                self._verified_parts.add(_asset_identity(ref))
-                if ref["kind"] == "tar":
-                    self._extract_group(decoded, staging, grouped[part_id])
-                else:
-                    for name, offset in usages[part_id]:
-                        with (staging / name).open("r+b") as output, decoded.open("rb") as source:
-                            output.seek(offset)
-                            shutil.copyfileobj(source, output, length=4 * 1024 * 1024)
-                encrypted.unlink()
-                if decoded != plain:
-                    decoded.unlink()
-                plain.unlink()
-            for item in index["files"]:
-                target = staging / item["path"]
-                if target.stat().st_size != item["bytes"] or _digest(target) != item["sha256"]:
-                    raise StateError("Restored state file hash/size differs")
-                os.chmod(target, item["mode"])
+            self._reconstruct(index, staging, downloads)
             # All ciphertexts, context, member names, and file hashes are checked
             # before materializing state. Keep the held controller lock's inode.
             self._require_empty_root()
@@ -1117,6 +1131,51 @@ class GitHubStateStore:
                 "state_plaintext_bytes": state_bytes,
                 "restore_peak_temporary_bytes_estimate": peak_temporary,
                 "restore_peak_additional_disk_bytes_estimate": peak_temporary + (0 if same_device else state_bytes)}
+
+    def _reconstruct(self, index: dict, staging: Path, downloads: Path,
+                     check_progress: Callable[[], None] | None = None) -> None:
+        """Freshly authenticate and reconstruct every indexed part into staging."""
+        grouped: dict[str, dict[str, dict]] = {}
+        for item in index["files"]:
+            if index["parts"][item["segments"][0]["part"]]["kind"] == "tar":
+                grouped.setdefault(item["segments"][0]["part"], {})[item["path"]] = item
+        usages: dict[str, list[tuple[str, int]]] = {}
+        for item in index["files"]:
+            if "member" in item["segments"][0]:
+                continue
+            target = staging / item["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb"):
+                pass
+            offset = 0
+            for segment in item["segments"]:
+                usages.setdefault(segment["part"], []).append((item["path"], offset))
+                offset += index["parts"][segment["part"]]["decoded_bytes"]
+        for part_id, ref in index["parts"].items():
+            if check_progress is not None:
+                check_progress()
+            encrypted, plain = downloads / (part_id + ".enc"), downloads / part_id
+            self._download_verified(ref, encrypted)
+            self._decrypt(ref, encrypted, plain)
+            decoded = self._decode_part(ref, plain, downloads / (part_id + ".decoded"))
+            self._verified_parts.add(_asset_identity(ref))
+            if ref["kind"] == "tar":
+                self._extract_group(decoded, staging, grouped[part_id])
+            else:
+                for name, offset in usages[part_id]:
+                    with (staging / name).open("r+b") as output, decoded.open("rb") as source:
+                        output.seek(offset)
+                        shutil.copyfileobj(source, output, length=4 * 1024 * 1024)
+            encrypted.unlink()
+            if decoded != plain:
+                decoded.unlink()
+            plain.unlink()
+        for item in index["files"]:
+            target = staging / item["path"]
+            _verify_file_integrity(target, size=item["bytes"], digest=item["sha256"],
+                                   stage="file_reconstruction", subject=_diagnostic_path(item["path"]),
+                                   message="Restored state file hash/size differs")
+            os.chmod(target, item["mode"])
 
     @staticmethod
     def _preflight_disk(*, directory: Path, required: int, operation: str) -> None:
@@ -1148,7 +1207,9 @@ class GitHubStateStore:
                         raise StateError("Invalid or overlapping state archive member offsets")
                     previous_end = member.offset_data + ((member.size + 511) // 512) * 512
                     if member.size != expected[name]["bytes"]:
-                        raise StateError("State archive member size differs")
+                        raise StateIntegrityError("State archive member size differs", stage="tar_member",
+                            subject=_diagnostic_path(name), field="bytes", expected=expected[name]["bytes"],
+                            actual=member.size)
                     seen.add(name)
                     target = staging / name
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1161,6 +1222,20 @@ class GitHubStateStore:
             raise StateError("Invalid state archive") from exc
         if seen != set(expected):
             raise StateError("State archive is missing expected members")
+
+    @classmethod
+    def _verify_group_files(cls, archive: Path, members: list[dict], staging: Path) -> None:
+        """Check the actual new archive against the frozen logical file map."""
+        staging.mkdir(mode=0o700)
+        try:
+            cls._extract_group(archive, staging, {item["path"]: item for item in members})
+            for item in members:
+                target = staging / item["path"]
+                _verify_file_integrity(target, size=item["bytes"], digest=item["sha256"],
+                                       stage="group_verification", subject=_diagnostic_path(item["path"]),
+                                       message="Grouped snapshot member hash/size differs")
+        finally:
+            shutil.rmtree(staging)
 
     @staticmethod
     def _excluded(path: str) -> bool:
@@ -1250,7 +1325,7 @@ class GitHubStateStore:
             compressed = directory / ("encoded-" + uuid.uuid4().hex + ".xz")
             with plaintext.open("rb") as source, lzma.open(compressed, "wb", preset=1) as output:
                 shutil.copyfileobj(source, output, length=4 * 1024 * 1024)
-            if compressed.stat().st_size <= self.part_bytes:
+            if compressed.stat().st_size <= min(self.part_bytes, plaintext.stat().st_size):
                 plaintext, encoding = compressed, "xz"
             else:
                 compressed.unlink()  # Incompressible input at the part limit.
@@ -1341,8 +1416,7 @@ class GitHubStateStore:
                         raise StateError("Previously retained immutable state file changed")
                     reused[name] = copy.deepcopy(old["segments"])
                     continue
-                pack_file = name.startswith("git/") and "/objects/pack/" in name
-                if (self.small_immutable_bytes and item["bytes"] <= self.small_immutable_bytes and not pack_file and
+                if (self.small_immutable_bytes and item["bytes"] <= self.small_immutable_bytes and
                         self._tar_total_bytes(self._tar_member_bytes(item)) <= self.immutable_group_bytes):
                     small.append(item)
                 else:
@@ -1374,6 +1448,293 @@ class GitHubStateStore:
         recovery_reads = [part for part in matched.values() if _asset_identity(part) not in self._verified_parts]
         return (2 * (parts + 1) + 2 * releases + 18 + old_release_reads + len(recovery_reads) +
                 13 * len({part["release_tag"] for part in recovery_reads}))
+
+    def _compaction_plan(self, index: dict, max_input_bytes: int, max_input_parts: int) -> dict:
+        # A part is eligible only when every reference is an eligible complete
+        # single-segment immutable file. This includes shared raw segments and
+        # prevents leaving a tar with an incomplete extraction member map.
+        by_part: dict[str, list[dict]] = {}
+        for item in index["files"]:
+            for segment in item["segments"]:
+                by_part.setdefault(segment["part"], []).append(item)
+        candidates = []
+        for part_id, members in by_part.items():
+            unique = {item["path"]: item for item in members}
+            if any(not self._immutable(item["path"]) or len(item["segments"]) != 1 or
+                   item["bytes"] > self.small_immutable_bytes or
+                   self._tar_total_bytes(self._tar_member_bytes(item)) > self.immutable_group_bytes
+                   for item in unique.values()):
+                continue
+            size = sum(item["bytes"] for item in unique.values())
+            candidates.append((size, part_id, list(unique.values())))
+        chosen, selected, total = [], [], 0
+        for size, part_id, members in sorted(candidates, key=lambda row: (row[0], row[1])):
+            if len(chosen) >= max_input_parts or total + size > max_input_bytes:
+                continue
+            chosen.append(part_id)
+            selected.extend(members)
+            total += size
+        groups = self._group_files(sorted(selected, key=lambda item: item["path"]), self.immutable_group_bytes)
+        return {"parts": chosen, "groups": groups, "input_bytes": total,
+                "part_savings": len(chosen) - len(groups)}
+
+    def _check_compaction_root(self, index: dict) -> None:
+        actual = []
+        for path in sorted(self.root.rglob("*")):
+            name = path.relative_to(self.root).as_posix()
+            if self._excluded(name):
+                continue
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise StateError("Compaction root requires regular files without hardlinks")
+            _safe_path(name)
+            actual.append({"path": name, "bytes": info.st_size, "sha256": _digest(path),
+                           "mode": stat.S_IMODE(info.st_mode)})
+        expected = [{key: item[key] for key in ("path", "bytes", "sha256", "mode")}
+                    for item in index["files"]]
+        if actual != sorted(expected, key=lambda item: item["path"]):
+            raise StateError("Compaction root differs from authenticated predecessor file map")
+
+    @staticmethod
+    def _check_compaction_file_map(predecessor: dict, candidate: dict) -> None:
+        def logical(index: dict) -> list[dict]:
+            return sorted(({key: item[key] for key in ("path", "bytes", "sha256", "mode")}
+                           for item in index["files"]), key=lambda item: item["path"])
+        if logical(predecessor) != logical(candidate):
+            raise StateError("Compaction logical file map differs from predecessor")
+
+    def validate_compaction_metadata(self, head: str | None, pointer: dict) -> None:
+        """Verify pinned slug and immediate outbox node at one exact Git head."""
+        transport = self.transport
+        binding = transport.read_slug_binding(head, self.slug) if head is not None else None
+        if binding is None or _json(binding, "compaction slug binding") != _slug_binding(self.slug, self.repository_id):
+            raise StateConflictError("Compaction requires its pinned repository slug binding")
+        if transport.read_pointer(head, self.repository_id) != canonical_json(pointer):
+            raise StateConflictError("Compaction pointer differs from pinned metadata head")
+        ref = pointer.get("proof_outbox")
+        if ref is None:
+            return
+        self._check_pointer(pointer)
+        reader = getattr(transport, "read_proof_outbox", None)
+        if not callable(reader):
+            reader = getattr(transport, "outbox_node", None)
+        if not callable(reader):
+            raise StateError("Compaction transport cannot read its pinned proof outbox node")
+        try:
+            raw = reader(head, self.repository_id, ref)
+        except KeyError as exc:
+            raise StateError("Compaction proof outbox node is missing") from exc
+        if (not isinstance(raw, bytes) or len(raw) != ref["bytes"] or
+                hashlib.sha256(raw).hexdigest() != ref["sha256"]):
+            raise StateError("Compaction proof outbox node is missing or differs")
+        node = _json(raw, "compaction proof outbox node")
+        if (set(node) != {"schema_version", "kind", "repository_id", "slug", "generation", "created_at", "catalog", "previous"} or
+                node.get("schema_version") != 1 or node.get("kind") != "icsot_public_proof_outbox" or
+                type(node.get("repository_id")) is not int or node["repository_id"] != self.repository_id or
+                node.get("slug") != self.slug or not isinstance(node.get("generation"), str) or
+                not _GENERATION.fullmatch(node["generation"]) or not isinstance(node.get("created_at"), str) or
+                not _UTC.fullmatch(node["created_at"])):
+            raise StateError("Invalid compaction proof outbox node identity")
+        try:
+            datetime.fromisoformat(node["created_at"].replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise StateError("Invalid compaction proof outbox node time") from exc
+        catalog, previous = node["catalog"], node["previous"]
+        if (not isinstance(catalog, dict) or set(catalog) != {"release_tag", "name", "sha256", "bytes"} or
+                not isinstance(catalog.get("release_tag"), str) or not re.fullmatch(
+                    rf"collector-observations-r{self.repository_id}-g[0-9a-f]{{32}}", catalog["release_tag"]) or
+                catalog.get("name") != "metadata-catalog.json" or not isinstance(catalog.get("sha256"), str) or
+                not _HASH.fullmatch(catalog["sha256"]) or type(catalog.get("bytes")) is not int or
+                not 1 <= catalog["bytes"] <= 16 * 1024 * 1024):
+            raise StateError("Invalid compaction proof outbox catalog")
+        if (previous is not None and (not isinstance(previous, dict) or set(previous) != {"sha256", "bytes"} or
+                not isinstance(previous.get("sha256"), str) or not _HASH.fullmatch(previous["sha256"]) or
+                type(previous.get("bytes")) is not int or not 1 <= previous["bytes"] <= 4096 or previous == ref)):
+            raise StateError("Invalid compaction proof outbox predecessor")
+
+    def compact(self, selection: StateSelection, *, max_input_bytes: int, max_input_parts: int,
+                max_upload_bytes: int, min_part_savings: int = 1, max_runtime_seconds: int,
+                quiescent: bool = False) -> dict:
+        """Compact bounded immutable closures after restoring the selected state.
+
+        New remote assets remain unreachable until a fresh full reconstruction
+        succeeds and the predecessor pointer is advanced by compare-and-swap.
+        """
+        self.compaction_candidate_pointer_sha256 = None
+        bounds = (max_input_bytes, max_input_parts, max_upload_bytes, min_part_savings, max_runtime_seconds)
+        if any(type(value) is not int or value < 1 for value in bounds):
+            raise ValueError("Positive integer compaction limits are required")
+        if not quiescent or self.private_key is None:
+            raise StateError("Compaction requires a quiescent root and working-state private key")
+        if selection.pointer is None or selection.index is None:
+            raise StateError("Compaction requires authenticated existing state")
+        self._check_index(selection.pointer, selection.index)
+        known_pointer_fields = {"schema_version", "repository_id", "slug", "generation",
+                                "predecessor_index_sha256", "logical_root", "snapshot_started_at",
+                                "snapshot_sealed_at", "clock_source", "index", "context_sha256",
+                                "proof_outbox"}
+        if set(selection.pointer) - known_pointer_fields:
+            raise StateError("Compaction does not support unknown predecessor pointer fields")
+        before_count = len(selection.index["parts"])
+        before_bytes = sum(ref["ciphertext_bytes"] for ref in selection.index["parts"].values())
+        def no_op(plan: dict, estimated_requests: int = 0) -> dict:
+            return {"status": "no_op", "input_parts": len(plan["parts"]),
+                    "input_bytes": plan["input_bytes"], "part_savings": 0,
+                    "before_part_count": before_count, "after_part_count": before_count,
+                    "before_referenced_part_ciphertext_bytes": before_bytes,
+                    "after_referenced_part_ciphertext_bytes": before_bytes,
+                    "full_remote_reconstruction_verified": False,
+                    "verification_scope": "working_state_files_only",
+                    "predecessor_snapshot_started_at": selection.pointer["snapshot_started_at"],
+                    "predecessor_snapshot_sealed_at": selection.pointer["snapshot_sealed_at"],
+                    "snapshot_started_at": None, "snapshot_sealed_at": None,
+                    "estimated_api_requests": estimated_requests}
+        deadline = time.monotonic() + max_runtime_seconds
+        def check_time() -> None:
+            if time.monotonic() >= deadline:
+                raise StateDeferredError("Compaction runtime budget exhausted", reason="compaction_runtime_limit")
+        with self._lock(), tempfile.TemporaryDirectory(prefix="icsot-state-compact-") as temporary:
+            directory = Path(temporary)
+            current_head, actual = self._authoritative_pointer()
+            if actual != canonical_json(selection.pointer):
+                raise StateConflictError("State pointer changed before compaction")
+            self.validate_compaction_metadata(selection.head, selection.pointer)
+            if current_head != selection.head:
+                self.validate_compaction_metadata(current_head, selection.pointer)
+            self._check_compaction_root(selection.index)
+            plan = self._compaction_plan(selection.index, max_input_bytes, max_input_parts)
+            if plan["part_savings"] < min_part_savings:
+                return no_op(plan)
+            check_time()
+            # XZ is only retained when no larger than its input. Include a
+            # generous envelope and index-growth allowance before producing
+            # frozen assets, so local preparation also respects the byte cap.
+            archive_bound = sum(self._tar_total_bytes(sum(self._tar_member_bytes(item) for item in group))
+                                for group in plan["groups"])
+            index_bound = (len(canonical_json(selection.index)) + ENVELOPE_OVERHEAD +
+                           sum(len(canonical_json(item["path"])) + 512
+                               for group in plan["groups"] for item in group) +
+                           4096 * len(plan["groups"]))
+            if archive_bound + index_bound + ENVELOPE_OVERHEAD * (len(plan["groups"]) + 1) > max_upload_bytes:
+                raise StateDeferredError("Compaction cannot fit ciphertext upload byte budget",
+                                         reason="compaction_byte_limit")
+            state_bytes = sum(item["bytes"] for item in selection.index["files"])
+            max_old = max((ref["ciphertext_bytes"] + ref["plaintext_bytes"] +
+                           (ref["decoded_bytes"] if ref["encoding"] == "xz" else 0)
+                           for ref in selection.index["parts"].values()), default=0)
+            # Frozen new ciphertexts, one archive/check/extract scratch group,
+            # a complete reconstructed tree, and the largest old part download.
+            required_disk = max_upload_bytes + state_bytes + max_old + 4 * (self.immutable_group_bytes + 65536)
+            self._preflight_disk(directory=directory, required=required_disk,
+                                 operation="compaction reconstruction and frozen assets")
+            estimated_requests = (2 * (len(plan["groups"]) + 1) + 15 * (len(plan["groups"]) + 1) +
+                                  len(selection.index["parts"]) + 13 * len({ref["release_tag"] for ref in selection.index["parts"].values()}) + 50)
+            budget = getattr(self.transport, "publication_budget", None)
+            budget_metrics = budget(estimated_requests) if callable(budget) else {}
+            check_time()
+            generation = uuid.uuid4().hex
+            predecessor = selection.pointer["index"]["ciphertext_sha256"]
+            release = f"collector-state-r{self.repository_id}-g{generation}"
+            sink = _PreparedSink(directory / "frozen")
+            files = copy.deepcopy(selection.index["files"])
+            files_by_name = {item["path"]: item for item in files}
+            parts = {key: copy.deepcopy(ref) for key, ref in selection.index["parts"].items()
+                     if key not in plan["parts"]}
+            metrics = {"new_parts": 0, "reused_parts": 0, "state_uploaded_ciphertext_bytes": 0,
+                       "_asset_count": 0, "_releases": {release}}
+            started = utc_iso()
+            for number, members in enumerate(plan["groups"]):
+                check_time()
+                archive = directory / f"group-{number}.tar"
+                with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as output:
+                    for item in members:
+                        with (self.root / item["path"]).open("rb") as source:
+                            output.addfile(self._tar_info(item), source)
+                if archive.stat().st_size > self.immutable_group_bytes:
+                    raise StateError("Compaction archive exceeds its selected bound")
+                self._verify_group_files(archive, members, directory / f"check-{number}")
+                part_id = self._part(archive, "tar", release, {}, directory, parts, metrics,
+                                     prepared_sink=sink)
+                for item in members:
+                    files_by_name[item["path"]]["segments"] = [{"part": part_id, "member": item["path"]}]
+                archive.unlink()
+            times = {"snapshot_started_at": started, "snapshot_sealed_at": utc_iso(),
+                     "clock_source": "runner_system_clock"}
+            context = copy.deepcopy(selection.index["context"])
+            context.update(self._binding(generation, predecessor))
+            context.update(times)
+            context["file_map_sha256"] = hashlib.sha256(canonical_json(files)).hexdigest()
+            context["maintenance"] = {
+                "kind": "state_compaction",
+                "predecessor_snapshot_started_at": selection.pointer["snapshot_started_at"],
+                "predecessor_snapshot_sealed_at": selection.pointer["snapshot_sealed_at"],
+                "predecessor_context_sha256": selection.pointer["context_sha256"],
+                "new_observations": 0, "main_evidence_bytes": 0,
+            }
+            index = {**copy.deepcopy(selection.index), "context": context, "files": files, "parts": parts}
+            self._check_compaction_file_map(selection.index, index)
+            plaintext, encrypted = directory / "index.json", directory / "index.enc"
+            plaintext.write_bytes(canonical_json(index))
+            if plaintext.stat().st_size > self.part_bytes:
+                raise StateError("Compacted state index exceeds plaintext part limit")
+            ref = {**encrypt_file(plaintext, encrypted, self.public_key), "release_tag": release, "name": "index.enc"}
+            pointer = {**self._binding(generation, predecessor), **times, "index": ref,
+                       "context_sha256": hashlib.sha256(canonical_json(context)).hexdigest()}
+            if selection.pointer.get("proof_outbox") is not None:
+                pointer["proof_outbox"] = copy.deepcopy(selection.pointer["proof_outbox"])
+            self._check_index(pointer, index)
+            sink.capture(ref, encrypted)
+            upload_bytes = sum(asset["ref"]["ciphertext_bytes"] for asset in sink.assets)
+            if upload_bytes > max_upload_bytes:
+                raise StateDeferredError("Compaction exceeds ciphertext upload byte budget", reason="compaction_byte_limit")
+            if len(selection.index["parts"]) - len(parts) < min_part_savings:
+                return no_op(plan, estimated_requests)
+            self._check_compaction_root(selection.index)
+            for asset in sink.assets:
+                check_time()
+                asset_ref = asset["ref"]
+                self.transport.ensure_release(asset_ref["release_tag"])
+                self.transport.upload_asset(asset_ref["release_tag"], asset_ref["name"], sink.directory / asset["path"])
+                target = directory / "upload-check"
+                self._download_verified(asset_ref, target)
+                target.unlink()
+            check_time()
+            remote_index = directory / "remote-index.enc"
+            decoded_index = directory / "remote-index.json"
+            self._download_verified(ref, remote_index)
+            self._decrypt(ref, remote_index, decoded_index)
+            fresh_index = _json(decoded_index.read_bytes(), "compacted encrypted state index")
+            self._check_index(pointer, fresh_index)
+            self._check_compaction_file_map(selection.index, fresh_index)
+            if fresh_index != index:
+                raise StateError("Compacted remote index differs from frozen index")
+            staging, downloads = directory / "reconstructed", directory / "downloads"
+            staging.mkdir(mode=0o700)
+            downloads.mkdir(mode=0o700)
+            self._reconstruct(fresh_index, staging, downloads, check_progress=check_time)
+            for item in fresh_index["files"]:
+                if stat.S_IMODE((staging / item["path"]).stat().st_mode) != item["mode"]:
+                    raise StateError("Compacted reconstructed file mode differs")
+            self._check_compaction_root(selection.index)
+            check_time()
+            self.compaction_candidate_pointer_sha256 = hashlib.sha256(canonical_json(pointer)).hexdigest()
+            commit = self._advance(selection, pointer, metadata_validator=self.validate_compaction_metadata)
+            return {**budget_metrics, "status": "complete", "pointer": pointer, "pointer_commit": commit,
+                    "input_parts": len(plan["parts"]), "input_bytes": plan["input_bytes"],
+                    "part_savings": len(selection.index["parts"]) - len(parts),
+                    "before_part_count": before_count, "after_part_count": len(parts),
+                    "before_referenced_part_ciphertext_bytes": before_bytes,
+                    "after_referenced_part_ciphertext_bytes": sum(ref["ciphertext_bytes"] for ref in parts.values()),
+                    "full_remote_reconstruction_verified": True, "estimated_api_requests": estimated_requests,
+                    "verification_scope": "working_state_files_only",
+                    "predecessor_snapshot_started_at": selection.pointer["snapshot_started_at"],
+                    "predecessor_snapshot_sealed_at": selection.pointer["snapshot_sealed_at"],
+                    "snapshot_started_at": times["snapshot_started_at"],
+                    "snapshot_sealed_at": times["snapshot_sealed_at"],
+                    "state_uploaded_ciphertext_bytes": upload_bytes,
+                    "compaction_peak_additional_disk_bytes_estimate": required_disk}
 
     def _recovery_parts(self, pool: RecoveryCandidatePool | None, selection: StateSelection) -> dict:
         if pool is None:
@@ -1487,6 +1848,7 @@ class GitHubStateStore:
                         if wal.is_file():
                             source_bytes += wal.stat().st_size
             largest_payload = min(self.part_bytes, max(largest_file,
+                                  min(self.immutable_group_bytes, source_bytes + 10240 * (source_files + 1)),
                                   min(source_bytes, self.group_bytes) + 10240 * (source_files + 1)))
             # Snapshot copy + current raw/tar + XZ + local/remote ciphertext.
             # Encryption envelope overhead is bounded by the codec's 64 KiB header.
@@ -1565,6 +1927,7 @@ class GitHubStateStore:
                             archive.addfile(info, source)
                 if archive_path.stat().st_size > self.part_bytes:
                     raise StateError("Grouped snapshot exceeds plaintext part limit")
+                self._verify_group_files(archive_path, members, directory / f"group-check-{number}")
                 part_id = self._part(archive_path, "tar", release, prior_parts, directory, parts, metrics,
                                      prepared_sink=prepared_sink, capture_reused=recovery_candidates is not None)
                 for item in members:
@@ -2020,7 +2383,8 @@ class GitHubStateStore:
                       destination_github_rest_api_requests_for_publish=request_total - request_start - (graphql_total - graphql_start))
         return report
 
-    def _advance(self, selection: StateSelection, pointer: dict, *, proof_outbox_node: bytes | None = None) -> str:
+    def _advance(self, selection: StateSelection, pointer: dict, *, proof_outbox_node: bytes | None = None,
+                 metadata_validator: Callable[[str | None, dict], None] | None = None) -> str:
         expected, old = selection.head, canonical_json(selection.pointer) if selection.pointer else None
         raw = canonical_json(pointer)
         for _ in range(8):
@@ -2030,6 +2394,8 @@ class GitHubStateStore:
                 raise StateConflictError("Repository slug binding exists but its state pointer is missing")
             if current != old:
                 raise StateConflictError("Selected repository state pointer changed")
+            if metadata_validator is not None:
+                metadata_validator(expected, selection.pointer)
             commit = (self.transport.commit_pointer(expected, self.repository_id, raw, proof_outbox_node=proof_outbox_node)
                       if proof_outbox_node is not None else self.transport.commit_pointer(expected, self.repository_id, raw))
             try:
@@ -2045,6 +2411,8 @@ class GitHubStateStore:
             head = self.transport.branch_head()
             actual = self.transport.read_pointer(head, self.repository_id) if head else None
             if actual == raw:
+                if metadata_validator is not None:
+                    metadata_validator(head, pointer)
                 return head
             if actual != old:
                 raise StateConflictError("Selected repository state pointer changed concurrently")

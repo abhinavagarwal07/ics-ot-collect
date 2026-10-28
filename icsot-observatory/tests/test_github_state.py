@@ -18,7 +18,7 @@ from icsot_observer.core import canonical_json
 from icsot_observer.encryption import encrypt_file
 from icsot_observer.github_state import (
     BRANCH, GhCliStateTransport, GitHubStateStore, StateConflictError, StateDeferredError,
-    StateError, StateSelection,
+    StateError, StateIntegrityError, StateSelection,
 )
 from icsot_observer.runtime import ControllerLock
 
@@ -46,11 +46,14 @@ class FakeGitHub:
     def read_slug_binding(self, head, slug):
         return self.bindings[head].get(slug.lower())
 
-    def commit_pointer(self, parent, repository_id, data):
+    def commit_pointer(self, parent, repository_id, data, *, proof_outbox_node=None):
         self.counter += 1
         commit = hashlib.sha1(str(self.counter).encode()).hexdigest()
         tree = dict(self.commits[parent]) if parent else {}
         tree[repository_id] = data
+        if proof_outbox_node is not None:
+            ref = json.loads(data)["proof_outbox"]
+            tree[f"proof-outbox/{repository_id}/{ref['sha256']}.json"] = proof_outbox_node
         self.commits[commit] = tree
         bindings = dict(self.bindings[parent]) if parent else {}
         slug = json.loads(data)["slug"].lower()
@@ -91,6 +94,9 @@ class FakeGitHub:
             return None
         return {"id": 1, "name": name, "size": len(contents), "state": "uploaded",
                 "digest": "sha256:" + hashlib.sha256(contents).hexdigest()}
+
+    def read_proof_outbox(self, head, repository_id, ref):
+        return self.commits[head].get(f"proof-outbox/{repository_id}/{ref['sha256']}.json")
 
 
 @pytest.fixture(scope="module")
@@ -515,7 +521,7 @@ def test_release_shards_reserve_index_room_and_restore_across_shards(setup):
 
 def test_xz_default_preserves_already_compressed_git_pack(setup):
     _, make, _ = setup
-    store = make()
+    store = make(small_immutable_bytes=0)
     write(store, "checkpoints/api/7/capture/response.json", b"repetitive JSON " * 1000)
     write(store, "git/7.git/objects/pack/pack-abc.pack", b"PACK" + os.urandom(100))
     publish(store)
@@ -1685,3 +1691,407 @@ def test_core_probe_does_not_supply_reset_for_another_rest_resource():
     with pytest.raises(StateDeferredError) as failure:
         transport._api('repos/owner/collector/releases')
     assert failure.value.retry_not_before == 7000 and 'rate_limit' not in calls
+
+
+def compact_for_test(store, selection, **changes):
+    options = dict(max_input_bytes=2_000_000, max_input_parts=100,
+                   max_upload_bytes=2_000_000, min_part_savings=1,
+                   max_runtime_seconds=60, quiescent=True)
+    options.update(changes)
+    return store.compact(selection, **options)
+
+
+def test_new_packing_includes_git_pack_and_checks_group_members(setup):
+    _, make, _ = setup
+    store = make(part_bytes=32768, immutable_group_bytes=20480)
+    first = write(store, "git/7.git/objects/pack/pack-a.pack", b"PACK" + b"a" * 5000)
+    second = write(store, "git/7.git/objects/pack/pack-b.pack", b"PACK" + b"b" * 5000)
+    publish(store)
+    selected = store.read()
+    items = {item["path"]: item for item in selected.index["files"]}
+    assert items[first.relative_to(store.root).as_posix()]["segments"][0]["part"] == items[second.relative_to(store.root).as_posix()]["segments"][0]["part"]
+    assert next(iter(selected.index["parts"].values()))["kind"] == "tar"
+    clear(store)
+    store.restore(selected)
+    assert first.read_bytes() == b"PACK" + b"a" * 5000
+    assert second.read_bytes() == b"PACK" + b"b" * 5000
+
+
+def test_compaction_full_roundtrip_preserves_logical_map_and_stable_parts(setup):
+    transport, make, _ = setup
+    legacy = make(part_bytes=32768, immutable_group_bytes=20480, small_immutable_bytes=0)
+    names = [cas_file(legacy, b""), cas_file(legacy, b"one"), cas_file(legacy, b"two")]
+    pack = write(legacy, "git/7.git/objects/pack/pack-a.pack", b"PACK" + b"p" * 1000)
+    large = write(legacy, "git/7.git/objects/pack/pack-big.pack", b"Z" * 70000)
+    mutable = write(legacy, "runs/data", b"mutable")
+    pack.chmod(0o700)
+    publish(legacy, lane_heads={"git": {"observed_at": "2024-01-01"}},
+            evidence_heads={"manifest": "retain"})
+    before = legacy.read()
+    assert len(next(item for item in before.index["files"] if item["path"].endswith("pack-big.pack"))["segments"]) == 3
+    old_assets = dict(transport.assets)
+    store = make(part_bytes=32768, immutable_group_bytes=20480, small_immutable_bytes=10000)
+    clear(store)
+    store.restore(before)
+    result = compact_for_test(store, before)
+    assert result["status"] == "complete" and result["part_savings"] >= 3
+    after = store.read()
+    old = {item["path"]: item for item in before.index["files"]}
+    new = {item["path"]: item for item in after.index["files"]}
+    for path in old:
+        assert {k: old[path][k] for k in ("path", "bytes", "sha256", "mode")} == {k: new[path][k] for k in ("path", "bytes", "sha256", "mode")}
+    assert new[large.relative_to(store.root).as_posix()]["segments"] == old[large.relative_to(store.root).as_posix()]["segments"]
+    assert new[mutable.relative_to(store.root).as_posix()]["segments"] == old[mutable.relative_to(store.root).as_posix()]["segments"]
+    assert after.index["dependencies"] == before.index["dependencies"]
+    assert after.index["context"]["lane_heads"] == before.index["context"]["lane_heads"]
+    assert after.index["context"]["evidence_heads"] == before.index["context"]["evidence_heads"]
+    assert after.pointer["predecessor_index_sha256"] == before.pointer["index"]["ciphertext_sha256"]
+    assert after.index["context"]["maintenance"] == {
+        "kind": "state_compaction", "predecessor_snapshot_started_at": before.pointer["snapshot_started_at"],
+        "predecessor_snapshot_sealed_at": before.pointer["snapshot_sealed_at"],
+        "predecessor_context_sha256": before.pointer["context_sha256"],
+        "new_observations": 0, "main_evidence_bytes": 0}
+    assert result["predecessor_snapshot_started_at"] == before.pointer["snapshot_started_at"]
+    assert result["predecessor_snapshot_sealed_at"] == before.pointer["snapshot_sealed_at"]
+    assert result["snapshot_started_at"] == after.pointer["snapshot_started_at"]
+    assert result["snapshot_sealed_at"] == after.pointer["snapshot_sealed_at"]
+    assert all(transport.assets[key] == value for key, value in old_assets.items())
+    count = len(transport.uploads)
+    assert compact_for_test(store, after)["status"] == "no_op"
+    assert len(transport.uploads) == count
+    clear(store)
+    store.restore(after)
+    assert [ (store.root / name).read_bytes() for name in names ] == [b"", b"one", b"two"]
+    assert pack.read_bytes() == b"PACK" + b"p" * 1000 and pack.stat().st_mode & 0o777 == 0o700
+    assert large.read_bytes() == b"Z" * 70000 and mutable.read_bytes() == b"mutable"
+
+
+@pytest.mark.parametrize("failure", ["ciphertext", "index", "reconstruction", "time", "conflict"])
+def test_compaction_failure_never_advances_predecessor(setup, monkeypatch, failure):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    for value in (b"one", b"two", b"three"):
+        cas_file(legacy, value)
+    publish(legacy)
+    before = legacy.read()
+    store = make()
+    clear(store)
+    store.restore(before)
+    old_head, old_assets = transport.head, dict(transport.assets)
+    if failure == "ciphertext":
+        original = store._reconstruct
+        def corrupt(index, staging, downloads, **kwargs):
+            ref = next(ref for ref in index["parts"].values() if ref["release_tag"] != before.pointer["index"]["release_tag"])
+            key = (ref["release_tag"], ref["name"])
+            transport.assets[key] = transport.assets[key][:-1]
+            return original(index, staging, downloads, **kwargs)
+        monkeypatch.setattr(store, "_reconstruct", corrupt)
+    elif failure == "index":
+        original = transport.download_asset
+        calls = 0
+        def corrupt(tag, name, path):
+            nonlocal calls
+            original(tag, name, path)
+            if name == "index.enc" and tag != before.pointer["index"]["release_tag"]:
+                calls += 1
+                if calls == 2:
+                    path.write_bytes(b"broken")
+        monkeypatch.setattr(transport, "download_asset", corrupt)
+    elif failure == "reconstruction":
+        monkeypatch.setattr(store, "_reconstruct", lambda *args, **kwargs: (_ for _ in ()).throw(StateError("bad archive")))
+    elif failure == "time":
+        monkeypatch.setattr("icsot_observer.github_state.time.monotonic", iter([0, 0, 0, 61]).__next__)
+    else:
+        def race():
+            rival = make()
+            publish(rival, before)
+        transport.on_advance = race
+    with pytest.raises(StateError):
+        compact_for_test(store, before)
+    if failure != "conflict":
+        assert transport.head == old_head
+    else:
+        assert store.read().pointer["generation"] != before.pointer["generation"]
+    assert all(transport.assets[key] == value for key, value in old_assets.items())
+
+
+def test_compaction_admission_and_changed_root_fail_before_remote_writes(setup):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    names = [cas_file(legacy, value) for value in (b"one", b"two")]
+    publish(legacy)
+    selected = legacy.read()
+    store = make()
+    clear(store)
+    store.restore(selected)
+    count, old_head = len(transport.uploads), transport.head
+    assert compact_for_test(store, selected, max_input_parts=1)["status"] == "no_op"
+    with pytest.raises(StateDeferredError, match="byte budget"):
+        compact_for_test(store, selected, max_upload_bytes=1)
+    (store.root / names[0]).write_bytes(b"changed")
+    with pytest.raises(StateError, match="root differs"):
+        compact_for_test(store, selected)
+    assert len(transport.uploads) == count and transport.head == old_head
+
+
+def test_compaction_planner_rejects_partial_shared_parts_and_segmented_files(setup):
+    _, make, _ = setup
+    store = make(part_bytes=32768, immutable_group_bytes=20480, small_immutable_bytes=4096)
+    def item(path, segments, size=1):
+        return {"path": path, "bytes": size, "sha256": "a" * 64, "mode": 0o600,
+                "segments": [{"part": part} for part in segments]}
+    shared = "a" * 64
+    index = {"files": [item("objects/sha256/one", [shared]),
+                       item("runs/mutable", [shared]),
+                       item("objects/sha256/large", ["b" * 64, "c" * 64]),
+                       item("objects/sha256/single1", ["d" * 64]),
+                       item("objects/sha256/single2", ["e" * 64])]}
+    plan = store._compaction_plan(index, 1000, 100)
+    assert set(plan["parts"]) == {"d" * 64, "e" * 64}
+    assert {it["path"] for group in plan["groups"] for it in group} == {"objects/sha256/single1", "objects/sha256/single2"}
+    assert plan["part_savings"] == 1
+
+
+def test_new_group_member_corruption_fails_before_pointer_or_asset_upload(setup, monkeypatch):
+    transport, make, _ = setup
+    store = make()
+    cas_file(store, b"first")
+    cas_file(store, b"second")
+    original = tarfile.TarFile.addfile
+    def bad_addfile(archive, info, fileobj=None):
+        if fileobj is not None:
+            return original(archive, info, io.BytesIO(b"x" * info.size))
+        return original(archive, info, fileobj)
+    monkeypatch.setattr(tarfile.TarFile, "addfile", bad_addfile)
+    with pytest.raises(StateError, match="member hash/size"):
+        publish(store)
+    assert not transport.uploads and transport.head is None
+
+
+def test_compaction_rejects_changed_mode_before_remote_write(setup):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    names = [cas_file(legacy, value) for value in (b"a", b"b")]
+    publish(legacy)
+    before = legacy.read()
+    store = make()
+    clear(store)
+    store.restore(before)
+    (store.root / names[0]).chmod(0o644)
+    uploads = len(transport.uploads)
+    with pytest.raises(StateError, match="root differs"):
+        compact_for_test(store, before)
+    assert len(transport.uploads) == uploads
+
+
+@pytest.mark.parametrize("field, replacement", [("path", "objects/sha256/other"),
+                                                 ("bytes", 99), ("sha256", "f" * 64),
+                                                 ("mode", 0o700)])
+def test_compaction_logical_file_map_comparison_checks_each_field(setup, field, replacement):
+    _, make, _ = setup
+    store = make(small_immutable_bytes=0)
+    cas_file(store, b"logical")
+    publish(store)
+    predecessor = store.read().index
+    candidate = copy.deepcopy(predecessor)
+    candidate["files"][0][field] = replacement
+    with pytest.raises(StateError, match="logical file map"):
+        store._check_compaction_file_map(predecessor, candidate)
+
+
+def test_compaction_reconstruction_file_hash_reports_safe_exact_mismatch(setup, monkeypatch):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    names = [cas_file(legacy, value) for value in (b"alpha", b"beta")]
+    publish(legacy)
+    before = legacy.read()
+    store = make()
+    clear(store)
+    store.restore(before)
+    original = store._extract_group
+    mutated = {}
+    def corrupt_after_extraction(archive, staging, expected):
+        original(archive, staging, expected)
+        if staging.name == "reconstructed":
+            name = next(name for name in names if name in expected)
+            path = staging / name
+            data = path.read_bytes()
+            changed = bytes([data[0] ^ 1]) + data[1:]
+            path.write_bytes(changed)
+            mutated.update(name=name, actual=hashlib.sha256(changed).hexdigest())
+    monkeypatch.setattr(store, "_extract_group", corrupt_after_extraction)
+    head = transport.head
+    with pytest.raises(StateIntegrityError) as failure:
+        compact_for_test(store, before)
+    expected = next(item for item in before.index["files"] if item["path"] == mutated["name"])
+    assert failure.value.detail == {"stage": "file_reconstruction", "subject": mutated["name"],
+                                    "field": "sha256", "expected": expected["sha256"],
+                                    "actual": mutated["actual"]}
+    assert transport.head == head
+
+
+def test_compaction_part_ciphertext_hash_reports_safe_exact_mismatch(setup, monkeypatch):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    for value in (b"alpha", b"beta"):
+        cas_file(legacy, value)
+    publish(legacy)
+    before = legacy.read()
+    store = make()
+    clear(store)
+    store.restore(before)
+    original = store._reconstruct
+    altered = {}
+    def corrupt_remote(index, staging, downloads, **kwargs):
+        ref = next(ref for ref in index["parts"].values()
+                   if ref["release_tag"] != before.pointer["index"]["release_tag"])
+        key = (ref["release_tag"], ref["name"])
+        data = transport.assets[key]
+        changed = data[:-1] + bytes([data[-1] ^ 1])
+        transport.assets[key] = changed
+        altered.update(expected=ref["ciphertext_sha256"], actual=hashlib.sha256(changed).hexdigest())
+        return original(index, staging, downloads, **kwargs)
+    monkeypatch.setattr(store, "_reconstruct", corrupt_remote)
+    head = transport.head
+    with pytest.raises(StateIntegrityError) as failure:
+        compact_for_test(store, before)
+    assert failure.value.detail == {"stage": "asset_download", "subject": "asset:" + altered["expected"],
+                                    "field": "sha256", "expected": altered["expected"],
+                                    "actual": altered["actual"]}
+    assert transport.head == head
+    assert store.compaction_candidate_pointer_sha256 is None
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_compaction_exposes_candidate_only_at_commit_for_ambiguous_readback(setup, monkeypatch, committed):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    for value in (b"alpha", b"beta"):
+        cas_file(legacy, value)
+    publish(legacy)
+    before = legacy.read()
+    store = make()
+    clear(store)
+    store.restore(before)
+    advance = store._advance
+    candidate = {}
+    def ambiguous(selection, pointer, **kwargs):
+        candidate["sha"] = hashlib.sha256(canonical_json(pointer)).hexdigest()
+        assert store.compaction_candidate_pointer_sha256 == candidate["sha"]
+        if committed:
+            advance(selection, pointer, **kwargs)
+        raise StateError("controlled ambiguous commit")
+    monkeypatch.setattr(store, "_advance", ambiguous)
+    with pytest.raises(StateError, match="controlled ambiguous"):
+        compact_for_test(store, before)
+    actual = hashlib.sha256(canonical_json(store.read().pointer)).hexdigest()
+    assert store.compaction_candidate_pointer_sha256 == candidate["sha"]
+    assert (actual == candidate["sha"]) is committed
+    # A later operation clears a previous attempt's candidate before validation.
+    with pytest.raises(ValueError):
+        compact_for_test(store, before, max_input_parts=0)
+    assert store.compaction_candidate_pointer_sha256 is None
+
+
+def test_compaction_rejects_unknown_pointer_extension_before_writes_and_preserves_restore(setup):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    names = [cas_file(legacy, value) for value in (b"alpha", b"beta")]
+    publish(legacy)
+    before = legacy.read()
+    extended = copy.deepcopy(before.pointer)
+    extended["future_policy"] = {"mode": "preserve"}
+    commit = transport.commit_pointer(transport.head, legacy.repository_id, canonical_json(extended))
+    assert transport.advance_branch(transport.head, commit)
+    store = make()
+    selected = store.read()  # Generic reading remains forward-compatible.
+    clear(store)
+    store.restore(selected)
+    old_head, old_assets, old_uploads = transport.head, dict(transport.assets), list(transport.uploads)
+    old_events = len(transport.events)
+    with pytest.raises(StateError, match="unknown predecessor pointer fields"):
+        compact_for_test(store, selected)
+    assert transport.head == old_head and transport.assets == old_assets and transport.uploads == old_uploads
+    assert not any(event[0] in ("release", "upload", "commit", "advance") for event in transport.events[old_events:])
+    clear(store)
+    store.restore(store.read())
+    assert [(store.root / name).read_bytes() for name in names] == [b"alpha", b"beta"]
+
+
+def compaction_with_outbox(setup):
+    transport, make, _ = setup
+    legacy = make(small_immutable_bytes=0)
+    for value in (b"alpha", b"beta", b"gamma"):
+        cas_file(legacy, value)
+    tag = "collector-observations-r7-g" + "a" * 32
+    payload = b"{}"
+    catalog = {"release_tag": tag, "name": "metadata-catalog.json",
+               "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
+    transport.assets[tag, catalog["name"]] = payload
+    dependency = {"release_tag": tag, "name": catalog["name"],
+                  "ciphertext_sha256": catalog["sha256"], "ciphertext_bytes": catalog["bytes"]}
+    publish(legacy, dependencies=[dependency], proof_catalog=catalog)
+    before = legacy.read()
+    store = make()
+    clear(store)
+    store.restore(before)
+    return transport, store, before
+
+
+def test_compaction_missing_proof_outbox_fails_before_write(setup):
+    transport, store, before = compaction_with_outbox(setup)
+    ref = before.pointer["proof_outbox"]
+    del transport.commits[transport.head][f"proof-outbox/7/{ref['sha256']}.json"]
+    events = len(transport.events)
+    old_head, uploads = transport.head, len(transport.uploads)
+    with pytest.raises(StateError, match="outbox node is missing"):
+        compact_for_test(store, before)
+    assert transport.head == old_head and len(transport.uploads) == uploads
+    assert not any(event[0] in ("release", "upload", "commit", "advance") for event in transport.events[events:])
+
+
+def test_compaction_valid_predecessor_proof_outbox_preserved(setup):
+    transport, store, before = compaction_with_outbox(setup)
+    old_ref = before.pointer["proof_outbox"]
+    old_node = transport.read_proof_outbox(transport.head, 7, old_ref)
+    result = compact_for_test(store, before)
+    after = store.read()
+    assert result["verification_scope"] == "working_state_files_only"
+    assert after.pointer["proof_outbox"] == old_ref
+    assert transport.read_proof_outbox(transport.head, 7, old_ref) == old_node
+    assert json.loads(old_node)["generation"] == before.pointer["generation"] != after.pointer["generation"]
+
+
+@pytest.mark.parametrize("ambiguous_candidate", [False, True])
+def test_compaction_rechecks_proof_outbox_at_rebase_or_ambiguous_candidate(setup, ambiguous_candidate):
+    transport, store, before = compaction_with_outbox(setup)
+    ref = before.pointer["proof_outbox"]
+    path = f"proof-outbox/7/{ref['sha256']}.json"
+    def competing_head():
+        if ambiguous_candidate:
+            commit = next(reversed(transport.commits))
+        else:
+            commit = transport.commit_pointer(transport.head, 7, canonical_json(before.pointer))
+        del transport.commits[commit][path]
+        transport.head = commit
+    transport.on_advance = competing_head
+    with pytest.raises(StateError, match="outbox node is missing"):
+        compact_for_test(store, before)
+    pointer = json.loads(transport.read_pointer(transport.head, 7))
+    if ambiguous_candidate:
+        assert hashlib.sha256(canonical_json(pointer)).hexdigest() == store.compaction_candidate_pointer_sha256
+    else:
+        assert pointer == before.pointer
+
+
+def test_compaction_planner_picks_smallest_complete_closures_first(setup):
+    _, make, _ = setup
+    store = make(part_bytes=32768, immutable_group_bytes=32768, small_immutable_bytes=1024)
+    def item(path, part, size):
+        return {"path": "objects/sha256/" + path, "bytes": size, "sha256": "f" * 64,
+                "mode": 0o600, "segments": [{"part": part}]}
+    old = {"files": [item("large", "0" * 64, 40)] +
+                    [item(f"small-{n}", f"{n:064x}", 2) for n in range(1, 1000)]}
+    plan = store._compaction_plan(old, max_input_bytes=40, max_input_parts=20)
+    assert plan["parts"] == [f"{n:064x}" for n in range(1, 21)]
+    assert plan["input_bytes"] == 40 and plan["part_savings"] == 19

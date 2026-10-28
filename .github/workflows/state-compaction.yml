@@ -1,0 +1,98 @@
+name: Compact one working-state snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_id:
+        description: 'Explicit numeric source repository ID'
+        required: true
+        type: string
+      slug:
+        description: 'Exact source owner/repository slug bound to the state'
+        required: true
+        type: string
+      expected_pointer_sha256:
+        description: 'Reviewed SHA-256 of canonical current state pointer'
+        required: true
+        type: string
+
+      expected_index_sha256:
+        description: 'Optional reviewed predecessor encrypted index SHA-256'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: persistent-collection
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  compact:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: persistent-selected-id-${{ inputs.repository_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out dispatched revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Materialize existing operational state key
+        env:
+          COLLECTOR_STATE_PRIVATE_KEY: ${{ secrets.COLLECTOR_STATE_PRIVATE_KEY }}
+        run: |
+          set +x
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          key = os.environ.get('COLLECTOR_STATE_PRIVATE_KEY', '')
+          if not key.strip():
+              raise SystemExit('The operational state key is required')
+          path = Path(os.environ['RUNNER_TEMP']) / 'state-compaction-private.pem'
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, 'wb') as output:
+              output.write(key.encode())
+          PY
+      - name: Authenticate, restore, and compact selected state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELECTED_REPOSITORY_ID: ${{ inputs.repository_id }}
+          SELECTED_SLUG: ${{ inputs.slug }}
+          EXPECTED_POINTER_SHA256: ${{ inputs.expected_pointer_sha256 }}
+          EXPECTED_INDEX_SHA256: ${{ inputs.expected_index_sha256 }}
+        run: |
+          set +x
+          trap 'rm -f "$RUNNER_TEMP/state-compaction-private.pem"' EXIT
+          python -m icsot_observer.state_compaction \
+            --repository-id "$SELECTED_REPOSITORY_ID" --slug "$SELECTED_SLUG" \
+            --destination-repository "$GITHUB_REPOSITORY" --expected-pointer-sha256 "$EXPECTED_POINTER_SHA256" \
+            --expected-index-sha256 "$EXPECTED_INDEX_SHA256" --code-sha "$GITHUB_SHA" --state-public-key keys/working-state-rsa-public.pem \
+            --state-private-key "$RUNNER_TEMP/state-compaction-private.pem" \
+            --output "analysis/state-compaction/outcome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+      - name: Preserve bounded metadata outcome
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: state-compaction-${{ github.run_id }}-${{ github.run_attempt }}
+          path: icsot-observatory/analysis/state-compaction/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove operational key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/state-compaction-private.pem"

@@ -43,6 +43,8 @@ Create local, incremental, independently verifiable records of public GitHub obs
 
 GitHub-backed resumption uses a separately generated operational RSA recipient and an explicitly authorized Actions state-key secret. It decrypts working state and, through the published key capsules, the covered baseline archives. The owner's retained-evidence private key remains local; this does not make capsule-covered baseline contents inaccessible to the operational key. State snapshot bytes must be reported separately from evidence-transfer bytes.
 
+Manual working-state compaction is scoped to one explicitly selected authenticated pointer, preserves logical evidence and original observation times, retains old assets, and verifies a complete fresh remote reconstruction before compare-and-swap. It creates no new observations or baseline evidence bytes; see [state compaction operations](icsot-observatory/docs/STATE_COMPACTION.md).
+
 ## Design direction
 
 - **SQLite:** metadata, derived indexes, and scheduling. Original evidence lives in content-addressed files and Git archives.

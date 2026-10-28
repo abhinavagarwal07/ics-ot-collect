@@ -73,6 +73,8 @@ The manual [legacy recovery pilot](LEGACY_RECOVERY.md) freezes one selected sour
 
 Optional RFC 3161 configuration uses `--rfc3161-url`, `--rfc3161-ca` and `--rfc3161-chain`. The manual pilot configures DigiCert's endpoint with the tracked explicit trust root/intermediate. Only the manifest SHA-256 digest and protocol request are sent. The collector retains the request, signed response, signed TSTInfo text, trust certificates and canonical metadata, verifies the nonce/query, subject imprint and configured certificate chain, then publishes those sidecars with the index. A signed TSA generation time is separate from the runner's observation clock. Certificate revocation is not checked. A timestamp failure leaves finalization retryable; an already accepted receipt is reverified and reused without another request. Live TSA success must be reported separately from offline tests.
 
+Manual [working-state compaction](STATE_COMPACTION.md) targets one reviewed existing pointer, reconstructs the entire candidate state from remote assets before publication, and never creates source observations or deletes prior assets. It shares the collection queue and is not scheduled.
+
 ## Crash and evidence semantics
 
 - `runtime.sqlite3` stores leases, attempts, delayed retries, captured results and successful scope watermarks. Handlers run outside database transactions. A captured result is committed before finalization starts, so a timestamp/export/finalization failure retries the finalizer without recapturing.
