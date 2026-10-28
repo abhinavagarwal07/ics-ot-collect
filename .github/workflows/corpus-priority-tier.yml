@@ -1,0 +1,196 @@
+name: Corpus priority tier
+
+on:
+  workflow_call:
+    inputs:
+      priority_tier:
+        required: true
+        type: string
+      schedule_slot:
+        required: true
+        type: string
+      cold_bootstraps:
+        required: true
+        type: number
+    outputs:
+      cold_bootstraps_remaining:
+        value: ${{ jobs.plan.outputs.cold_bootstraps_remaining }}
+      stop_lower_tiers:
+        value: ${{ jobs.plan.outputs.stop_lower_tiers }}
+
+permissions:
+  contents: write
+
+env:
+  # Caller workflow env does not propagate to reusable workflows.
+  ICSOT_DEBUG: '1'
+
+defaults:
+  run:
+    working-directory: icsot-observatory
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      planned_count: ${{ steps.plan.outputs.planned_count }}
+      plan_sha256: ${{ steps.plan.outputs.plan_sha256 }}
+      code_sha: ${{ steps.plan.outputs.code_sha }}
+      plan_release: ${{ steps.release.outputs.plan_release }}
+      cold_bootstraps_remaining: ${{ steps.plan.outputs.cold_bootstraps_remaining }}
+      stop_lower_tiers: ${{ steps.plan.outputs.stop_lower_tiers }}
+    steps:
+      - name: Check out the exact collector revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Freeze the complete cohort and selected state pointers
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
+          GH_TOKEN: ${{ github.token }}
+          COLD_BOOTSTRAPS: ${{ inputs.cold_bootstraps }}
+          PRIORITY_TIER: ${{ inputs.priority_tier }}
+          SCHEDULE_SLOT: ${{ inputs.schedule_slot }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          if not os.environ.get("GITHUB_TOKEN", "").strip():
+              raise SystemExit("The shared COLLECTOR_READ_TOKEN is required for cohort planning")
+          subprocess.run([sys.executable, "-m", "icsot_observer.recurrence", "plan",
+              "--config", "config.corpus.toml", "--csv", "../public_patch_corpus_185.csv",
+              "--code-sha", os.environ["GITHUB_SHA"], "--destination-repository", os.environ["GITHUB_REPOSITORY"],
+              "--cold-bootstraps", os.environ.get("COLD_BOOTSTRAPS") or "0",
+              "--priority-tier", os.environ["PRIORITY_TIER"], "--slot", os.environ["SCHEDULE_SLOT"],
+              "--output", "analysis/recurring-plan/recurring-plan.json",
+              "--github-output", os.environ["GITHUB_OUTPUT"]], check=True)
+          PY
+      - name: Publish the immutable metadata-only plan
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIORITY_TIER: ${{ inputs.priority_tier }}
+        run: |
+          tag="collector-incremental-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PRIORITY_TIER}"
+          gh release create "$tag" analysis/recurring-plan/recurring-plan.json \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Six-hour ${PRIORITY_TIER} collection plan ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}" \
+            --notes "Immutable metadata plan for all 185 cohort entries, selecting the ${PRIORITY_TIER} tier in frozen order. Ready state resumes incrementally. Scheduled fresh bootstraps default to zero; an explicit manual selection can request up to eight new public bootstraps across tiers. Retained baseline initialization is handled separately. Other tiers remain explicitly unselected or deferred. This release is not a completed-cohort claim. No user-imposed GitHub storage budget applies; actual service limits still apply."
+          printf 'plan_release=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+  observe:
+    needs: plan
+    if: ${{ needs.plan.outputs.planned_count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.resource_limits.job_timeout_minutes }}
+    name: Observe ${{ matrix.slug }}
+    concurrency:
+      group: persistent-selected-id-${{ matrix.repository_id }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out the planned collector revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.code_sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install collector and pinned timestamp client
+        run: python -m pip install --disable-pip-version-check -e . opentimestamps-client==0.7.2
+      - name: Fetch only this run's public metadata plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RELEASE: ${{ needs.plan.outputs.plan_release }}
+        run: |
+          gh release download "$PLAN_RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --pattern recurring-plan.json --dir "$RUNNER_TEMP/icsot-recurring-plan"
+      - name: Materialize the existing operational state key
+        env:
+          COLLECTOR_STATE_PRIVATE_KEY: ${{ secrets.COLLECTOR_STATE_PRIVATE_KEY }}
+        run: |
+          set +x
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          key = os.environ.get("COLLECTOR_STATE_PRIVATE_KEY", "")
+          if not key.strip():
+              raise SystemExit("COLLECTOR_STATE_PRIVATE_KEY is required; evidence private keys stay local")
+          path = Path(os.environ["RUNNER_TEMP"]) / "icsot-state-private.pem"
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w") as output:
+              output.write(key)
+              output.flush()
+              os.fsync(output.fileno())
+          PY
+      - name: Resume selected state and independently drain API and Git lanes
+        id: capture
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
+          GH_TOKEN: ${{ github.token }}
+          CAPTURE_SLUG: ${{ matrix.slug }}
+          SOURCE_REPOSITORY_ID: ${{ matrix.repository_id }}
+          PLANNED_CODE_SHA: ${{ needs.plan.outputs.code_sha }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+        run: |
+          set +x
+          trap 'rm -f "$RUNNER_TEMP/icsot-state-private.pem"' EXIT
+          python -m icsot_observer.recurrence run \
+            --config config.corpus.toml --csv ../public_patch_corpus_185.csv \
+            --plan "$RUNNER_TEMP/icsot-recurring-plan/recurring-plan.json" --plan-sha256 "$PLAN_SHA256" \
+            --slug "$CAPTURE_SLUG" --code-sha "$PLANNED_CODE_SHA" \
+            --destination-repository "$GITHUB_REPOSITORY" \
+            --state-public-key keys/working-state-rsa-public.pem \
+            --state-private-key "$RUNNER_TEMP/icsot-state-private.pem" \
+            --evidence-public-key keys/results-rsa-public.pem \
+            --rfc3161-url http://timestamp.digicert.com \
+            --rfc3161-ca keys/digicert-trusted-root-g4.pem \
+            --rfc3161-chain keys/digicert-timestamp-2025-intermediate.pem \
+            --freetsa \
+            --output "analysis/recurring-outcomes/outcome-r${SOURCE_REPOSITORY_ID}-attempt${GITHUB_RUN_ATTEMPT}.json"
+      - name: Preserve the explicit completion, partial or paused outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPOSITORY_ID: ${{ matrix.repository_id }}
+          PLAN_RELEASE: ${{ needs.plan.outputs.plan_release }}
+        run: |
+          outcome="analysis/recurring-outcomes/outcome-r${SOURCE_REPOSITORY_ID}-attempt${GITHUB_RUN_ATTEMPT}.json"
+          if [ -f "$outcome" ]; then
+            gh release upload "$PLAN_RELEASE" "$outcome" --repo "$GITHUB_REPOSITORY"
+            cat "$outcome" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Preserve bounded runner outcome metadata
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: recurring-outcome-${{ matrix.repository_id }}-${{ github.run_attempt }}
+          path: icsot-observatory/analysis/recurring-outcomes/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove runner operational key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/icsot-state-private.pem"
+      - name: Keep incomplete collection visible in the job conclusion
+        if: ${{ always() && steps.capture.outcome != 'success' }}
+        run: exit 2

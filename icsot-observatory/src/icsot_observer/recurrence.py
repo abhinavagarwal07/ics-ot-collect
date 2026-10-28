@@ -22,12 +22,14 @@ from .diagnostics import safe_fields
 from .github import APIRequestDeferred, GitHubAPI
 from .github_state import GhCliStateTransport, StateConflictError, StateDeferredError, StateError
 from .history import FULL_HISTORY, load_history_settings, repository_history_policy
+from .priorities import FrozenPriorities, TIERS, load_frozen_priorities
 
 INTERVAL_SECONDS = 21600
 MAX_PARALLEL = 8
 MAX_COLD_BOOTSTRAPS = 8
 MAX_PLAN_BYTES = 1024 * 1024
 EXECUTION_ORDER_POLICY = "slot_seeded_sha256_rank_v1"
+FROZEN_EXECUTION_ORDER_POLICY = "frozen_priority_csv_order_v1"
 GIB = 1024 ** 3
 DEFAULT_LIMITS = {"job_timeout_minutes": 180, "max_restored_state_plaintext_bytes": 8 * GIB,
                   "max_new_evidence_ciphertext_bytes": 2 * GIB, "max_new_state_ciphertext_bytes": 2 * GIB}
@@ -71,24 +73,52 @@ def load_cohort(config_path: Path, csv_path: Path, *, expected_count: int = 185)
 def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
                pointer_loader, cold_bootstraps: int = 0, now: float | None = None,
                history_settings: dict | None = None, resource_limits: dict | None = None,
-               migration_pending_slugs: set[str] | None = None) -> dict:
+               migration_pending_slugs: set[str] | None = None,
+               frozen_priorities: FrozenPriorities | None = None,
+               priority_tier: str | None = None, slot: int | None = None) -> dict:
     if type(cold_bootstraps) is not int or not 0 <= cold_bootstraps <= MAX_COLD_BOOTSTRAPS:
         raise ValueError("cold_bootstraps must be an integer from 0 through 8")
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", code_sha):
         raise ValueError("A full collector code SHA is required")
     now = time.time() if now is None else now
-    slot = int(now // INTERVAL_SECONDS)
+    if slot is not None and (type(slot) is not int or slot < 0):
+        raise ValueError("A nonnegative frozen schedule slot is required")
+    slot = int(now // INTERVAL_SECONDS) if slot is None else slot
+    if priority_tier is not None and (priority_tier not in TIERS or frozen_priorities is None):
+        raise ValueError("A selected priority tier requires the frozen priority policy")
+    if frozen_priorities is not None:
+        if (len(frozen_priorities.order) != len(config.repositories) or
+                set(frozen_priorities.order) != set(config.repositories) or
+                set(frozen_priorities.tiers) != set(config.repositories) or
+                any(tier not in TIERS for tier in frozen_priorities.tiers.values()) or
+                [frozen_priorities.tiers[slug] for slug in frozen_priorities.order] !=
+                sorted(frozen_priorities.tiers.values())):
+            raise ValueError("Frozen priority policy does not match the configured corpus")
+        sources = {**sources, "priority_policy_sha256": frozen_priorities.sha256}
+    positions = {slug: position for position, slug in enumerate(
+        frozen_priorities.order if frozen_priorities else config.repositories, 1)}
     rows, seen_ids = [], {}
     source_deferred = False
     history_settings = history_settings or {}
     for slug in config.repositories:
         row = {"slug": slug, "repository_id": None, "slot": slot,
+               "priority": frozen_priorities.tiers[slug] if frozen_priorities else "P2",
+               "priority_order_position": positions[slug],
                "reported_size_kb": None,
                "resource_limits": (resource_limits or {}).get(slug, dict(DEFAULT_LIMITS)),
                "observation_key": f"six-hour-slot-{slot}", "code_sha": code_sha, **sources,
                "expected_generation": None, "expected_pointer_sha256": None,
                "allow_bootstrap": False, "plan_status": "paused_identity"}
         rows.append(row)
+        if priority_tier is not None and row["priority"] != priority_tier:
+            row.update(plan_status="not_selected_priority", reason_code="scheduled_in_other_priority_tier")
+    by_slug = {row["slug"]: row for row in rows}
+    # For this corpus the checked-in row order is authoritative, before the
+    # first source identity request. Generic callers retain their old behavior.
+    planning_rows = [by_slug[slug] for slug in (frozen_priorities.order if frozen_priorities else config.repositories)
+                     if priority_tier is None or by_slug[slug]["priority"] == priority_tier]
+    for row in planning_rows:
+        slug = row["slug"]
         if source_deferred:
             row["reason_code"] = "shared_source_rate_deferred"
             continue
@@ -140,11 +170,17 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
             row.update(plan_status="paused_state", reason_code=type(error).__name__)
             if isinstance(error, StateDeferredError):
                 row["retry_not_before"] = error.retry_not_before
-    missing = [row for row in rows if row["plan_status"] == "bootstrap_pending"]
-    # Rotate cold attempts so one persistently large/unavailable target cannot
-    # monopolize the bootstrap wave. No historical baseline bytes are consumed.
+    if source_deferred and priority_tier is not None:
+        for row in rows:
+            if row["priority"] > priority_tier:
+                row.update(plan_status="deferred_lower_priority_shared_rate",
+                           reason_code="shared_source_rate_deferred")
+    missing = [row for row in (planning_rows if frozen_priorities else rows)
+               if row["plan_status"] == "bootstrap_pending"]
+    # Corpus cold attempts honor the frozen order. Generic callers preserve
+    # their existing rotation. No historical baseline bytes are consumed.
     if missing and cold_bootstraps:
-        offset = (slot * cold_bootstraps) % len(missing)
+        offset = 0 if frozen_priorities else (slot * cold_bootstraps) % len(missing)
         for row in (missing[offset:] + missing[:offset])[:cold_bootstraps]:
             row.update(plan_status="fresh_public_bootstrap", allow_bootstrap=True)
     cohort_hash = sha256(canonical_json([{"slug": row["slug"], "repository_id": row["repository_id"]}
@@ -152,19 +188,31 @@ def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,
     for row in rows:
         row["cohort_identity_sha256"] = cohort_hash
     selected = [row for row in rows if row["plan_status"] in ("ready_incremental", "fresh_public_bootstrap")]
-    execution_seed = sha256(canonical_json({"policy": EXECUTION_ORDER_POLICY,
-                                          "cohort_identity_sha256": cohort_hash, "slot": slot}))
-    # Vary matrix priority across slots without changing the canonical cohort
-    # or the eligibility and cold-bootstrap rotation decided above.
-    selected.sort(key=lambda row: (sha256(canonical_json({"seed_sha256": execution_seed,
-                                                         "repository_id": row["repository_id"]})),
-                                   row["repository_id"]))
+    execution_policy = FROZEN_EXECUTION_ORDER_POLICY if frozen_priorities else EXECUTION_ORDER_POLICY
+    execution_seed = sha256(canonical_json(
+        {"policy": execution_policy, "priority_policy_sha256": frozen_priorities.sha256}
+        if frozen_priorities else {"policy": execution_policy,
+                                  "cohort_identity_sha256": cohort_hash, "slot": slot}))
+    # The corpus never reranks. Generic callers retain per-slot matrix order.
+    if frozen_priorities:
+        selected.sort(key=lambda row: row["priority_order_position"])
+    else:
+        selected.sort(key=lambda row: (sha256(canonical_json({"seed_sha256": execution_seed,
+                                                             "repository_id": row["repository_id"]})),
+                                       row["repository_id"]))
     return {"schema_version": 1, "kind": "icsot_six_hour_incremental_plan", "planned_at": utc_iso(
         datetime.fromtimestamp(now, timezone.utc)), "slot": slot, "interval_seconds": INTERVAL_SECONDS,
         "code_sha": code_sha, **sources, "cohort_identity_sha256": cohort_hash,
-        "execution_order_policy": EXECUTION_ORDER_POLICY, "execution_order_seed_sha256": execution_seed,
+        "execution_order_policy": execution_policy, "execution_order_seed_sha256": execution_seed,
         "execution_order_sha256": sha256(canonical_json([row["repository_id"] for row in selected])),
-        "execution_order_qualification": "Per-slot matrix priority; hosted job start order and six-hour coverage are not guaranteed.",
+        "execution_order_qualification": (
+            "Frozen tier/order for planning and matrix; the staged workflow completes each tier before planning the next. Within-tier hosted starts and six-hour coverage are not guaranteed."
+            if frozen_priorities else "Per-slot matrix priority; hosted job start order and six-hour coverage are not guaranteed."),
+        "priority_tier": priority_tier,
+        "priority_counts": dict(Counter(row["priority"] for row in rows)),
+        "planning_order": [row["slug"] for row in planning_rows],
+        "stop_lower_tiers": source_deferred,
+        "cold_bootstraps_remaining": cold_bootstraps - sum(row["allow_bootstrap"] for row in rows),
         "history_profile_readiness": "recent profile pending Git/API validation; full-history selections only",
         "max_parallel": MAX_PARALLEL, "cold_bootstrap_limit": cold_bootstraps,
         "source_quota": "public-read account allowances, optionally partitioned across two independent accounts; workers and same-account tokens do not create independent allowances",
@@ -294,6 +342,8 @@ def public_outcome(result: dict, entry: dict) -> dict:
     if type(registration.get("proofs_in_catalog")) is int and 0 <= registration["proofs_in_catalog"] <= 10**15:
         proof_registration["proofs_in_catalog"] = registration["proofs_in_catalog"]
     return {"schema_version": 1, "kind": "icsot_recurring_outcome", "slug": entry["slug"],
+            "priority": entry.get("priority"), "priority_order_position": entry.get("priority_order_position"),
+            "priority_policy_sha256": entry.get("priority_policy_sha256"),
             "repository_id": entry["repository_id"], "slot": entry["slot"],
             "status": "partial" if pending or collection["partial_captures"] or
                 collection.get("current_observation", {}).get("status", "complete") != "complete" else "complete",
@@ -326,9 +376,13 @@ def main(argv=None) -> int:
         child.add_argument("--code-sha", required=True)
         child.add_argument("--destination-repository", required=True)
         child.add_argument("--output", required=True, type=Path)
+        child.add_argument("--priorities", type=Path,
+                           help="Explicit frozen corpus priority CSV (default beside config)")
         if name == "plan":
             child.add_argument("--cold-bootstraps", type=int, default=0)
             child.add_argument("--github-output", type=Path)
+            child.add_argument("--priority-tier", required=True, choices=TIERS)
+            child.add_argument("--slot", type=int, help="Cycle slot frozen before tier execution")
         else:
             child.add_argument("--plan", required=True, type=Path)
             child.add_argument("--plan-sha256", required=True)
@@ -341,6 +395,9 @@ def main(argv=None) -> int:
     if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != args.code_sha:
         raise ValueError("Collector checkout differs from the requested full code SHA")
     config, sources = load_cohort(args.config, args.csv)
+    priorities = load_frozen_priorities(args.priorities or args.config.with_name("repository-priorities.csv"),
+                                        config.repositories, source_csv=args.csv)
+    sources = {**sources, "priority_policy_sha256": priorities.sha256}
     history_settings = load_history_settings(args.config, config.repositories)
     resource_limits = load_resource_limits(args.config, config.repositories)
     config = replace(config, primary_rate_reserve=40, primary_rate_wait_seconds=0)
@@ -357,7 +414,8 @@ def main(argv=None) -> int:
                               identity_loader=lambda slug: api.get_json(f"/repos/{slug}", "recurring_plan_identity"),
                               pointer_loader=lambda repo_id: transport.read_pointer(head, repo_id) if head else None,
                               cold_bootstraps=args.cold_bootstraps, history_settings=history_settings,
-                              resource_limits=resource_limits, migration_pending_slugs=covered_by_migration)
+                              resource_limits=resource_limits, migration_pending_slugs=covered_by_migration,
+                              frozen_priorities=priorities, priority_tier=args.priority_tier, slot=args.slot)
         raw = canonical_json(plan)
         if len(raw) > MAX_PLAN_BYTES:
             raise ValueError("Recurring metadata plan exceeds its 1-MiB bound")
@@ -366,7 +424,9 @@ def main(argv=None) -> int:
             with args.github_output.open("a") as output:
                 for key, value in {"matrix": json.dumps(plan["matrix"], separators=(",", ":")),
                                    "planned_count": len(plan["matrix"]["include"]), "plan_sha256": sha256(raw),
-                                   "slot": plan["slot"], "code_sha": args.code_sha}.items():
+                                   "slot": plan["slot"], "code_sha": args.code_sha,
+                                   "cold_bootstraps_remaining": plan["cold_bootstraps_remaining"],
+                                   "stop_lower_tiers": str(plan["stop_lower_tiers"]).lower()}.items():
                     output.write(f"{key}={value}\n")
         print(json.dumps({"counts": plan["counts"], "slot": plan["slot"], "plan_sha256": sha256(raw)}))
         return 0
@@ -417,6 +477,7 @@ def main(argv=None) -> int:
         code = 2
     report.update({key: plan[key] for key in ("execution_order_policy", "execution_order_seed_sha256",
                                             "execution_order_sha256", "execution_order_qualification") if key in plan})
+    report.update({key: entry.get(key) for key in ("priority", "priority_order_position", "priority_policy_sha256")})
     report["planned_execution_position"] = next(index for index, row in enumerate(plan["matrix"]["include"], 1)
                                                 if row["slug"] == entry["slug"])
     write_once(args.output, canonical_json(report))

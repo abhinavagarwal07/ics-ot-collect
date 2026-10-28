@@ -463,7 +463,10 @@ def test_public_lane_outcomes_distinguish_missing_current_capture_from_completed
 @pytest.mark.parametrize("outcome", ["complete", "paused", "failed"])
 def test_cli_outcomes_retain_planned_execution_provenance(tmp_path, monkeypatch, outcome):
     from icsot_observer import recurrence
-    cfg, result = config(tmp_path), plan(tmp_path)
+    from icsot_observer.priorities import FrozenPriorities
+    cfg = config(tmp_path)
+    priorities = FrozenPriorities(cfg.repositories, {slug: "P2" for slug in cfg.repositories}, "d" * 64)
+    result = plan(tmp_path, frozen_priorities=priorities)
     entry = result["matrix"]["include"][-1]
     raw = canonical_json(result)
     plan_path, output = tmp_path / "plan.json", tmp_path / "outcome.json"
@@ -480,6 +483,7 @@ def test_cli_outcomes_retain_planned_execution_provenance(tmp_path, monkeypatch,
                                "runtime": {"completed": 2}}}
     monkeypatch.setattr(recurrence.subprocess, "check_output", lambda *args, **kwargs: CODE)
     monkeypatch.setattr(recurrence, "load_cohort", lambda *args: (cfg, SOURCES))
+    monkeypatch.setattr(recurrence, "load_frozen_priorities", lambda *args, **kwargs: priorities)
     monkeypatch.setattr(recurrence, "load_history_settings", lambda *args: {})
     monkeypatch.setattr(recurrence, "load_resource_limits", lambda *args: {})
     monkeypatch.setattr(pipeline, "run_github_persistent", capture)
@@ -494,6 +498,9 @@ def test_cli_outcomes_retain_planned_execution_provenance(tmp_path, monkeypatch,
     for key in ("execution_order_policy", "execution_order_seed_sha256", "execution_order_sha256", "execution_order_qualification"):
         assert report[key] == result[key]
     assert report["planned_execution_position"] == len(result["matrix"]["include"])
+    assert report["priority"] == entry["priority"] == "P2"
+    assert report["priority_order_position"] == entry["priority_order_position"]
+    assert report["priority_policy_sha256"] == priorities.sha256
     assert "arbitrary exception text" not in output.read_text()
 
 

@@ -318,13 +318,14 @@ def test_manual_initializer_queues_with_recurring_collection_under_shared_worker
     initializer = (root / ".github/workflows/baseline-state-initialize.yml").read_text()
     recurring = (root / ".github/workflows/corpus-incremental.yml").read_text()
     pilot = (root / ".github/workflows/persistent-selected.yml").read_text()
+    tier = (root / ".github/workflows/corpus-priority-tier.yml").read_text()
     assert "  schedule:" not in initializer and "  workflow_dispatch:" in initializer
     assert "cron: '17 */6 * * *'" in recurring
     for workflow in (initializer, recurring, pilot):
         concurrency = workflow.split("\nconcurrency:\n", 1)[1].split("\ndefaults:\n", 1)[0]
         assert "  group: persistent-collection\n" in concurrency
         assert "  cancel-in-progress: false\n" in concurrency and "  queue: max\n" in concurrency
-    for workflow in (initializer, recurring):
+    for workflow in (initializer, tier):
         assert "      max-parallel: 8\n" in workflow
     assert "${{ steps.plan.outputs.blocked_count }}" in initializer
     assert "${{ steps.plan.outputs.planning_status }}" in initializer
