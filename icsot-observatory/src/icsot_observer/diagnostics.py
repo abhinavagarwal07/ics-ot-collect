@@ -48,7 +48,7 @@ _CATEGORIES = frozenset(("collection_error", "http_error", "upstream_http_502", 
     "proof_failed", "interrupted", "budget_refused"))
 _STAGES = frozenset(("preflight", "collection", "verification", "evidence_inspection", "archive", "encryption",
     "archive_upload", "proof_publication", "proof_receipt", "index_upload", "inventory", "finalization",
-    "entrypoint", "github_cli", "asset_upload", "git_capture_and_bundle", "timestamp_request", "timestamp_receipt",
+    "entrypoint", "github_cli", "asset_upload", "asset_download", "git_capture_and_bundle", "timestamp_request", "timestamp_receipt",
     "diagnostic_heartbeat", "scientific_diagnostics", "scientific", "api", "git", "upload", "plan", "finalize", "capture",
     "plan_selection", "collector_report", "capture_outcome_report", "index_write", "index_digest_diagnostic", "unknown"))
 _STATUSES = frozenset(("unknown", "not_run", "not_verified", "not_collected", "ok", "success", "failed", "error",
@@ -66,7 +66,8 @@ _VOCABULARIES = {
     "reason": frozenset(("unknown", "expired_reset_cleared", "network_error", "primary_rate_reset", "secondary_rate_limit",
         "upstream_transient", "cursor_loop", "duplicate_id", "updated_boundary", "next_link", "link_end",
         "membership_changed", "order_changed", "cursor_changed", "representation_changed", "reset_unknown",
-        "repository_pull_requests_disabled", "repository_issues_and_pull_requests_disabled", "checkpoint_reuse")),
+        "repository_pull_requests_disabled", "repository_issues_and_pull_requests_disabled", "checkpoint_reuse",
+        "public_download", "authenticated_download", "authenticated_fallback")),
     "decision": frozenset(("unknown", "defer", "clear_expired", "refuse_wait_budget", "retry", "restart", "exhausted", "wait", "continue")),
     "rate_kind": frozenset(("unknown", "primary", "primary_reserve", "secondary", "server", "network")),
     "asset_id_reason": frozenset(("unknown", "not_returned", "not_probed")),
@@ -83,6 +84,7 @@ _NUMBERS = frozenset((
     "primary_wait_used_seconds", "primary_wait_allowance_seconds", "secondary_wait_used_seconds",
     "secondary_wait_allowance_seconds", "scope_attempt", "request_count",
     "reused_count", "remaining_count", "max_parallel", "git_refs_verified", "git_repositories_verified",
+    "public_http_requests", "public_downloads", "public_bytes", "authenticated_downloads", "fallbacks",
     "portable_git_bundles_verified", "raw_observations", "partial_runs",
 ))
 _BOOLS = frozenset(("matches", "membership_changed", "order_changed", "cursor_changed",

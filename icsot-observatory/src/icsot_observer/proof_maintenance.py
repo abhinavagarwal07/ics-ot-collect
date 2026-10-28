@@ -221,6 +221,9 @@ class ProofTransport(GhCliStateTransport):
         release = self._api(f"repos/{self.repository}/releases/tags/{tag}", missing_ok=True)
         if release is None:
             return None
+        self._validate_release(release, tag)
+        self._releases[tag] = release
+        self._assets[tag] = {a["name"]: a for a in release.get("assets", [])}
         matches = [a for a in release.get("assets", []) if a.get("name") == MARKER]
         if not matches:
             # Release responses may truncate assets; use the bounded existing pager.
@@ -238,8 +241,11 @@ class ProofTransport(GhCliStateTransport):
             raise ValueError("Ambiguous public metadata marker")
         if type(asset.get("size")) is not int or not 0 < asset["size"] <= MAX_JSON_BYTES:
             raise ValueError("Public metadata marker exceeds size limit")
-        raw = self._run(["api", f"repos/{self.repository}/releases/assets/{asset['id']}",
-                         "--method", "GET", "-H", "Accept: application/octet-stream"])
+        with tempfile.TemporaryDirectory(prefix="icsot-public-marker-read-") as directory:
+            target = Path(directory) / MARKER
+            self.download_asset(tag, MARKER, target)
+            with target.open("rb") as source:
+                raw = source.read(MAX_JSON_BYTES + 1)
         if len(raw) != asset["size"]:
             raise ValueError("Public metadata marker size mismatch")
         return raw

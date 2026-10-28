@@ -37,6 +37,9 @@ from urllib.parse import quote
 from .core import REPO_RE, canonical_json, utc_iso
 from .encryption import decrypt_file, encrypt_file, public_key_fingerprint
 from .runtime import ControllerLock
+from .public_assets import (MAX_PUBLIC_ASSET_BYTES, PublicAssetInvalid, PublicAssetRateLimited,
+                            PublicAssetUnavailable, check_browser_url, download_public,
+                            public_opener as make_public_opener)
 
 SCHEMA_VERSION = 1
 BRANCH = "collector-state"
@@ -253,11 +256,22 @@ class GhCliStateTransport:
 
     def __init__(self, destination_repository: str, *, runner: Callable = subprocess.run,
                  rate_reserve: int = 100, transient_retries: int = 1,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, asset_download_mode: str | None = None,
+                 public_opener: Callable | None = None):
         if not REPO_RE.fullmatch(destination_repository):
             raise ValueError("Invalid destination repository")
         if type(rate_reserve) is not int or rate_reserve < 0 or not 0 <= transient_retries <= 2:
             raise ValueError("Invalid bounded GitHub transport retry/reserve policy")
+        mode = asset_download_mode if asset_download_mode is not None else os.getenv(
+            "ICSOT_ASSET_DOWNLOAD_MODE", "public-first")
+        if mode not in ("public-first", "public-only", "authenticated"):
+            raise ValueError("Invalid GitHub asset download mode")
+        self.asset_download_mode = mode
+        self._public_opener = public_opener if public_opener is not None else make_public_opener()
+        self._public_unavailable_releases: set[str] = set()
+        self._public_unavailable_until = 0.0
+        self.asset_download_counts = {"public_http_requests": 0, "public_downloads": 0,
+                                      "public_bytes": 0, "authenticated_downloads": 0, "fallbacks": 0}
         self.repository, self.runner = destination_repository, runner
         self.rate_reserve, self.transient_retries, self.clock = rate_reserve, transient_retries, clock
         self.request_count = 0
@@ -291,6 +305,10 @@ class GhCliStateTransport:
                      "_graphql_rate_windows", "_last_graphql_rate_headers", "_last_response_retry_not_before",
                      "_last_quota_probe", "_fallback_rate_seconds", "last_budget_metrics"):
             setattr(other, name, copy.deepcopy(getattr(self, name)))
+        other.asset_download_mode, other._public_opener = self.asset_download_mode, self._public_opener
+        other._public_unavailable_until = self._public_unavailable_until
+        other.asset_download_counts = copy.deepcopy(self.asset_download_counts)
+        other._public_unavailable_releases = self._public_unavailable_releases
         # These caches name immutable Git objects and uploaded asset identities;
         # specialized adapters can retain discoveries made in either direction.
         for name in ("_releases", "_assets", "_listed", "_git_files"):
@@ -842,14 +860,85 @@ class GhCliStateTransport:
         _asset_ref({"release_tag": tag, "name": name, "ciphertext_sha256": "0" * 64,
                     "ciphertext_bytes": 1})
         asset = self._asset(tag, name)
+        release = self._releases[tag]  # _asset already cached the validated release.
+        size, digest = asset.get("size"), asset.get("digest")
+        if (type(size) is not int or not 0 <= size <= MAX_PUBLIC_ASSET_BYTES or
+                digest is not None and (not isinstance(digest, str) or
+                                        not re.fullmatch(r"sha256:[0-9a-f]{64}", digest))):
+            raise StateError("Invalid GitHub asset size or digest metadata")
+        digest = digest[7:] if digest is not None else None
+        public_url = asset.get("browser_download_url")
+        mode = self.asset_download_mode
+        if public_url is not None and mode != "authenticated" and release["draft"] is False:
+            try:
+                check_browser_url(public_url, self.repository, tag, name)
+            except PublicAssetInvalid:
+                raise StateError("Untrusted public GitHub asset URL") from None
+        public_ready = (mode != "authenticated" and release["draft"] is False and public_url is not None and
+                        tag not in self._public_unavailable_releases and self.clock() >= self._public_unavailable_until)
+        # A known secondary/Retry-After constraint applies to both routes. A
+        # primary REST reserve alone does not debit a public byte download.
+        if self.retry_not_before is not None and self.clock() < self.retry_not_before:
+            raise self._defer("destination Retry-After has not elapsed", self.retry_not_before)
+        created = False
         try:
             with destination.open("xb") as target:
+                created = True
                 os.chmod(destination, 0o600)
+                if public_ready:
+                    def counted_request():
+                        self.asset_download_counts["public_http_requests"] += 1
+                    try:
+                        download_public(public_url, target, size=size, digest=digest,
+                                        opener=self._public_opener, on_request=counted_request)
+                    except PublicAssetRateLimited as error:
+                        retry = self._retry_after(error.retry_after) or self.clock() + 60
+                        if isinstance(error.reset, str) and error.reset.isdecimal():
+                            retry = max(retry, int(error.reset))
+                        self.retry_not_before = max(self.retry_not_before or 0, retry)
+                        raise self._defer("destination public asset rate limit", self.retry_not_before) from None
+                    except PublicAssetInvalid:
+                        raise StateError("Public GitHub asset policy or integrity check failed") from None
+                    except PublicAssetUnavailable as error:
+                        if error.status in (401, 403, 404, 410):
+                            self._public_unavailable_releases.add(tag)
+                        else:
+                            self._public_unavailable_until = self.clock() + 60
+                        target.seek(0)
+                        target.truncate()
+                    else:
+                        self.asset_download_counts["public_downloads"] += 1
+                        self.asset_download_counts["public_bytes"] += size
+                        self._emit_asset_download("public_download", size)
+                        return
+                if mode == "public-only":
+                    raise StateError("Public GitHub asset download unavailable; authenticated fallback disabled")
+                if mode == "public-first":
+                    self.asset_download_counts["fallbacks"] += 1
+                self.asset_download_counts["authenticated_downloads"] += 1
                 self._run(["api", f"repos/{self.repository}/releases/assets/{asset['id']}",
                            "--method", "GET", "-H", "Accept: application/octet-stream"], stdout=target)
+            # Retain the trusted caller's SHA/AEAD checks as well. GitHub's
+            # optional digest is an additional transport check, not their source.
+            if destination.stat().st_size != size or digest is not None and _digest(destination) != digest:
+                raise StateError("Authenticated GitHub asset hash or size differs from metadata")
+            self._emit_asset_download("authenticated_fallback" if mode == "public-first" else "authenticated_download", size)
         except Exception:
-            destination.unlink(missing_ok=True)
+            if created:
+                destination.unlink(missing_ok=True)
             raise
+
+    def download_metrics(self) -> dict[str, int]:
+        return {"destination_github_public_asset_requests_total": self.asset_download_counts["public_http_requests"],
+                "destination_github_public_asset_downloads_total": self.asset_download_counts["public_downloads"],
+                "destination_github_public_asset_download_bytes_total": self.asset_download_counts["public_bytes"],
+                "destination_github_authenticated_asset_downloads_total": self.asset_download_counts["authenticated_downloads"],
+                "destination_github_asset_download_fallbacks_total": self.asset_download_counts["fallbacks"]}
+
+    def _emit_asset_download(self, reason: str, size: int) -> None:
+        from .diagnostics import emit
+        emit("stage_end", stage="asset_download", status="complete", reason=reason, bytes=size,
+             request_count=self.request_count, **self.asset_download_counts)
 
 
 class GitHubStateStore:
@@ -2019,7 +2108,8 @@ class GitHubStateStore:
         metrics.pop("_asset_count")
         request_total = getattr(self.transport, "request_count", 0)
         graphql_total = getattr(self.transport, "graphql_request_count", 0)
-        return {**metrics, "state_release_count": state_release_count,
+        download_metrics = getattr(self.transport, "download_metrics", lambda: {})()
+        return {**metrics, **download_metrics, "state_release_count": state_release_count,
                 "destination_github_api_requests_total": request_total,
                 "destination_github_graphql_api_requests_total": graphql_total,
                 "destination_github_graphql_api_requests_for_publish": graphql_total - graphql_start,
