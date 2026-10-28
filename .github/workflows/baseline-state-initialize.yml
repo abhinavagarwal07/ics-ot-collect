@@ -49,6 +49,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           CATALOG_REF: ${{ inputs.catalog_ref }}
         run: |
           python - <<'PY'
@@ -95,6 +96,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           PLAN_REF: ${{ needs.plan.outputs.plan_ref }}
         run: |
           python - <<'PY'
@@ -130,6 +132,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           CAPTURE_SLUG: ${{ matrix.slug }}
           REPOSITORY_ID: ${{ matrix.repository_id }}
           IMPORTER_CODE_SHA: ${{ needs.plan.outputs.code_sha }}

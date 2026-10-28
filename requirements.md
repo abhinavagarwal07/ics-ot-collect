@@ -19,6 +19,7 @@ Create local, incremental, independently verifiable records of public GitHub obs
 - **Indefinite retention**; no automatic expiration or deletion of captured evidence.
 - The source repository is **public**. The one-time baseline uses standard hosted runners and encrypted XZ Release assets; metadata and the RSA public key may remain public. Recurring collection restores authenticated encrypted working state; state storage and evidence-transfer bytes are accounted separately.
 - Respect Actions runtime/disk/API limits; preserve explicit partial or missing outcomes and repair only affected targets/scopes. Avoid overwriting prior evidence or repeating the entire cohort to repair one failure.
+- An optional second public source-read credential may distribute repository jobs deterministically, pinning each job's identity, pagination and retries to one credential. Keep primary-rate observations independent, honor secondary limits without credential switching, preserve single-token fallback, and leave destination authentication and concurrency unchanged.
 - **Local disk hard limit: 2,000,000,000 bytes at once**, counting this workspace, caches, temporary downloads, decrypted/expanded data and visualization/spot-check files together. Use one shared admission ledger and stream one archive part at a time; defer any check that cannot fit. Do not use Docker locally.
 
 ## LARGE policy and measured sizes

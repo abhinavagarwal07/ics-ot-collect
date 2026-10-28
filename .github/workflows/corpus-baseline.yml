@@ -151,6 +151,7 @@ jobs:
           # API reads use the optional public read credential. Release writes
           # remain on this workflow's separate, repository-scoped GH_TOKEN.
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           GH_TOKEN: ${{ github.token }}
           CAPTURE_SLUG: ${{ matrix.slug }}
           RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}

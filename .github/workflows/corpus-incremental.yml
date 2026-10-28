@@ -52,6 +52,7 @@ jobs:
         id: plan
         env:
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           GH_TOKEN: ${{ github.token }}
           COLD_BOOTSTRAPS: ${{ inputs.cold_bootstraps }}
         run: |
@@ -135,6 +136,7 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           GH_TOKEN: ${{ github.token }}
           CAPTURE_SLUG: ${{ matrix.slug }}
           SOURCE_REPOSITORY_ID: ${{ matrix.repository_id }}

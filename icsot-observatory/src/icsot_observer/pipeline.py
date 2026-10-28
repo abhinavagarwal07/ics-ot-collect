@@ -299,7 +299,8 @@ def capture_lane(config: Config, job: Any, queue: Any) -> dict[str, Any]:
         records[:] = [record for record in records if canonical_json(
             {key: value for key, value in record.items() if key != "checkpoint_provenance"}) not in saved]
     try:
-        api = GitHubAPI(config, store, records, checkpoint_store=checkpoint, defer_on_rate=True)
+        api = GitHubAPI(config, store, records, checkpoint_store=checkpoint, defer_on_rate=True,
+                        source_repository=job.slug)
         meta = api.get_json(f"/repos/{job.slug}", "repository_identity")
         expected = job.payload.get("expected_repository_id")
         if expected is not None and meta.get("id") != expected:
@@ -329,7 +330,7 @@ def capture_lane(config: Config, job: Any, queue: Any) -> dict[str, Any]:
     # Bind identity envelopes durably before either lane continues, including a
     # first Git capture whose result may outlive its worker process.
     checkpoint = CheckpointStore(config.root, repo_id, job.capture_id)
-    api = GitHubAPI(config, store, records, checkpoint_store=checkpoint)
+    api = GitHubAPI(config, store, records, checkpoint_store=checkpoint, source_repository=job.slug)
     if job.lane == "api":
         scope_since = job.payload.get("scope_since")
         if scope_since is None:
@@ -933,7 +934,7 @@ def collect_one(config: Config, slug: str, mode: str, *, deep_full: bool = False
     capture_id = rid
     records: list[dict] = []
     store = ObjectStore(config.root)
-    api = GitHubAPI(config, store, records)
+    api = GitHubAPI(config, store, records, source_repository=slug)
     result: dict[str, Any] | None = None
     git_result: dict[str, Any] | None = None
     failures: list[str] = []

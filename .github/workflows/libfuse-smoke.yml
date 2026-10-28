@@ -74,6 +74,7 @@ jobs:
       - name: Collect full and delta evidence, verify, derive, and diff
         env:
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
         run: |
           set -euo pipefail
           failed=0

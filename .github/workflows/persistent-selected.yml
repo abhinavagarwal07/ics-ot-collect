@@ -46,6 +46,7 @@ jobs:
         id: selected
         env:
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           CAPTURE_SLUG: ${{ inputs.repository }}
         run: |
           python - <<'PY'
@@ -107,6 +108,7 @@ jobs:
       - name: Restore state, collect independent lanes, publish encrypted evidence and state
         env:
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           GH_TOKEN: ${{ github.token }}
           CAPTURE_SLUG: ${{ inputs.repository }}
           SOURCE_REPOSITORY_ID: ${{ needs.resolve.outputs.repository_id }}

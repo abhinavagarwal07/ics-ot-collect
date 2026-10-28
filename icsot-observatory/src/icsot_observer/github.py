@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from .core import Config, ObjectStore, canonical_json, parse_github_time, sha256, utc_iso
+from .core import Config, ObjectStore, REPO_RE, canonical_json, parse_github_time, sha256, utc_iso
 from .checkpoints import CheckpointError, CheckpointStore
 from .diagnostics import emit, exception_fields, failure_category, safe_fields, wait_heartbeat
 
@@ -71,7 +71,10 @@ class GitHubAPI:
     """Captures original HTTP body and a redacted provenance envelope."""
 
     def __init__(self, config: Config, store: ObjectStore, records: list[dict],
-                 checkpoint_store: CheckpointStore | None = None, *, defer_on_rate: bool = False):
+                 checkpoint_store: CheckpointStore | None = None, *, defer_on_rate: bool = False,
+                 source_repository: str | None = None):
+        if source_repository is not None and not REPO_RE.fullmatch(source_repository):
+            raise ValueError("Invalid public source repository context")
         self.config, self.store, self.records = config, store, records
         self.checkpoint_store = checkpoint_store
         self.defer_on_rate = defer_on_rate or checkpoint_store is not None
@@ -110,12 +113,74 @@ class GitHubAPI:
                     record["checkpoint_provenance"]["reused_from_checkpoint"] = True
                     records.append(record)
         self.token = os.getenv(config.token_env, "").strip()
+        self._source_tokens = (self.token,)
+        if self.token and config.token_env in ("GITHUB_TOKEN", "COLLECTOR_READ_TOKEN"):
+            secondary = os.getenv("COLLECTOR_READ_TOKEN_SECONDARY", "").strip()
+            if secondary and secondary != self.token:
+                self._source_tokens += (secondary,)
+        # Select once for a repository job. Historical response/checkpoint data
+        # never pins later jobs to a credential, and no credential identity is
+        # serialized into evidence. Shared planners bind individual repositories.
+        self._source_repository = source_repository.lower() if source_repository else None
+        self._source_repository_id = str(checkpoint_store.repository_id) if checkpoint_store else None
+        self._source_repository_slots: dict[str, int] = {}
+        if self._source_repository:
+            slot = self._partition_source_repository(self._source_repository)
+            self._source_repository_slots["/repos/" + self._source_repository] = slot
+            if self._source_repository_id:
+                self._source_repository_slots["/repositories/" + self._source_repository_id] = slot
         self.opener = urllib.request.build_opener(NoRedirect)
         self.requests = 0
         self.primary_rate_waited_seconds = 0.0
         self.secondary_rate_waited_seconds = 0.0
         self._last_rate_record: dict | None = None
+        self._source_rate_records: dict[int, dict] = {}
         self._repository_ids: dict[str, str] = {}
+
+    def _partition_source_repository(self, slug: str) -> int:
+        return int(sha256(slug.lower().encode("utf-8")), 16) % len(self._source_tokens)
+
+    def _source_credential_slot(self, url: str | None) -> int:
+        if len(self._source_tokens) == 1:
+            return 0
+        route = _REPOSITORY_PATH_RE.fullmatch(urllib.parse.urlsplit(url or "").path)
+        if route is None:
+            raise RuntimeError("Public source repository credential context unavailable")
+        repository = route["repository"].lower()
+        if repository in self._source_repository_slots:
+            return self._source_repository_slots[repository]
+        # Numeric pagination must inherit an observed identity or the trusted
+        # job checkpoint binding; hashing a numeric alias could change tokens.
+        if route["id"] or self._source_repository is not None:
+            raise RuntimeError("Public source repository credential binding unavailable")
+        slot = self._partition_source_repository(repository[len("/repos/"):])
+        self._source_repository_slots[repository] = slot
+        return slot
+
+    def _remember_repository_identity(self, path: str, metadata: dict) -> None:
+        route = _REPOSITORY_PATH_RE.fullmatch(path)
+        if (route is None or route["endpoint"] or
+                type(metadata.get("id")) is not int or metadata["id"] <= 0):
+            return
+        repository, repository_id = route["repository"].lower(), str(metadata["id"])
+        self._repository_ids[repository] = repository_id
+        if len(self._source_tokens) == 1:
+            return
+        slot = self._source_credential_slot(self.url(path))
+        aliases = {repository, "/repositories/" + repository_id}
+        full_name = metadata.get("full_name")
+        if isinstance(full_name, str) and REPO_RE.fullmatch(full_name):
+            aliases.add("/repos/" + full_name.lower())
+        if (self._source_repository is not None and self._source_repository_id is not None and
+                repository_id != self._source_repository_id):
+            raise RuntimeError("Public source repository identity differs from job binding")
+        if any(alias in self._source_repository_slots and self._source_repository_slots[alias] != slot
+               for alias in aliases):
+            raise RuntimeError("Conflicting public source repository credential bindings")
+        self._source_repository_slots.update(dict.fromkeys(aliases, slot))
+        self._repository_ids.update(dict.fromkeys(aliases, repository_id))
+        if self._source_repository is not None:
+            self._source_repository_id = repository_id
 
     def _request_fields(self, url: str | None, purpose: str) -> dict:
         fields = {"scope": purpose, "method": "GET", "page": 1, "scope_attempt": 1,
@@ -248,7 +313,8 @@ class GitHubAPI:
         return url
 
     def _preserve_primary_reserve(self, purpose: str, *, url: str | None = None) -> None:
-        record = self._last_rate_record
+        slot = self._source_credential_slot(url)
+        record = self._source_rate_records.get(slot) if len(self._source_tokens) > 1 else self._last_rate_record
         if self.config.primary_rate_reserve == 0 or record is None:
             return
         headers = record.get("headers", {})
@@ -260,7 +326,7 @@ class GitHubAPI:
             return
         try:
             if time.time() >= float(headers["x-ratelimit-reset"]) + 1:
-                self._last_rate_record = None
+                self._clear_primary_rate_record(slot)
                 emit("api_rate_reserve", important=True, **self._request_fields(url, purpose),
                      **self._rate_fields(headers), decision="clear_expired", reason="expired_reset_cleared",
                      wait_available_seconds=max(0, self.config.primary_rate_wait_seconds - self.primary_rate_waited_seconds))
@@ -292,18 +358,26 @@ class GitHubAPI:
         record["primary_rate_reserve_wait_seconds"] = duration
         self.primary_rate_waited_seconds += duration
         self._debug_wait(duration, purpose, url=url, headers=headers, rate_kind="primary_reserve")
-        self._last_rate_record = None  # reset elapsed; obtain current headers on the next request
+        self._clear_primary_rate_record(slot)  # obtain current headers on the next request
+
+    def _clear_primary_rate_record(self, slot: int) -> None:
+        if len(self._source_tokens) > 1:
+            self._source_rate_records.pop(slot, None)
+        else:
+            self._last_rate_record = None
 
     def get(self, url: str, purpose: str) -> Response:
         self.validate_url(url)
+        slot = self._source_credential_slot(url)
+        token = self._source_tokens[slot]
         self._preserve_primary_reserve(purpose, url=url)
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": self.config.api_version,
             "User-Agent": self.config.user_agent,
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         # Never store Authorization header, token, private token scopes, or full request environment.
         errors = (urllib.error.URLError, TimeoutError, OSError)
         for attempt in range(4):
@@ -352,10 +426,13 @@ class GitHubAPI:
                 "purpose": purpose, "url": url, "method": "GET", "api_version": self.config.api_version,
                 "request_started_at": started, "request_completed_at": completed,
                 "status": status, "headers": hdrs, "body_sha256": digest, "body_bytes": len(body),
-                "error": failure, "attempt": attempt + 1, "auth": "token_present" if self.token else "anonymous"
+                "error": failure, "attempt": attempt + 1, "auth": "token_present" if token else "anonymous"
             }
             self._append_record(rec)
-            self._last_rate_record = rec
+            if len(self._source_tokens) > 1:
+                self._source_rate_records[slot] = rec
+            else:
+                self._last_rate_record = rec
             self.requests += 1
             category = ("response_cap" if failure == "RESPONSE_EXCEEDS_CAP" else
                         "upstream_http_502" if status == 502 else "http_error")
@@ -492,9 +569,7 @@ class GitHubAPI:
 
     def get_json(self, path: str, purpose: str) -> dict:
         _, obj = self._request_json(self.url(path), purpose, "object")
-        route = _REPOSITORY_PATH_RE.fullmatch(path)
-        if route and not route["endpoint"] and type(obj.get("id")) is int and obj["id"] > 0:
-            self._repository_ids[route["repository"].lower()] = str(obj["id"])
+        self._remember_repository_identity(path, obj)
         return obj
 
     @staticmethod
@@ -1070,7 +1145,7 @@ class GitHubAPI:
             return result
         result["repository_id"] = metadata["id"]
         result["repository_full_name"] = metadata.get("full_name")
-        self._repository_ids[prefix.lower()] = str(metadata["id"])
+        self._remember_repository_identity(prefix, metadata)
         pr_disabled = metadata.get("has_pull_requests") is False
         issue_comments_disabled = metadata.get("has_issues") is False and pr_disabled
         metadata_records = [record for record in self.records if record.get("purpose") == "repository_metadata"]

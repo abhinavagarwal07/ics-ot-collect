@@ -75,6 +75,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COLLECTOR_READ_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN }}
+          COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           RECOVERY_MANIFEST_SHA256: ${{ inputs.recovery_manifest_sha256 }}
         run: |
           set +x
