@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       repository:
-        description: 'One public repository from the declared cohort'
+        description: 'One to five declared public repositories, comma or newline separated'
         required: true
         default: 'libfuse/libfuse'
         type: string
@@ -36,7 +36,8 @@ jobs:
     permissions:
       contents: read
     outputs:
-      repository_id: ${{ steps.selected.outputs.repository_id }}
+      matrix: ${{ steps.selected.outputs.matrix }}
+      slot: ${{ steps.selected.outputs.slot }}
     steps:
       - name: Check out reviewed collector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,39 +49,67 @@ jobs:
           python-version: '3.12'
       - name: Install collector
         run: python -m pip install --disable-pip-version-check -e .
-      - name: Resolve one declared public repository
+      - name: Resolve up to five declared repositories and freeze one cycle slot
         id: selected
         env:
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
           COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
-          CAPTURE_SLUG: ${{ inputs.repository }}
+          SELECTED_REPOSITORIES: ${{ inputs.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python - <<'PY'
+          import json
           import os
+          import re
           import tempfile
+          import time
           from dataclasses import replace
           from pathlib import Path
           from icsot_observer.core import Config, ObjectStore
           from icsot_observer.github import GitHubAPI
+          from icsot_observer.github_state import GhCliStateTransport
           config = Config.load("config.corpus.toml")
-          slug = os.environ["CAPTURE_SLUG"]
-          if slug not in config.repositories:
+          slugs = [value.strip() for value in re.split(r"[,\r\n]+", os.environ["SELECTED_REPOSITORIES"]) if value.strip()]
+          if not 1 <= len(slugs) <= 5 or len({slug.lower() for slug in slugs}) != len(slugs):
+              raise SystemExit("Select one to five distinct declared repositories")
+          if any(slug not in config.repositories for slug in slugs):
               raise SystemExit("Selected repository is outside the declared cohort")
+          slot = int(time.time() // 21600)
+          destination = GhCliStateTransport(os.environ["GITHUB_REPOSITORY"])
+          head = destination.branch_head()
+          selected = []
           with tempfile.TemporaryDirectory(prefix="icsot-identity-") as temporary:
-              config = replace(config, root=Path(temporary), repositories=(slug,))
-              meta = GitHubAPI(config, ObjectStore(config.root), []).get_json(f"/repos/{slug}", "repository_identity")
-          if meta.get("private") is not False or type(meta.get("id")) is not int or meta["id"] <= 0:
-              raise SystemExit("Selected repository is not unambiguously public")
+              config = replace(config, root=Path(temporary), repositories=tuple(slugs))
+              api = GitHubAPI(config, ObjectStore(config.root), [], defer_on_rate=True)
+              for slug in slugs:
+                  meta = api.get_json(f"/repos/{slug}", "repository_identity")
+                  if (meta.get("private") is not False or type(meta.get("id")) is not int or meta["id"] <= 0
+                          or any(row["repository_id"] == meta["id"] for row in selected)):
+                      raise SystemExit("Selected identities must be distinct and unambiguously public")
+                  raw = destination.read_pointer(head, meta["id"]) if head else None
+                  pointer = json.loads(raw) if raw is not None else None
+                  if (not isinstance(pointer, dict) or pointer.get("repository_id") != meta["id"]
+                          or pointer.get("slug") != slug):
+                      raise SystemExit("Manual comparison requires existing authenticated working state; no cold bootstraps")
+                  selected.append({"slug": slug, "repository_id": meta["id"]})
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"repository_id={meta['id']}\n")
+              output.write("matrix=" + json.dumps({"include": selected}, separators=(",", ":")) + "\n")
+              output.write(f"slot={slot}\n")
           PY
 
   observe:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    name: Observe ${{ matrix.slug }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    env:
+      ICSOT_CYCLE_SLOT: ${{ needs.resolve.outputs.slot }}
     concurrency:
-      group: persistent-selected-id-${{ needs.resolve.outputs.repository_id }}
+      group: persistent-selected-id-${{ matrix.repository_id }}
       cancel-in-progress: false
     steps:
       - name: Check out reviewed collector
@@ -112,29 +141,98 @@ jobs:
               os.fsync(output.fileno())
           PY
       - name: Restore state, collect independent lanes, publish encrypted evidence and state
+        id: capture
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.COLLECTOR_READ_TOKEN || github.token }}
           COLLECTOR_READ_TOKEN_SECONDARY: ${{ secrets.COLLECTOR_READ_TOKEN_SECONDARY }}
           GH_TOKEN: ${{ github.token }}
-          CAPTURE_SLUG: ${{ inputs.repository }}
-          SOURCE_REPOSITORY_ID: ${{ needs.resolve.outputs.repository_id }}
+          CAPTURE_SLUG: ${{ matrix.slug }}
+          SOURCE_REPOSITORY_ID: ${{ matrix.repository_id }}
         run: |
           set +x
           trap 'rm -f "$RUNNER_TEMP/icsot-state-private.pem"' EXIT
-          icsot-observe github-run \
-            --config config.corpus.toml \
-            --slug "$CAPTURE_SLUG" \
-            --repository-id "$SOURCE_REPOSITORY_ID" \
-            --destination-repository "$GITHUB_REPOSITORY" \
-            --state-public-key keys/working-state-rsa-public.pem \
-            --state-private-key "$RUNNER_TEMP/icsot-state-private.pem" \
-            --evidence-public-key keys/results-rsa-public.pem \
-            --code-sha "$GITHUB_SHA" \
-            --observation-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --rfc3161-url http://timestamp.digicert.com \
-            --rfc3161-ca keys/digicert-trusted-root-g4.pem \
-            --rfc3161-chain keys/digicert-timestamp-2025-intermediate.pem \
-            --freetsa
+          /usr/bin/time -v -o "$RUNNER_TEMP/selected-runtime-time.txt" python - <<'PY'
+          import json
+          import os
+          import time
+          from pathlib import Path
+          from icsot_observer.core import Config, sha256, utc_iso
+          from icsot_observer.diagnostics import exception_fields
+          from icsot_observer.github import APIRequestDeferred
+          from icsot_observer.github_state import StateError
+          from icsot_observer.pipeline import run_github_persistent
+          from icsot_observer.recurrence import BoundedStateTransport, load_resource_limits, public_outcome
+          slug, repository_id = os.environ["CAPTURE_SLUG"], int(os.environ["SOURCE_REPOSITORY_ID"])
+          slot = int(os.environ["ICSOT_CYCLE_SLOT"])
+          config_path = Path("config.corpus.toml")
+          config = Config.load(config_path)
+          limits = load_resource_limits(config_path, config.repositories)[slug]
+          transport = BoundedStateTransport(os.environ["GITHUB_REPOSITORY"],
+              evidence_bytes=limits["max_new_evidence_ciphertext_bytes"],
+              state_bytes=limits["max_new_state_ciphertext_bytes"])
+          entry = {"slug": slug, "repository_id": repository_id, "slot": slot, "resource_limits": limits}
+          started, started_at = time.monotonic(), utc_iso()
+          code = 2
+          report = {**entry, "status": "failed"}
+          try:
+              result = run_github_persistent(config, slug=slug, repository_id=repository_id,
+                  destination_repository=os.environ["GITHUB_REPOSITORY"],
+                  state_public_key=Path("keys/working-state-rsa-public.pem"),
+                  state_private_key=Path(os.environ["RUNNER_TEMP"]) / "icsot-state-private.pem",
+                  evidence_public_key=Path("keys/results-rsa-public.pem"), code_sha=os.environ["GITHUB_SHA"],
+                  config_source_sha256=sha256(config_path.read_bytes()),
+                  observation_key=os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"],
+                  allow_bootstrap=False, schedule_slot=slot, transport=transport,
+                  max_restored_state_plaintext_bytes=limits["max_restored_state_plaintext_bytes"],
+                  rfc3161_url="http://timestamp.digicert.com", rfc3161_ca=Path("keys/digicert-trusted-root-g4.pem"),
+                  rfc3161_chain=Path("keys/digicert-timestamp-2025-intermediate.pem"), freetsa=True)
+              report = public_outcome(result, entry)
+              report["restore_metrics"] = {key: value for key, value in result["restore"].items()
+                  if type(value) in (int, float, bool)}
+              report["publication_metrics"] = {key: value for key, value in result["publication"].items()
+                  if type(value) in (int, float, bool)}
+              code = 0 if report["status"] == "complete" else 2
+          except (StateError, APIRequestDeferred) as error:
+              report.update(status="paused", reason_code=type(error).__name__,
+                            retry_not_before_epoch=getattr(error, "retry_not_before", None))
+              report.update(exception_fields(error))
+              code = 75
+          except Exception as error:
+              report["reason_code"] = type(error).__name__
+              report.update(exception_fields(error))
+          finally:
+              report.update(code_sha=os.environ["GITHUB_SHA"], observation_started_at=started_at,
+                  observation_finished_at=utc_iso(), capture_step_elapsed_seconds=round(time.monotonic() - started, 3),
+                  archive_profile=os.environ["ICSOT_ARCHIVE_PROFILE"], release_layout=os.environ["ICSOT_RELEASE_LAYOUT"],
+                  cold_bootstraps_allowed=False, download_metrics=transport.download_metrics(),
+                  attempted_upload_bytes=transport.uploaded_bytes)
+              raw = json.dumps(report, indent=2) + "\n"
+              if len(raw.encode()) > 1024 * 1024:
+                  raise RuntimeError("Selected runtime outcome exceeds metadata bound")
+              (Path(os.environ["RUNNER_TEMP"]) / "selected-runtime-outcome.json").write_text(raw)
+              print(raw)
+          raise SystemExit(code)
+          PY
+      - name: Preserve bounded runtime comparison metadata
+        if: always()
+        run: |
+          for file in "$RUNNER_TEMP/selected-runtime-outcome.json" "$RUNNER_TEMP/selected-runtime-time.txt"; do
+            if [ -f "$file" ]; then cat "$file" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+      - name: Retain the selected runtime outcome and process resource summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: selected-runtime-${{ matrix.repository_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/selected-runtime-outcome.json
+            ${{ runner.temp }}/selected-runtime-time.txt
+          if-no-files-found: warn
+          retention-days: 7
       - name: Remove runner operational key
         if: always()
         run: rm -f "$RUNNER_TEMP/icsot-state-private.pem"
+      - name: Keep incomplete collection visible
+        if: ${{ always() && steps.capture.outcome != 'success' }}
+        run: exit 2

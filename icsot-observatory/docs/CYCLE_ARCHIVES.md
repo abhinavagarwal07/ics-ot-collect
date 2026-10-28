@@ -1,6 +1,6 @@
 # Cycle archives and compatibility
 
-The new layout is implemented locally. Automatic schedules are paused, no new workflows are authorized, and this change has not been pushed or tested on a hosted runner. Earlier hosted validation applies to the previous layout.
+Automatic schedules remain paused. The user authorized one bounded manual comparison of five existing repositories using this layout; broader launches require separate authorization. Earlier hosted validation applies to the previous layout. Production-profile memory, disk and runtime remain unproven until the comparison completes.
 
 ## Publication
 

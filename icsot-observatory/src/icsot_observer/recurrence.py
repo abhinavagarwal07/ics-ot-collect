@@ -240,6 +240,10 @@ class BoundedStateTransport(GhCliStateTransport):
         self._counted_uploads = set()
 
     def upload_asset(self, tag: str, name: str, source: Path) -> None:
+        # Cycle routing re-enters this method with the physical filename after
+        # admitting its logical evidence/state reference. Charge it only once.
+        if tag.startswith("collector-cycle-"):
+            return super().upload_asset(tag, name, source)
         kind = "state" if tag.startswith("collector-state-") else "evidence"
         identity = (tag, name)
         size = source.stat().st_size

@@ -54,6 +54,32 @@ def test_entire_cohort_plan_selects_ready_state_and_only_bounded_explicit_cold_w
     assert "monthly_evidence_policy_bytes" not in result
 
 
+def test_cycle_payload_upload_is_charged_once_under_its_logical_kind(tmp_path, monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+    raw = b"cipher"
+    source = tmp_path / "part.enc"
+    source.write_bytes(raw)
+    transport = BoundedStateTransport("owner/collector", evidence_bytes=len(raw), state_bytes=len(raw), cycle_slot=123)
+    def release(tag, **_):
+        value = {"id": 1, "tag_name": tag, "draft": False, "assets": []}
+        transport._releases[tag] = value
+        transport._assets.setdefault(tag, {})
+        return value
+    uploads = []
+    def uploaded(args, **_):
+        name = parse_qs(urlsplit(args[1]).query)["name"][0]
+        uploads.append(name)
+        return canonical_json({"id": len(uploads), "name": name, "size": len(raw),
+                               "state": "uploaded", "digest": "sha256:" + sha256(raw)})
+    monkeypatch.setattr(transport, "_release", release)
+    monkeypatch.setattr(transport, "_api", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(transport, "_run", uploaded)
+    for kind in ("state", "observations"):
+        transport.upload_asset(f"collector-{kind}-r17-g" + "a"*32, source.name, source)
+    assert transport.uploaded_bytes == {"evidence": len(raw), "state": len(raw)}
+    assert len(uploads) == 2 and uploads[0] != uploads[1]
+
+
 def test_manual_and_scheduled_retries_share_slot_and_cold_attempts_rotate(tmp_path):
     first = plan(tmp_path, now=100000, cold_bootstraps=1)
     retry = plan(tmp_path, now=100001, cold_bootstraps=1)
