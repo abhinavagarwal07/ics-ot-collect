@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 from .attestations import MAX_RECEIPT_BYTES, inspect_ots_receipt, publish_ots_attestation
 from .core import REPO_RE, canonical_json, sha256, utc_iso
+from .exclusions import EXCLUDED_REPOSITORIES, EXCLUDED_REPOSITORY_IDS, excluded_asset_reference
 from .github_state import GhCliStateTransport, StateConflictError, StateDeferredError, StateError, _slug_binding
 
 BRANCH = "collector-attestations"
@@ -414,6 +415,8 @@ def _marker_entries(marker: dict, tag: str, transport: Any, *, storage: dict | N
     entries = []
     for observation in marker["observations"]:
         index_ref = _ref(observation["index"])
+        if excluded_asset_reference(index_ref):
+            continue
         if index_ref["release_tag"] != tag or not index_ref["name"].endswith(".index.json"):
             raise ValueError("Completion marker index names another release")
         index = _json(transport.fetch(index_ref))
@@ -620,6 +623,8 @@ def requeue_catalog(transport: Any, catalog_sha256: str, *, max_proofs: int = 12
         if record.get("maintenance_status") != "awaiting_trusted_rpc" or key in state["pending"]:
             continue
         latest = record["history"][-1]
+        if excluded_asset_reference(latest["proof"]):
+            continue
         state["pending"][key] = {"subject_sha256": record["subject_sha256"],
             "proof": _ref(latest["proof"]), "metadata": _ref(latest["metadata"]),
             "status": latest["status"], "discovered_at": utc_iso(), "attempts": 0,
@@ -645,6 +650,8 @@ def _discover_outbox(transport: Any, head: str | None, state: dict, report: dict
     if not hasattr(transport, "outbox_repositories"):
         return {}
     source_head, identifiers = transport.outbox_repositories()
+    report["outbox_repositories_excluded"] = sum(identifier in EXCLUDED_REPOSITORY_IDS for identifier in identifiers)
+    identifiers = [identifier for identifier in identifiers if identifier not in EXCLUDED_REPOSITORY_IDS]
     report["outbox_repositories_total"] = len(identifiers)
     discovery = state["discovery"].setdefault("proof_outbox", {"repositories": {}, "last_repository_id": 0})
     rows = discovery["repositories"]
@@ -664,6 +671,8 @@ def _discover_outbox(transport: Any, head: str | None, state: dict, report: dict
             raise ValueError("Invalid public proof outbox repository checkpoint")
         try:
             slug, latest = transport.outbox_head(source_head, repository_id)
+            if slug.lower() in EXCLUDED_REPOSITORIES:
+                continue
             if row.get("slug", slug) != slug:
                 raise ValueError("Public proof outbox repository slug changed")
             row["slug"] = slug
@@ -766,7 +775,8 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
             for release in releases:
                 tag, identifier = release.get("tag_name", ""), release.get("id")
                 if isinstance(tag, str) and OBSERVATION.fullmatch(tag) and type(identifier) is int and \
-                        identifier not in seen and identifier not in queued:
+                        identifier not in seen and identifier not in queued and \
+                        not excluded_asset_reference({"release_tag": tag}):
                     if len(discovery["incomplete_releases"]) >= MAX_INCOMPLETE_RELEASES:
                         report["discovery_paused_at_capacity"] = True
                         break
@@ -787,6 +797,9 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
             if clock() - started >= runtime_seconds:
                 break
             candidate = discovery["incomplete_releases"].pop(0)
+            if excluded_asset_reference({"release_tag": candidate["tag"]}):
+                seen.add(candidate["id"])
+                continue
             try:
                 raw = transport.marker(candidate["tag"])
                 if raw is None:
@@ -815,7 +828,8 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
             head = transport.save(head, state, registration_records)
             committed_state = copy.deepcopy(state)
         # Oldest attempted items rotate on each durable checkpoint, including failures.
-        ready = sorted((key for key, item in state["pending"].items() if item["next_attempt_after"] <= clock()),
+        ready = sorted((key for key, item in state["pending"].items() if item["next_attempt_after"] <= clock()
+                        and not excluded_asset_reference(item.get("proof", {}))),
                        key=lambda k: (state["pending"][k].get("last_attempt_at", 0), k))
         for key in ready[:max_proofs]:
             if clock() - started >= runtime_seconds:
@@ -920,15 +934,18 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
         report.update(status="conflict", deferred_reason="branch_changed_reload_next_run")
         # Report authoritative backlog, not an uncommitted local queue.
         _, state = transport.load()
-    report.update(pending_proofs=len(state["pending"]), incomplete_releases=len(state["discovery"]["incomplete_releases"]),
+    pending = {key: item for key, item in state["pending"].items() if not excluded_asset_reference(item.get("proof", {}))}
+    report.update(pending_proofs=len(pending), excluded_proofs_retained=len(state["pending"]) - len(pending),
+                  incomplete_releases=len(state["discovery"]["incomplete_releases"]),
                   historical_discovery_page=state["discovery"]["historical_page"],
                   completed_discovery_cycles=state["discovery"]["completed_cycles"],
                   github_requests=getattr(transport, "request_count", 0))
-    report["due_proofs"] = sum(item["next_attempt_after"] <= clock() for item in state["pending"].values())
+    report["due_proofs"] = sum(item["next_attempt_after"] <= clock() for item in pending.values())
     report["runtime_seconds"] = round(max(0, clock() - started), 3)
     checkpoint = state["discovery"].get("proof_outbox", {})
     outboxes = checkpoint.get("repositories", {}) if isinstance(checkpoint, dict) else {}
-    outboxes = {key: row for key, row in outboxes.items() if isinstance(row, dict)} if isinstance(outboxes, dict) else {}
+    outboxes = {key: row for key, row in outboxes.items() if isinstance(row, dict)
+                and key not in {str(identifier) for identifier in EXCLUDED_REPOSITORY_IDS}} if isinstance(outboxes, dict) else {}
     report["outbox_pending_catalogs_lower_bound"] = sum(row.get("cursor") is not None for row in outboxes.values())
     report["outbox_backlog_count_complete"] = False
     pending_dates = [row["pending_node_created_at"] for row in outboxes.values()
@@ -936,7 +953,7 @@ def refresh(transport: Any, *, client: OtsClient | None = None, verifier: Bitcoi
     report["oldest_inspected_pending_outbox_at"] = min(pending_dates, default=None)
     report["outbox_backlog_age_complete"] = False
     report["oldest_pending_proof_discovered_at"] = min(
-        (item.get("discovered_at") for item in state["pending"].values() if item.get("discovered_at")), default=None)
+        (item.get("discovered_at") for item in pending.values() if item.get("discovered_at")), default=None)
     report["discovery_coverage"] = "atomic_state_outbox_with_bounded_checkpoint_walk; rolling_release_scan_for_legacy_and_orphans"
     report["maintenance_cadence"] = "daily; bounded attempts do not guarantee proof completion within 24 hours"
     if report["status"] == "complete" and (report["pending_proofs"] or report["incomplete_releases"] or

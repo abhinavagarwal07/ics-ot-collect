@@ -142,7 +142,7 @@ def test_source_identity_requires_entire_csv_order(tmp_path):
     assert identities["config_source_sha256"] == hashlib.sha256(config.read_bytes()).hexdigest()
     assert identities["csv_sha256"] == hashlib.sha256(csv.read_bytes()).hexdigest()
     csv.write_text("Repository_URL\nhttps://github.com/example/two\nhttps://github.com/example/one\n")
-    with pytest.raises(ValueError, match="every CSV repository in order"):
+    with pytest.raises(ValueError, match="non-excluded CSV repositories in order"):
         baseline.load_sources(config, csv, expected_count=2)
     assert baseline.repository_key("a__b/c") != baseline.repository_key("a/b__c")
 

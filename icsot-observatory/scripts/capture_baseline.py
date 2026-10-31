@@ -311,6 +311,8 @@ def repository_key(slug: str) -> str:
 
 
 def load_sources(config_path: Path, csv_path: Path, *, expected_count: int = EXPECTED_REPOSITORIES):
+    from icsot_observer.exclusions import collection_repositories, exclusion_metadata
+
     config = Config.load(config_path)
     csv_bytes = csv_path.read_bytes()
     rows = list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8-sig"))))
@@ -321,12 +323,14 @@ def load_sources(config_path: Path, csv_path: Path, *, expected_count: int = EXP
         if url.scheme != "https" or url.netloc != "github.com" or url.query or url.fragment or not REPO_RE.fullmatch(slug):
             raise ValueError("CSV contains an invalid repository URL")
         csv_slugs.append(slug)
-    if tuple(csv_slugs) != config.repositories or len(csv_slugs) != expected_count:
-        raise ValueError("Configuration must match every CSV repository in order and expected count")
+    active_slugs = collection_repositories(csv_slugs)
+    if active_slugs != config.repositories or len(csv_slugs) != expected_count:
+        raise ValueError("Configuration must match non-excluded CSV repositories in order and original expected count")
     return config, {
         "config_source_sha256": sha256(config_path.read_bytes()),
         "csv_sha256": sha256(csv_bytes),
-        "cohort_count": len(csv_slugs),
+        "cohort_count": len(active_slugs),
+        **exclusion_metadata(csv_slugs),
     }
 
 
@@ -1255,8 +1259,8 @@ def _finalize(args) -> int:
         return 0 if summary["complete"] else 2
     notes = args.work_root / "release-notes.md"
     notes.write_text(
-        f"One-time 185-repository shallow baseline: **{summary['status']}**.\n\n"
-        f"Accepted repositories: {summary['complete_repositories']}/185; incomplete or missing: {summary['incomplete_repositories']}. "
+        f"One-time {len(config.repositories)}-repository shallow baseline: **{summary['status']}**.\n\n"
+        f"Accepted repositories: {summary['complete_repositories']}/{len(config.repositories)}; incomplete or missing: {summary['incomplete_repositories']}. "
         "See baseline-inventory.json and each repository's index asset for capture, verification, source hashes and ordered archive-part digests. "
         "A missing index represents missing/failed transfer, not successful coverage.\n\n"
         f"Collector commit: `{args.code_sha}`. Config SHA-256: `{sources['config_source_sha256']}`. CSV SHA-256: `{sources['csv_sha256']}`.\n\n"

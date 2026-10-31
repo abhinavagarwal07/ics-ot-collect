@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .core import REPO_RE
+from .exclusions import EXCLUDED_REPOSITORIES
 
 TIERS = ("P0", "P1", "P2")
 PRIORITY_FIELDS = ("repository", "priority", "source_cohort")
@@ -43,7 +44,8 @@ def load_frozen_priorities(path: Path, repositories: tuple[str, ...], *, source_
     expected = {slug.lower(): slug for slug in repositories}
     if len(expected) != len(repositories):
         raise ValueError("Duplicate normalized corpus repository")
-    source = {row["repository"].lower(): row for row in _source_rows(source_csv)}
+    source = {row["repository"].lower(): row for row in _source_rows(source_csv)
+              if row["repository"].lower() not in EXCLUDED_REPOSITORIES}
     if set(source) != set(expected):
         raise ValueError("Priority source does not match the configured corpus")
     reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
@@ -54,6 +56,8 @@ def load_frozen_priorities(path: Path, repositories: tuple[str, ...], *, source_
         if set(row) != set(PRIORITY_FIELDS) or not isinstance(row.get("repository"), str):
             raise ValueError("Malformed frozen priority row")
         normalized, tier = row["repository"].strip().lower(), row["priority"]
+        if normalized in EXCLUDED_REPOSITORIES:
+            continue
         if normalized not in expected or tier not in TIERS or normalized in tiers:
             raise ValueError("Unknown, duplicate or invalid frozen priority member")
         if tier < last_tier:
@@ -87,5 +91,7 @@ def initial_priority_rows(source_csv: Path) -> list[dict[str, str]]:
              "priority": "P0" if row["Cohort"] == "Healthcare" else
                          "P1" if row["repository"] in selected else "P2",
              "source_cohort": row["Cohort"]} for row in source]
-    return sorted(rows, key=lambda row: (row["priority"],
+    # Select against the original source first; removals must not select a
+    # replacement or change any remaining repository's frozen membership.
+    return sorted((row for row in rows if row["repository"].lower() not in EXCLUDED_REPOSITORIES), key=lambda row: (row["priority"],
         hashlib.sha256(row["repository"].lower().encode("utf-8")).digest(), row["repository"].lower()))

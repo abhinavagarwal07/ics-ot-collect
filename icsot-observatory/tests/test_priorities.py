@@ -60,7 +60,7 @@ def test_checked_in_policy_covers_every_repository_and_all_healthcare():
                                     cfg.repositories, source_csv=source)
     medical = {row["Repository_URL"].removeprefix("https://github.com/")
                for row in csv.DictReader(io.StringIO(source.read_text())) if row["Cohort"] == "Healthcare"}
-    assert len(policy.order) == len(set(policy.order)) == 185
+    assert len(policy.order) == len(set(policy.order)) == 181
     assert set(policy.order) == set(cfg.repositories)
     assert all(policy.tiers[slug] == "P0" for slug in medical)
     assert [policy.tiers[slug] for slug in policy.order] == sorted(policy.tiers.values())

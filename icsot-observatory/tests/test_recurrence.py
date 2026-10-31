@@ -98,7 +98,7 @@ def full_cohort_planner():
     root = Path(__file__).resolve().parents[2]
     cfg, sources = load_cohort(root / "icsot-observatory/config.corpus.toml", root / "public_patch_corpus_185.csv")
     identifiers = {slug: number for number, slug in enumerate(cfg.repositories, 20000)}
-    def build(slot=123456, *, ready_count=185, cold_bootstraps=0, offset_seconds=0):
+    def build(slot=123456, *, ready_count=181, cold_bootstraps=0, offset_seconds=0):
         pointers = {repo_id: canonical_json({"repository_id": repo_id, "slug": slug, "generation": "b" * 32})
                     for slug, repo_id in list(identifiers.items())[:ready_count]}
         return build_plan(cfg, sources=sources, code_sha=CODE,
@@ -113,7 +113,7 @@ def test_shuffled_matrix_preserves_full_canonical_cohort_lock_and_eligibility(fu
     cfg, sources, identifiers, build = full_cohort_planner
     result = build(ready_count=174, cold_bootstraps=cold_bootstraps)
     rows, selected = result["repositories"], result["matrix"]["include"]
-    assert tuple(row["slug"] for row in rows) == cfg.repositories and len(rows) == 185
+    assert tuple(row["slug"] for row in rows) == cfg.repositories and len(rows) == 181
     expected_hash = sha256(canonical_json([{"slug": slug, "repository_id": identifiers[slug]} for slug in cfg.repositories]))
     assert result["cohort_identity_sha256"] == expected_hash
     assert {row["slug"] for row in selected} == {
@@ -362,7 +362,7 @@ def test_source_csv_order_is_part_of_locked_cohort(tmp_path):
     _, hashes = load_cohort(cfg, csv, expected_count=2)
     assert hashes["csv_sha256"] == sha256(csv.read_bytes())
     csv.write_text("Repository_URL\nhttps://github.com/two/repo\nhttps://github.com/one/repo\n")
-    with pytest.raises(ValueError, match="every CSV row"):
+    with pytest.raises(ValueError, match="non-excluded CSV rows"):
         load_cohort(cfg, csv, expected_count=2)
 
 

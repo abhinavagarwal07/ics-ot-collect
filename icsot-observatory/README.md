@@ -8,9 +8,9 @@ The [persistent collector guide](docs/PERSISTENT.md) describes the implemented `
 
 Public observation indexes include the original UTC observation interval and hash-linked timestamp sidecars. OpenTimestamps receipts require independent Bitcoin verification. The selected-repository persistent pilot also requests RFC 3161 receipts with explicit trust-chain, nonce and digest verification; the corpus baseline publishes OTS sidecars. See [UTC and timestamp evidence](docs/PERSISTENT.md#utc-intervals-and-timestamp-evidence).
 
-The [six-hour cohort workflow](docs/PERSISTENT.md#six-hour-cohort-workflow) plans all 185 repositories, resumes existing authenticated working state and defaults to zero fresh public bootstraps, with an explicit manual range of zero through eight. It shares eight capture slots, uses the separate operational state key and records partial/paused/bootstrap-pending outcomes. The nominal interval does not promise completion of all 185 targets. A separate manual [proof-maintenance workflow](docs/TIMESTAMPING.md#manual-delayed-proof-maintenance) retrieves delayed OTS evidence and appends immutable receipt/metadata history without recapture or decryption. Its default has no trusted Bitcoin Core node, so Bitcoin attestation presence remains unverified. Full-cohort daily proof throughput is unmeasured.
+The [six-hour cohort workflow](docs/PERSISTENT.md#six-hour-cohort-workflow) plans all 181 active repositories, resumes existing authenticated working state and defaults to zero fresh public bootstraps, with an explicit manual range of zero through eight. It shares eight capture slots, uses the separate operational state key and records partial/paused/bootstrap-pending outcomes. The nominal interval does not promise completion of all 181 active targets. A separate manual [proof-maintenance workflow](docs/TIMESTAMPING.md#manual-delayed-proof-maintenance) retrieves delayed OTS evidence and appends immutable receipt/metadata history without recapture or decryption. Its default has no trusted Bitcoin Core node, so Bitcoin attestation presence remains unverified. Full-cohort daily proof throughput is unmeasured.
 
-The selected cohort is all 185 repositories in [public_patch_corpus_185.csv](../public_patch_corpus_185.csv), configured in [config.corpus.toml](config.corpus.toml) in CSV order. Pilot and priority labels do not filter the selection. Repository roles and measurement caveats remain in the CSV; observations of mirrors establish availability at those mirrors. Cohort changes must update both the CSV and configuration.
+The active cohort contains 181 repositories after four explicit exclusions effective 2026-10-30. The original 185-row [CSV](../public_patch_corpus_185.csv), [configuration declarations](config.corpus.toml) and frozen priority rows remain provenance; `Config.load` removes exactly the four excluded slugs, including manual selections. Remaining membership, tier assignments and order are preserved. See [scope and exclusion reasons](docs/CORPUS_SCOPE.md). Repository roles and measurement caveats remain in the CSV; observations of mirrors establish availability at those mirrors.
 
 `libfuse/libfuse` remains the smoke target in `config.libfuse.toml`. The workspace-root manual Actions workflow runs a shallow full capture, a delta capture, full-bundle restoration, byte verification and CSV/diff generation. It requests OpenTimestamps receipts but does not equate pending receipts with verified Bitcoin attestations. Artifact downloads are temporary transfer copies, not the indefinite archive.
 
@@ -33,7 +33,7 @@ pip install -e .
 pip install pytest
 pip install opentimestamps-client
 cp config.corpus.toml config.toml
-# review collector/root; all 185 selected repositories are included
+# review collector/root; 181 active repositories; four explicit exclusions apply
 # config.toml is machine-local and ignored by Git; never add a token
 export GITHUB_TOKEN="<read-only-public-GitHub-token>"
 

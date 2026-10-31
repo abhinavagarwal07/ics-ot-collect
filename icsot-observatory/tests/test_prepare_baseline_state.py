@@ -280,6 +280,15 @@ def test_full185_row_order_and_already_operational_skips_are_preserved(tmp_path,
         assert row["source_manifest"] is not None
 
 
+def test_historical_batch_with_excluded_target_refuses_capsule_recreation(tmp_path, monkeypatch):
+    data = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(prep, "cohort", lambda *a, **k: ("v8/v8", "example/remaining"))
+    monkeypatch.setattr(prep, "_candidates", lambda *a, **k: pytest.fail("payload preparation started"))
+    with pytest.raises(prep.PreparationError, match="active-scope preparation required"):
+        prepare(data, tmp_path)
+    assert not data.reader.ranges
+
+
 def test_fresh_repairs_require_exact_authorization_and_skip_headers_preserving_original_refs(tmp_path, monkeypatch):
     assert prep._fresh_repairs(prep.FRESH_REPAIR_INVENTORY, prep.FRESH_REPAIR_IDENTITIES) == prep.FRESH_REPAIR_IDENTITIES
     for digest, identities in (("0" * 64, prep.FRESH_REPAIR_IDENTITIES),

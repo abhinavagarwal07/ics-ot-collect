@@ -786,3 +786,72 @@ def test_registration_adapter_returns_updated_bucket_probe_and_cache_on_error(mo
     assert transport._last_response_rate_headers["remaining"] == 100
     assert transport.last_budget_metrics["destination_github_repository_rate_probe"]["remaining"] == 100
     assert transport._releases["retained-public-release"]["id"] == 123
+
+
+def test_excluded_outboxes_releases_and_pending_proofs_are_skipped_without_fetch(monkeypatch):
+    from icsot_observer.exclusions import EXCLUDED_REPOSITORY_IDS
+
+    github = OutboxGitHub()
+    github.source_heads = {identifier: ("v8/v8", None) for identifier in EXCLUDED_REPOSITORY_IDS}
+    removed_tag = "collector-observations-r24420506-g" + "a" * 32
+    github.pages[1] = [{"id": 17, "tag_name": removed_tag}]
+    github.state["discovery"]["incomplete_releases"] = [{"id": 17, "tag": removed_tag}]
+    old_entry = {"proof": {"release_tag": removed_tag, "name": "old.ots"},
+                 "next_attempt_after": 0, "attempts": 2}
+    github.state["pending"]["a" * 64] = copy.deepcopy(old_entry)
+    monkeypatch.setattr(github, "outbox_head", lambda *a: pytest.fail("excluded outbox read"))
+    monkeypatch.setattr(github, "fetch", lambda *a: pytest.fail("excluded proof/index fetched"))
+    monkeypatch.setattr(github, "marker", lambda *a: pytest.fail("excluded marker fetched"))
+    report = refresh(github, clock=lambda: 10000)
+    assert report["proofs_attempted"] == report["markers_processed"] == report["outbox_nodes_registered"] == 0
+    assert report["outbox_repositories_excluded"] == 4 and report["excluded_proofs_retained"] == 1
+    assert report["pending_proofs"] == report["due_proofs"] == report["incomplete_releases"] == 0
+    assert github.state["pending"]["a" * 64] == old_entry
+
+
+def test_shared_baseline_catalog_skips_removed_repository_index_before_fetch():
+    from icsot_observer.proof_maintenance import _marker_entries
+
+    tag = "corpus-baseline-123-1"
+    marker = {"schema_version": 1, "kind": "icsot_evidence_metadata_catalog", "generation_release": tag,
+              "observations": [{"index": {"release_tag": tag, "name": "v8__v8-123456789abc.index.json",
+                                            "sha256": "a" * 64, "bytes": 123}}]}
+    github = FakeGitHub()
+    github.fetch = lambda *a: pytest.fail("deleted baseline index fetched")
+    assert _marker_entries(marker, tag, github) == []
+
+
+def test_deleted_baseline_sha_only_pending_proofs_are_held_without_fetch(monkeypatch):
+    from icsot_observer.exclusions import EXCLUDED_BASELINE_OTS_SUBJECTS
+
+    github = FakeGitHub()
+    for subject in EXCLUDED_BASELINE_OTS_SUBJECTS:
+        github.state["pending"][subject] = {
+            "proof": {"release_tag": "corpus-baseline-40294818409-1", "name": f"ots-{subject}-{'b' * 64}.ots"},
+            "next_attempt_after": 0, "attempts": 0}
+    monkeypatch.setattr(github, "fetch", lambda *a: pytest.fail("deleted baseline sidecar fetched"))
+    report = refresh(github, clock=lambda: 10000)
+    assert report["proofs_attempted"] == report["pending_proofs"] == 0
+    assert report["excluded_proofs_retained"] == 4
+    assert len(github.state["pending"]) == 4
+
+
+def test_deleted_upgraded_proof_is_held_only_for_exact_tag_and_full_subject(monkeypatch):
+    from icsot_observer.exclusions import excluded_asset_reference
+
+    subject = "c599c7080f63c40af886b5a786d2c1bc2026d61ca1ba3cda2a282e1bd80eebbf"
+    tag = "collector-attestations-" + subject[:32]
+    ref = {"release_tag": tag, "name": f"ots-{subject}-{'b' * 64}.ots"}
+    assert excluded_asset_reference(ref)
+    # A different full subject with the same tag prefix must remain eligible.
+    other_subject = subject[:-1] + "0"
+    assert not excluded_asset_reference({**ref, "name": f"ots-{other_subject}-{'b' * 64}.ots"})
+    assert not excluded_asset_reference({**ref, "release_tag": tag + "-extra"})
+    github = FakeGitHub()
+    entry = {"proof": ref, "next_attempt_after": 0, "attempts": 2}
+    github.state["pending"][subject] = copy.deepcopy(entry)
+    monkeypatch.setattr(github, "fetch", lambda *a: pytest.fail("deleted upgraded proof fetched"))
+    report = refresh(github, clock=lambda: 10000)
+    assert report["proofs_attempted"] == report["pending_proofs"] == 0
+    assert report["excluded_proofs_retained"] == 1
+    assert github.state["pending"][subject] == entry

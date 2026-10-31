@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from .core import Config, ObjectStore, REPO_RE, canonical_json, sha256, utc_iso, write_once
 from .diagnostics import safe_fields
+from .exclusions import collection_repositories, exclusion_metadata
 from .github import APIRequestDeferred, GitHubAPI
 from .github_state import GhCliStateTransport, StateConflictError, StateDeferredError, StateError
 from .history import FULL_HISTORY, load_history_settings, repository_history_policy
@@ -64,10 +65,11 @@ def load_cohort(config_path: Path, csv_path: Path, *, expected_count: int = 185)
                 not REPO_RE.fullmatch(slug)):
             raise ValueError("Invalid cohort repository URL")
         slugs.append(slug)
-    if tuple(slugs) != config.repositories or len(slugs) != expected_count:
-        raise ValueError("Recurring cohort must match every CSV row in order")
+    active_slugs = collection_repositories(slugs)
+    if active_slugs != config.repositories or len(slugs) != expected_count:
+        raise ValueError("Recurring cohort must match non-excluded CSV rows in order and original expected count")
     return config, {"config_source_sha256": sha256(config_path.read_bytes()),
-                    "csv_sha256": sha256(raw), "cohort_count": len(slugs)}
+                    "csv_sha256": sha256(raw), "cohort_count": len(active_slugs), **exclusion_metadata(slugs)}
 
 
 def build_plan(config: Config, *, sources: dict, code_sha: str, identity_loader,

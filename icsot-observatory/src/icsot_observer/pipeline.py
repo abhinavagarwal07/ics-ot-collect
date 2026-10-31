@@ -24,6 +24,7 @@ from typing import Any
 from . import __version__
 from .core import Config, ObjectStore, canonical_json, parse_github_time, run_id, sha256, utc_iso, utc_now, write_once
 from .diagnostics import emit, exception_fields, failure_category
+from .exclusions import require_collection_repository
 from .github import GitHubAPI
 from .gitstore import collect_git
 
@@ -300,6 +301,7 @@ def _timestamp_receipt_info(root: Path, info: dict[str, Any], proof: Path, initi
 
 def capture_lane(config: Config, job: Any, queue: Any) -> dict[str, Any]:
     """Capture one resumable API job or one incremental Git job, without appending."""
+    require_collection_repository(job.slug)
     from .checkpoints import CheckpointStore
     from .github import APIRequestDeferred, BASE_SCOPES
     from .runtime import RetryDeferred
@@ -757,6 +759,7 @@ def enqueue_capture(queue: Any, config: Config, slug: str, lane: str, capture_id
                     mode: str = "delta", deep_full: bool = False, input_hash: str | None = None,
                     extra_payload: dict[str, Any] | None = None):
     """Freeze query/config inputs before enqueue, shared by host and state adapters."""
+    require_collection_repository(slug)
     from .github import BASE_SCOPES
     if slug not in config.repositories:
         raise ValueError("Target is outside the declared cohort")
@@ -825,6 +828,7 @@ def _restore_mirrors(root: Path) -> dict[str, Any]:
 
 def finalize_lane(config: Config, job: Any, capture: dict[str, Any], *, stamp: bool = True,
                   exporter: CaptureExporter | None = None):
+    require_collection_repository(job.slug)
     from .runtime import Finalization, ScopeWatermark
     store = ObjectStore(config.root)
     verified_objects, verified_bytes = 0, 0
@@ -1082,6 +1086,7 @@ def _persistent_loop(config: Config, queue: Any, *, exporter: CaptureExporter | 
 
 def collect_one(config: Config, slug: str, mode: str, *, deep_full: bool = False,
                 bundle_full: bool = False, stamp: bool = True) -> dict[str, Any]:
+    require_collection_repository(slug)
     rid, started = run_id(), utc_iso()
     capture_id = rid
     records: list[dict] = []
@@ -1243,6 +1248,7 @@ def run_github_persistent(config: Config, *, slug: str, repository_id: int,
     Recurring callers additionally bind the planned pointer and explicitly allow
     a fresh public bootstrap; selected manual callers retain their existing path.
     """
+    require_collection_repository(slug)
     from .core import REPO_RE
     from .encryption import _fingerprint, _load_private_key, public_key_fingerprint
     from .github_state import GhCliStateTransport, GitHubStateStore, StateConflictError, StateError

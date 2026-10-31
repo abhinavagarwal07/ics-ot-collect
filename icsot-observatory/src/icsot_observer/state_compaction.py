@@ -113,6 +113,9 @@ def execute(*, repository_id: int, slug: str, destination: str, expected_pointer
     The root path is part of the authenticated state identity. Only remove a
     directory created exclusively by this invocation. Never capture upstream.
     """
+    from .exclusions import require_collection_repository
+
+    require_collection_repository(slug)
     if (type(repository_id) is not int or repository_id < 1 or not REPO_RE.fullmatch(slug)
             or not REPO_RE.fullmatch(destination) or not _SHA256.fullmatch(expected_pointer_sha256)
             or not _CODE_SHA.fullmatch(code_sha)

@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 import zipfile
 from collections import Counter
@@ -113,7 +114,10 @@ class Cohort:
 
 
 def load_cohort(config_path: Path, csv_path: Path, *, expected_count: int = 185) -> Cohort:
-    config = Config.load(config_path)
+    Config.load(config_path)
+    # This read-only audit binds historical inventories to their original
+    # declarations. Today's collection exclusions must not rewrite that scope.
+    declared_repositories = tuple(tomllib.loads(config_path.read_text(encoding="utf-8"))["cohort"]["repositories"])
     raw = csv_path.read_bytes()
     rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
     slugs, roles = [], {}
@@ -125,7 +129,7 @@ def load_cohort(config_path: Path, csv_path: Path, *, expected_count: int = 185)
             raise ValueError("Invalid CSV repository URL")
         slugs.append(slug)
         roles[slug] = row.get("Repository_Role", "unspecified")
-    if tuple(slugs) != config.repositories or len(slugs) != expected_count:
+    if tuple(slugs) != declared_repositories or len(slugs) != expected_count:
         raise ValueError("Config and CSV must identify the complete expected cohort in order")
     return Cohort(tuple(slugs), roles, {"config_source_sha256": sha256(config_path.read_bytes()),
                   "csv_sha256": sha256(raw), "cohort_count": len(slugs)})

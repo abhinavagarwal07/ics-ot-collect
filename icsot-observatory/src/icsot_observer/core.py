@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .exclusions import collection_repositories
+
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -94,6 +96,9 @@ class Config:
         for slug in repos:
             if not REPO_RE.fullmatch(slug) or slug.endswith(".git"):
                 raise ValueError(f"Invalid repository slug: {slug!r}")
+        repos = collection_repositories(repos)
+        if not repos:
+            raise ValueError("No collection repositories remain after explicit exclusions")
         version = c["api_version"]
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", version):
             raise ValueError("Explicit GitHub API version YYYY-MM-DD required")

@@ -20,9 +20,9 @@ New public indexes replace free-text failure messages with stable category/class
 
 | Limit | Consequence |
 | --- | --- |
-| Included minutes/spend and account concurrency | These belong to the repository owner's user/organization account and are shared across its repositories. The triggering actor and the 185 public targets do not supply separate allowances. |
+| Included minutes/spend and account concurrency | These belong to the repository owner's user/organization account and are shared across its repositories. The triggering actor and the 181 active public targets do not supply separate allowances. |
 | Six hours per hosted job; 35 days per workflow | A multi-job baseline may exceed six hours overall. Each configured job remains below the hosted ceiling. |
-| 256 jobs per matrix | 185 capture jobs fit. Configured parallelism shares account capacity with other workflows. |
+| 256 jobs per matrix | 181 capture jobs fit. Configured parallelism shares account capacity with other workflows. |
 | Private standard Ubuntu: 2 CPUs, 8 GB RAM, 14 GB SSD | Process one repository per runner. Mirrors, temporary bundles, CAS objects, restore scratch space and XZ parts can coexist. |
 | Configured public-read token: 5,000 REST calls/hour; fallback `GITHUB_TOKEN`: 1,000/hour per execution repository | All workers share the applicable allowance; adding workers does not multiply it. Release operations retain their separate workflow-token capacity. |
 | Secondary limits, including content-generating requests | Bound upload concurrency and obey server deferrals; primary capacity remaining does not exclude secondary throttling. |
@@ -30,7 +30,7 @@ New public indexes replace free-text failure messages with stable category/class
 
 The documented 24-hour queued-job limit appears under **self-hosted runners**; it is not evidence of a 24-hour expiry for this hosted matrix. [Actions limits](https://docs.github.com/en/actions/reference/limits), [private runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), [API limits and backoff](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api), [Release limits](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases).
 
-Even empty targets require at least nine source reads each before rechecks, retries and transfers: 1,665 for 185 repositories. Busy repositories require thousands of pages. A per-job one-hour primary wait is bounded, but does not coordinate the shared allowance or guarantee complete metadata. The 40-request transfer reserve is a local precaution, not an atomic global reservation.
+Even empty targets require at least nine source reads each before rechecks, retries and transfers: 1,629 for 181 active repositories. Busy repositories require thousands of pages. A per-job one-hour primary wait is bounded, but does not coordinate the shared allowance or guarantee complete metadata. The 40-request transfer reserve is a local precaution, not an atomic global reservation.
 
 ## Compute cost
 
@@ -40,9 +40,9 @@ Public target repositories do not make execution free in this **private collecto
 
 The owner reports no billing setup. GitHub documents that **without a valid payment method, Actions usage is blocked after the included allowance is exhausted**. The amounts below describe hypothetical paid usage, not a debt that this no-payment setup is accruing. Usage belongs to the repository owner's [personal billing account](https://github.com/settings/billing). [No-payment behavior](https://docs.github.com/en/billing/concepts/product-billing/github-actions#using-more-than-your-included-quota).
 
-- Five minutes per capture implies approximately 925 runner-minutes, or $5.55 gross before included usage.
-- Ten minutes implies approximately 1,850 minutes, or $11.10 gross.
-- The configured timeout ceiling is `(185 × 180 + 90 + 10) × $0.006 = $200.40`, excluding separate validation workflows. This is a ceiling, **not a forecast**.
+- Five minutes per capture for 181 active targets implies approximately 905 runner-minutes, or $5.43 gross before included usage.
+- Ten minutes implies approximately 1,810 minutes, or $10.86 gross.
+- The configured timeout ceiling is `(181 × 180 + 90 + 10) × $0.006 = $196.08`, excluding separate validation workflows. This is a ceiling, **not a forecast**.
 
 API waits consume runner minutes. Increasing parallelism reduces elapsed time only when useful work can proceed; it does not reduce aggregate billable time.
 
@@ -61,7 +61,7 @@ Standard Ubuntu runners in a **public execution repository** have free compute u
 | Deadline, disk full, OOM, cancellation or runner loss | A process can be killed before cleanup/upload. Missing indexes remain missing/incomplete; `finally` is not a durability guarantee. |
 | Finalizer failure after inventory upload or publication | Recover by reconciling the existing inventory and source identities, reusing its bytes and completing publication idempotently. Never replace evidence with a freshly generated conflicting inventory. |
 
-The [six-hour cohort workflow](PERSISTENT.md#six-hour-cohort-workflow) now uses durable scope checkpoints, authenticated per-repository encrypted working state and incremental archive dependencies. Its immutable plan includes all 185 entries, while ordinary scheduled cycles resume existing-state repositories and default to zero fresh cold bootstraps. Fresh bootstraps require an explicit manual request (0–8); retained baseline-state initialization uses its own full-cohort migration path. API/Git jobs remain independent inside one per-repository publisher. Eight matrix slots share the source PAT and destination repository quotas; monthly admission is not enforced. Public partial/paused outcomes and bootstrap-pending entries preserve the distinction between scheduled eligibility and completed coverage.
+The [six-hour cohort workflow](PERSISTENT.md#six-hour-cohort-workflow) now uses durable scope checkpoints, authenticated per-repository encrypted working state and incremental archive dependencies. Its immutable plan includes all 181 active entries, while ordinary scheduled cycles resume existing-state repositories and default to zero fresh cold bootstraps. Fresh bootstraps require an explicit manual request (0–8); retained baseline-state initialization uses its own full-cohort migration path. API/Git jobs remain independent inside one per-repository publisher. Eight matrix slots share the source PAT and destination repository quotas; monthly admission is not enforced. Public partial/paused outcomes and bootstrap-pending entries preserve the distinction between scheduled eligibility and completed coverage.
 
 The hardened helper limits collection to 120 minutes and verification to 20 minutes, leaving approximately 40 minutes within the 180-minute job for packaging and transfer. Disk capacity and tool versions are recorded. This improves orderly timeout handling; all compressed parts still stage locally, and additional transfer waits or forced termination can exceed that remaining window. These changes apply to later captures, not the already-running original checkout.
 

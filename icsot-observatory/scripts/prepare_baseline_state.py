@@ -112,7 +112,13 @@ def asset_ref(value: dict, *, unpublished: bool = False) -> dict:
 
 def cohort(config_path: Path, csv_path: Path, inventory: dict, *, expected_count=EXPECTED_REPOSITORIES) -> tuple[str, ...]:
     import csv
-    config = Config.load(config_path)
+    import tomllib
+
+    Config.load(config_path)
+    # Validate sealed historical membership against its original declarations,
+    # not today's collection scope. Operational migration separately requires
+    # exact active Config membership and refuses the four excluded targets.
+    declared_repositories = tuple(tomllib.loads(config_path.read_text(encoding="utf-8"))["cohort"]["repositories"])
     raw = csv_path.read_bytes()
     rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
     slugs = []
@@ -123,7 +129,7 @@ def cohort(config_path: Path, csv_path: Path, inventory: dict, *, expected_count
                 any(part in (".", "..") for part in slug.split("/"))):
             raise PreparationError("Invalid cohort URL")
         slugs.append(slug)
-    if (tuple(slugs) != config.repositories or len(slugs) != expected_count or
+    if (tuple(slugs) != declared_repositories or len(slugs) != expected_count or
             len({slug.lower() for slug in slugs}) != len(slugs) or
             [row.get("repository") for row in inventory.get("repositories", [])] != slugs or
             inventory.get("cohort_count") != expected_count or inventory.get("csv_sha256") != sha256(raw) or
@@ -706,6 +712,9 @@ def prepare(inventory_raw, inventory_sha256, sources_raw, sources_sha256, *, con
     if inventory_ref["sha256"] != inventory_sha256 or inventory_ref["bytes"] != len(inventory_raw):
         raise PreparationError("Sealed inventory asset context differs")
     slugs = cohort(config_path, csv_path, inventory, expected_count=expected_count)
+    from icsot_observer.exclusions import collection_repositories
+    if collection_repositories(slugs) != slugs:
+        raise PreparationError("Historical cohort includes excluded repositories; active-scope preparation required")
     # This completes metadata validation for the whole batch before loading the
     # owner private key. No original payload is fetched in this phase.
     candidates = _candidates(inventory, sources, slugs, reader)
